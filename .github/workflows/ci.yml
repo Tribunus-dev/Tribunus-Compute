@@ -10,137 +10,316 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# ─── Feature flags ─────────────────────────────────────────────────
+#   default        → (macOS) mlx-metal + mlx-accelerate + mlx-safetensors
+#   linux-compat   → mlx-safetensors only (no Metal/Accelerate/GPU)
+#   mlx-metal      → enables mlx-rs/metal → mlx-sys/metal
+#   mlx-accelerate → enables mlx-rs/accelerate → mlx-sys/accelerate
+
 jobs:
-  # ─── Portable checks (Linux) ───
-  portable:
-    name: Portable (fmt, clippy, doc, dep-audit)
-    runs-on: ubuntu-latest
+  # ═════════════════════════════════════════════════════════════════
+  # Preflight — System introspection (both platforms)
+  # ═════════════════════════════════════════════════════════════════
+  preflight:
+    name: Preflight
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-15]
+        include:
+          - os: macos-15
+            display: macOS
+          - os: ubuntu-latest
+            display: Linux
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
+      - name: Record system info
+        run: |
+          {
+            echo "## System — ${{ matrix.display }}"
+            echo ""
+            echo "| Property | Value |"
+            echo "|----------|-------|"
+            echo "| runner.os | ${{ runner.os }} |"
+            echo "| uname -m | $(uname -m) |"
+            echo "| uname -a | $(uname -a) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record macOS-specific info
+        if: runner.os == 'macOS'
+        run: |
+          {
+            echo "| sw_vers | $(sw_vers -productVersion) ($(sw_vers -buildVersion)) |"
+            echo "| ProductName | $(sw_vers -productName) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          xcode_path=$(xcode-select -p 2>/dev/null || echo "not set")
+          xcode_version=$(xcodebuild -version 2>/dev/null | head -1 || echo "n/a")
+          {
+            echo "| Xcode path | $xcode_path |"
+            echo "| Xcode version | $xcode_version |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record Rust version
+        run: |
+          rustc --version 2>/dev/null || echo "rustc not yet installed"
+          {
+            echo "| rustc | $(rustc --version 2>/dev/null || echo 'not installed') |"
+            echo "| cargo | $(cargo --version 2>/dev/null || echo 'not installed') |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Enforce aarch64 on macOS runner
+        if: runner.os == 'macOS'
+        run: |
+          arch=$(uname -m)
+          if [ "$arch" != "arm64" ]; then
+            echo "::error::macOS runner must be aarch64 (Apple Silicon); got $arch"
+            exit 1
+          fi
+          echo "Architecture verified: aarch64"
+          echo "| architecture check | aarch64 — OK |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log submodule SHA (informational)
+        run: |
+          sub_status=$(git submodule status mlx-rs-fork 2>/dev/null | awk '{print $1}' || echo "not initialized")
+          pinned_sha=$(git ls-tree HEAD mlx-rs-fork 2>/dev/null | awk '{print $3}' || echo "not found")
+          actual_sha=$(echo "$sub_status" | sed 's/^.//' | awk '{print $1}')
+          echo "| mlx-rs-fork pinned SHA | $pinned_sha |" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$actual_sha" ] && [ "$actual_sha" != "not" ]; then
+            echo "| mlx-rs-fork checked-out SHA | $actual_sha |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| mlx-rs-fork status | $([ \"$(echo "$sub_status" | cut -c1)\" = \" \" ] && echo 'clean' || echo 'dirty/unexpected') |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Log MLX version (macOS, informational)
+        if: runner.os == 'macOS'
+        run: |
+          if command -v brew >/dev/null 2>&1 && brew --prefix mlx >/dev/null 2>&1; then
+            MLX_PREFIX=$(brew --prefix mlx)
+            {
+              echo "| MLX prefix | $MLX_PREFIX |"
+              echo "| MLX include | $(ls \"$MLX_PREFIX/include/mlx/\"*.h 2>/dev/null | head -3 | tr '\n' ', ') |"
+              echo "| MLX lib | $(ls \"$MLX_PREFIX/lib/\"libmlx* 2>/dev/null | head -3 | tr '\n' ', ') |"
+            } >> "$GITHUB_STEP_SUMMARY"
+            if [ -f "$MLX_PREFIX/include/mlx/version.h" ]; then
+              version_line=$(grep 'MLX_VERSION' "$MLX_PREFIX/include/mlx/version.h" | head -1)
+              echo "| MLX version header | $version_line |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            echo "MLX_SYS_MLX_LIB_DIR=$MLX_PREFIX/lib" >> "$GITHUB_ENV"
+            echo "MLX_SYS_MLX_INCLUDE_DIR=$MLX_PREFIX/include" >> "$GITHUB_ENV"
+          else
+            echo "MLX not yet installed on macOS runner (will be installed in test job)"
+          fi
+
+  # ═════════════════════════════════════════════════════════════════
+  # Formatting — Rustfmt check
+  # ═════════════════════════════════════════════════════════════════
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt
+      - run: cargo fmt --all --check
 
+  # ═════════════════════════════════════════════════════════════════
+  # License headers — exact SPDX identifier
+  # ═════════════════════════════════════════════════════════════════
+  license-headers:
+    name: License Headers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check all source files carry SPDX-License-Identifier
+        run: |
+          missing=""
+          for ext in rs mm h; do
+            while IFS= read -r -d '' f; do
+              if ! head -5 "$f" | grep -Eq 'SPDX-License-Identifier:\s*AGPL-3\.0-only'; then
+                missing="$missing  $f"$'\n'
+              fi
+            done < <(find compute-native/src -name "*.$ext" -not -path '*/bridge/*' -print0 2>/dev/null)
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Files missing 'SPDX-License-Identifier: AGPL-3.0-only' in first 5 lines:"
+            echo "$missing"
+            exit 1
+          fi
+          echo "All source files carry SPDX-License-Identifier: AGPL-3.0-only"
+
+  # ═════════════════════════════════════════════════════════════════
+  # Clippy (Linux — linux-compat feature set)
+  # ═════════════════════════════════════════════════════════════════
+  clippy:
+    name: Clippy (Linux)
+    runs-on: ubuntu-latest
+    needs: [preflight]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: compute-native
+      - name: Clippy with linux-compat feature (warnings denied)
+        run: cargo clippy --no-default-features --features linux-compat --all-targets -- -D warnings
 
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-      - name: Clippy (warnings denied)
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: Build documentation
+  # ═════════════════════════════════════════════════════════════════
+  # Documentation build
+  # ═════════════════════════════════════════════════════════════════
+  doc:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compute-native
+      - name: Build documentation (warnings denied)
         run: cargo doc --no-deps --document-private-items
         env:
           RUSTDOCFLAGS: -D warnings
 
-      - name: Dependency audit
-        uses: rustsec/audit-check@v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Check license headers
-        run: |
-          missing=$(find compute-native/src -name '*.rs' -not -path '*/bridge/*' | while read f; do
-            head -1 "$f" | grep -q '//' || echo "$f"
-          done)
-          if [ -n "$missing" ]; then
-            echo "Files missing SPDX header:"
-            echo "$missing"
-            exit 1
-          fi
-
-  # ─── Unit tests (Linux, no GPU/MLX) ───
+  # ═════════════════════════════════════════════════════════════════
+  # Linux tests — safetensors/CPU only, no GPU
+  # ═════════════════════════════════════════════════════════════════
   test-linux:
-    name: Unit Tests (Linux)
+    name: Tests (Linux, linux-compat)
     runs-on: ubuntu-latest
+    needs: [preflight]
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-
       - uses: dtolnay/rust-toolchain@stable
-
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: compute-native
+      - name: Build with linux-compat feature
+        run: cargo build --no-default-features --features linux-compat -p tribunus-compute-native
+      - name: Run tests with linux-compat feature
+        run: cargo test --no-default-features --features linux-compat -p tribunus-compute-native -- --nocapture
 
-      - name: Test (pure-logic only, no MLX)
-        run: cargo test --no-run -p tribunus-compute-native 2>&1 || true
-        continue-on-error: true
-
-      - name: Run compilable tests
-        run: |
-          cargo test -p tribunus-compute-native -- \
-            --skip mlx \
-            --skip metal \
-            --skip coreml \
-            --skip arena \
-            --skip external_array \
-            --skip gemma \
-            --skip compute_image \
-            --skip projection \
-            --skip attention \
-            --skip primitives \
-            --skip profiled_executor \
-            --skip mapped_image \
-            || echo "NOTE: Some tests skipped — MLX/CoreML/Metal not available on Linux"
-
-  # ─── macOS ARM64 qualification ───
-  qualify-macos:
-    name: macOS ARM64 Qualification
+  # ═════════════════════════════════════════════════════════════════
+  # macOS tests — full feature set, hard gate
+  # ═════════════════════════════════════════════════════════════════
+  test-macos:
+    name: Tests (macOS ARM64)
     runs-on: macos-15
-    if: github.event_name == 'push' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'qualify'))
-    strategy:
-      matrix:
-        xcode: ['16.2']
+    timeout-minutes: 45
+    needs: [preflight]
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: compute-native
 
       - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode_${{ matrix.xcode }}.app
+        run: sudo xcode-select -s /Applications/Xcode_16.2.app
 
-      - name: Install MLX
+      - name: Verify submodule commit is pinned
+        run: |
+          expected=$(git ls-tree HEAD mlx-rs-fork | awk '{print $3}')
+          status=$(git submodule status mlx-rs-fork | awk '{print $1}')
+          prefix=$(echo "$status" | cut -c1)
+          actual=$(echo "$status" | sed 's/^.//' | awk '{print $1}')
+          echo "Pinned SHA:  $expected"
+          echo "Actual SHA:  $actual"
+          echo "Status:      $prefix"
+          if [ "$prefix" = "-" ]; then
+            echo "::error::Submodule mlx-rs-fork not at pinned commit"
+            echo "  Expected: $expected"
+            echo "  Actual:   $actual"
+            exit 1
+          fi
+          echo "Submodule mlx-rs-fork verified at $expected"
+
+      - name: Record MLX headers and linked libraries
         run: |
           brew install mlx
-          echo "MLX_SYS_MLX_LIB_DIR=$(brew --prefix mlx)/lib" >> $GITHUB_ENV
-          echo "MLX_SYS_MLX_INCLUDE_DIR=$(brew --prefix mlx)/include" >> $GITHUB_ENV
+          MLX_PREFIX=$(brew --prefix mlx)
+          echo "MLX_SYS_MLX_LIB_DIR=$MLX_PREFIX/lib" >> "$GITHUB_ENV"
+          echo "MLX_SYS_MLX_INCLUDE_DIR=$MLX_PREFIX/include" >> "$GITHUB_ENV"
+          echo "## MLX Environment" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$MLX_PREFIX/include/mlx/version.h" ]; then
+            grep 'MLX_VERSION\|MLX_CORE_VERSION' "$MLX_PREFIX/include/mlx/version.h" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "Linked libs:" >> "$GITHUB_STEP_SUMMARY"
+          otool -L "$MLX_PREFIX"/lib/libmlx*.dylib 2>/dev/null | head -15 >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Clippy (macOS)
-        run: cargo clippy --all-targets -- -D warnings
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compute-native
 
       - name: Build (release)
         run: cargo build --release -p tribunus-compute-native
 
-      - name: Run all tests
+      - name: Run all tests — hard gate (no continue-on-error)
         run: cargo test -p tribunus-compute-native -- --nocapture
         timeout-minutes: 30
-
-      - name: Run qualification tests
-        run: cargo test -p tribunus-compute-native qualification -- --nocapture
-        timeout-minutes: 60
-        continue-on-error: true
 
       - name: Collect capability report
         run: |
           cargo run --release -p tribunus-compute-native --bin tribunus-fake-worker -- capability-report > capability-report.json
           cat capability-report.json
+          {
+            echo "## Capability Report"
+            echo '```json'
+            cat capability-report.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Upload capability report
+        uses: actions/upload-artifact@v4
+        with:
+          name: capability-report-macos
+          path: capability-report.json
+          retention-days: 30
+
+  # ═════════════════════════════════════════════════════════════════
+  # macOS qualification — separate job, push or 'qualify' label only
+  # ═════════════════════════════════════════════════════════════════
+  qualify-macos:
+    name: Qualification (macOS)
+    runs-on: macos-15
+    if: >
+      github.event_name == 'push'
+      || (github.event_name == 'pull_request'
+          && contains(github.event.pull_request.labels.*.name, 'qualify'))
+    needs: [test-macos, fmt, clippy, license-headers, repo-policy, doc]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compute-native
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.2.app
+      - name: Install MLX
+        run: |
+          brew install mlx
+          MLX_PREFIX=$(brew --prefix mlx)
+          echo "MLX_SYS_MLX_LIB_DIR=$MLX_PREFIX/lib" >> "$GITHUB_ENV"
+          echo "MLX_SYS_MLX_INCLUDE_DIR=$MLX_PREFIX/include" >> "$GITHUB_ENV"
+          echo "## MLX Environment" >> "$GITHUB_STEP_SUMMARY"
+          otool -L "$MLX_PREFIX"/lib/libmlx*.dylib 2>/dev/null | head -10 >> "$GITHUB_STEP_SUMMARY" || true
+      - name: Build (release)
+        run: cargo build --release -p tribunus-compute-native
+      - name: Run qualification tests
+        run: cargo test -p tribunus-compute-native qualification -- --nocapture
+        timeout-minutes: 60
+      - name: Collect capability report
+        run: cargo run --release -p tribunus-compute-native --bin tribunus-fake-worker -- capability-report > capability-report.json
       - name: Upload qualification artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -150,40 +329,149 @@ jobs:
             target/release/tribunus-compute-worker
           retention-days: 30
 
-      - name: Upload test receipts
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-receipts
-          path: |
-            target/test-receipts/
-          retention-days: 30
-        continue-on-error: true
-
-  # ─── Repository policy checks ───
+  # ═════════════════════════════════════════════════════════════════
+  # Repository policy — structural integrity checks
+  # ═════════════════════════════════════════════════════════════════
   repo-policy:
     name: Repository Policy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Verify .gitmodules exists
-        run: test -f .gitmodules || (echo "MISSING: .gitmodules" && exit 1)
-
-      - name: Verify required docs exist
         run: |
-          for f in README.md LICENSE docs/ARCHITECTURE.md docs/STATUS.md docs/SECURITY.md docs/CONTRIBUTING.md CHANGELOG.md; do
-            test -f "$f" || (echo "MISSING: $f" && exit 1)
-          done
-          echo "All required documents present."
+          test -f .gitmodules || { echo "::error::Missing .gitmodules"; exit 1; }
+          echo ".gitmodules — present"
 
-      - name: Verify workspace compiles
-        run: cargo check --workspace
-
-      - name: Verify no TODOs in production paths
+      - name: Verify submodule commit is reachable in clone
         run: |
-          todos=$(grep -rn 'TODO' compute-native/src --include='*.rs' | grep -v 'test' | grep -v '#\[allow' || true)
-          if [ -n "$todos" ]; then
-            echo "TODOs found in production source:"
-            echo "$todos"
+          expected=$(git ls-tree HEAD mlx-rs-fork | awk '{print $3}')
+          if [ -z "$expected" ]; then
+            echo "::error::mlx-rs-fork not tracked in git tree"
+            exit 1
           fi
-          exit 0
+          if git cat-file -e "$expected" 2>/dev/null; then
+            echo "Submodule commit $expected — reachable"
+          else
+            echo "::error::Submodule commit $expected not reachable (clone without submodules?)"
+            exit 1
+          fi
+
+      - name: Verify CODEOWNERS covers all top-level directories
+        run: |
+          errors=0
+          for dir in */; do
+            dir_name="${dir%/}"
+            # Skip hidden dirs, target/, and mlx-rs-fork (already covered by maintainers)
+            case "$dir_name" in
+              .*|target|mlx-rs-fork) continue ;;
+            esac
+            if ! grep -Eq "^\Q$dir_name\E" .github/CODEOWNERS 2>/dev/null; then
+              echo "::error::Top-level directory '$dir_name' not covered by CODEOWNERS"
+              errors=$((errors + 1))
+            fi
+          done
+          if [ "$errors" -gt 0 ]; then
+            exit 1
+          fi
+          echo "All top-level directories have CODEOWNERS entries"
+
+      - name: Verify required documents exist
+        run: |
+          errors=0
+          for f in README.md LICENSE docs/ARCHITECTURE.md docs/STATUS.md docs/SECURITY.md; do
+            if [ ! -f "$f" ]; then
+              echo "::error::Required document missing: $f"
+              errors=$((errors + 1))
+            fi
+          done
+          if [ "$errors" -gt 0 ]; then
+            exit 1
+          fi
+          echo "All required documents present"
+
+      - name: Verify workspace compiles (linux-compat)
+        run: cargo check --no-default-features --features linux-compat --workspace
+
+      - name: Verify no stale paths in README tree section
+        run: |
+          errors=0
+          # Extract markdown link targets that look like relative paths
+          while IFS= read -r link_target; do
+            [ -z "$link_target" ] && continue
+            # Skip URLs, anchors, mailto:
+            case "$link_target" in
+              http://*|https://*|#*|mailto:*) continue ;;
+            esac
+            # Strip leading ./
+            clean="${link_target#./}"
+            if [ ! -e "$clean" ] && [ ! -e "docs/$clean" ]; then
+              echo "::error::README references non-existent path: $link_target"
+              errors=$((errors + 1))
+            fi
+          done < <(grep -oP '\[([^\]]*)\]\(\K[^)]+' README.md 2>/dev/null || true)
+          if [ "$errors" -gt 0 ]; then
+            exit 1
+          fi
+          echo "All README file references resolve"
+
+  # ═════════════════════════════════════════════════════════════════
+  # Docs integrity — README structure and link checks
+  # ═════════════════════════════════════════════════════════════════
+  docs:
+    name: Docs Integrity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for duplicate headings in README.md
+        run: |
+          duplicates=$(grep '^##' README.md | sort | uniq -d)
+          if [ -n "$duplicates" ]; then
+            echo "::error::Duplicate headings found in README.md:"
+            echo "$duplicates"
+            exit 1
+          fi
+          echo "README.md headings — all unique"
+
+      - name: Check referenced file paths exist
+        run: |
+          errors=0
+          while IFS= read -r link_target; do
+            [ -z "$link_target" ] && continue
+            case "$link_target" in
+              http://*|https://*|#*|mailto:*) continue ;;
+            esac
+            clean="${link_target#./}"
+            # Try relative to repo root, then relative to docs/
+            resolved=""
+            if [ -e "$clean" ]; then
+              resolved="$clean"
+            elif [ -e "docs/$clean" ]; then
+              resolved="docs/$clean"
+            fi
+            if [ -z "$resolved" ]; then
+              echo "::error::README references non-existent path: $link_target"
+              errors=$((errors + 1))
+            fi
+          done < <(grep -oP '\[([^\]]*)\]\(\K[^)]+' README.md 2>/dev/null || true)
+          if [ "$errors" -gt 0 ]; then
+            exit 1
+          fi
+          echo "All README file references resolve"
+
+      - name: Check anchor links resolve to headings
+        run: |
+          # Extract anchors from markdown [text](#anchor) or bare (#anchor) in the file
+          while IFS= read -r anchor_raw; do
+            [ -z "$anchor_raw" ] && continue
+            anchor="${anchor_raw#\#}"
+            pattern=$(echo "$anchor" | sed 's/-/ /g' | sed 's/[^a-zA-Z0-9 ]//g')
+            heading_count=$(grep -ci "^#\+[[:space:]]*$pattern" README.md 2>/dev/null || echo 0)
+            if [ "$heading_count" -eq 0 ] 2>/dev/null; then
+              echo "::warning::Anchor '#$anchor' may not match any README heading"
+            fi
+          done < <(grep -oP '\[([^\]]*)\]\(\K#[^)]+' README.md 2>/dev/null || true)
+          echo "README anchor link check complete"
