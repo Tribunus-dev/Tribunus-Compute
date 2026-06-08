@@ -774,6 +774,13 @@ The dependency tuple is documented in `docs/compatibility.md`.
 
 ## 12. License
 
+
+## 12. License
+
+The Tribunus Compute Kernel is dual-licensed.
+
+### Open Source — AGPL-3.0-only
+
 ```
 Copyright (c) 2026 Tribunus, Inc.
 
@@ -787,17 +794,40 @@ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 GNU Affero General Public License for more details.
 ```
 
-The kernel is licensed under **AGPL-3.0-only**. Both the `tribunus-compute-native`
-crate and the `tribunus-mlx-rs` fork (MIT / Apache-2.0) are linked together in
-a single binary — the combined work is distributed under AGPL-3.0 as required
-by the AGPL's "Corresponding Source" provisions.
+Anyone may use, study, modify, and redistribute the kernel under AGPL-3.0-only.
+The license grants every compliant recipient a worldwide, royalty-free copyright
+license and a patent license covering claims necessarily infringed by the
+contributed implementation. You retain ownership of your copyrights and patents.
 
-**Linking implications:** Any application that links against the N-API addon
-(including via `require('@tribunus/compute-native')`) must comply with AGPL-3.0
-terms. If you are considering using the kernel in a proprietary or closed-source
-product, please contact Tribunus, Inc. about commercial licensing options.
+AGPL-3.0 requires that anyone who modifies the kernel and makes it available to
+others over a network must make the Corresponding Source available under the same
+license. Any application that links against the N-API addon (including via
+`require('@tribunus/compute-native')`) must comply with these terms.
 
-**Third-party components:**
+### Commercial License
+
+Proprietary incorporation — embedding the kernel in a closed-source product,
+distributing it under terms other than AGPL-3.0, or using it in a context where
+AGPL network obligations are not acceptable — requires a separate commercial
+license from Tribunus, Inc. A commercial license may include additional rights
+such as proprietary embedding, warranties, indemnification, and broader patent
+rights beyond the statutory AGPL grant.
+
+For commercial licensing inquiries: `license@tribunus.io`
+
+See [docs/LICENSE-COMMERCIAL.md](docs/LICENSE-COMMERCIAL.md) for details.
+
+### Contributor Agreement
+
+To preserve the ability to continue dual-licensing the kernel, all substantial
+external contributions require a contributor license agreement that grants
+Tribunus, Inc. sufficient copyright and patent rights to include the contribution
+under both the AGPL and the commercial license. See
+[CONTRIBUTING.md §10](docs/CONTRIBUTING.md#10-license-and-contributor-agreement)
+for the full policy.
+
+### Third-Party Components
+
 - `mlx-rs` / `mlx-sys`: MIT OR Apache-2.0 (used under fork at `mlx-rs-fork/`)
 - `napi-rs` / `napi-derive`: MIT
 - `safetensors`: Apache-2.0

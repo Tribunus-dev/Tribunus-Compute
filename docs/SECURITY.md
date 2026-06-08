@@ -545,48 +545,47 @@ not marked retryable (the session state is terminal).
 
 ## 11. AGPL-3.0-only Implications
 
-Tribunus Compute is licensed under the **GNU Affero General Public License
-v3.0**. This has specific implications for security and deployment:
+
+## 11. AGPL-3.0-only and Dual Licensing
+
+Tribunus Compute is dual-licensed under **AGPL-3.0-only** and a separate
+**commercial license**. See [README.md §12](../README.md#12-license) and
+[LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md) for the full policy.
+
+### Patent Grant
+
+AGPL-3.0 grants every compliant recipient a worldwide, royalty-free patent
+license covering claims necessarily infringed by the contributed implementation.
+Tribunus, Inc. retains ownership of its patents. The license does not assign
+or transfer patent ownership — it grants recipients a covenant not to sue for
+patent infringement arising from their compliant use of the kernel.
+
+A commercial license may grant broader patent rights beyond the statutory
+AGPL grant. Contact `license@tribunus.io` for details.
 
 ### Linking
 
 - The Rust core and the ObjC++ bridge are part of "the Program" under AGPL-3.0.
 - MLX C library is a separate work (MIT-licensed). The FFI boundary through
-  `mlx-sys` creates an "aggregate" under AGPL-3.0 Section 5 — the MLX library
-  is a separate, independently licensed component.
+  `mlx-sys` creates an "aggregate" under AGPL-3.0 Section 5.
 - Core ML, CoreVideo, and IOSurface are System Libraries (AGPL-3.0 Section 1).
-  They are "included in the normal form of packaging a Major Component" and
-  "serve only to enable use of the work with that Major Component" (macOS).
   They do not trigger the AGPL's copyleft requirements.
 - napi-rs is a separate work (MIT-licensed). The N-API boundary is a Standard
   Interface.
 
-### Network Deployment (The "Affero" Clause)
+### Network Deployment
 
 AGPL-3.0 Section 13 requires that anyone who interacts with the Program over
-a network must be offered the Corresponding Source. For Tribunus Compute:
+a network must be offered the Corresponding Source. For Tribunus Compute, a
+user sending a prompt and receiving tokens back qualifies as interaction.
 
-- If you deploy the `@tribunus/compute-native` addon as part of a network
-  service (e.g., an inference API), users who interact with that service are
-  entitled to receive the Corresponding Source of the Program.
-- "Interaction" under Section 13 is triggered when a remote user communicates
-  with the Program. A user sending a prompt and receiving tokens back over
-  HTTP qualifies.
-- The Corresponding Source includes the Rust source, the ObjC++ bridge, the
-  `build.rs` scripts, and the Cargo build configuration. It does **not**
-  include MLX (separate work), Core ML (System Library), or the host
-  application (if the application is a separate work that communicates with
-  the addon through the N-API Standard Interface).
+### Compliance
 
-### Compliance Recommendations
-
-1. Provide a link to the source repository (this repository) in your service's
-   user interface or terms of service.
-2. If you modify the Program, make your modified source available under AGPL-3.0
-   to your users.
-3. The model weights you load into Tribunus Compute are data, not part of the
-   Program. Their license is independent.
-4. For questions about AGPL-3.0 compliance, contact `security@tribunus.io`.
+1. Provide a link to this repository in your service's user interface.
+2. If you modify the Program, make your modified source available under AGPL-3.0.
+3. Model weights are data, not part of the Program. Their license is independent.
+4. If AGPL compliance is not acceptable, a commercial license is available.
+5. For questions, contact `security@tribunus.io` or `license@tribunus.io`.
 
 ---
 
