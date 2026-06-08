@@ -1,0 +1,25 @@
+[workspace]
+members = ["compute-native"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+repository = "https://github.com/Tribunus-dev/Tribunus-Compute"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"
+cargo = "warn"
+
+[profile.release]
+lto = true
+strip = "symbols"
+codegen-units = 1
+opt-level = 3

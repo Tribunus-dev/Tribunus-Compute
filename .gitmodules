@@ -1,0 +1,4 @@
+[submodule "mlx-rs-fork"]
+	path = mlx-rs-fork
+	url = https://github.com/oxideai/mlx-rs.git
+	branch = compat/mlx-core-0.31.2
