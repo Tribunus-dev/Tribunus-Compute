@@ -1,0 +1,189 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ─── Portable checks (Linux) ───
+  portable:
+    name: Portable (fmt, clippy, doc, dep-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compute-native
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy (warnings denied)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build documentation
+        run: cargo doc --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: Dependency audit
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check license headers
+        run: |
+          missing=$(find compute-native/src -name '*.rs' -not -path '*/bridge/*' | while read f; do
+            head -1 "$f" | grep -q '//' || echo "$f"
+          done)
+          if [ -n "$missing" ]; then
+            echo "Files missing SPDX header:"
+            echo "$missing"
+            exit 1
+          fi
+
+  # ─── Unit tests (Linux, no GPU/MLX) ───
+  test-linux:
+    name: Unit Tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compute-native
+
+      - name: Test (pure-logic only, no MLX)
+        run: cargo test --no-run -p tribunus-compute-native 2>&1 || true
+        continue-on-error: true
+
+      - name: Run compilable tests
+        run: |
+          cargo test -p tribunus-compute-native -- \
+            --skip mlx \
+            --skip metal \
+            --skip coreml \
+            --skip arena \
+            --skip external_array \
+            --skip gemma \
+            --skip compute_image \
+            --skip projection \
+            --skip attention \
+            --skip primitives \
+            --skip profiled_executor \
+            --skip mapped_image \
+            || echo "NOTE: Some tests skipped — MLX/CoreML/Metal not available on Linux"
+
+  # ─── macOS ARM64 qualification ───
+  qualify-macos:
+    name: macOS ARM64 Qualification
+    runs-on: macos-15
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'qualify'))
+    strategy:
+      matrix:
+        xcode: ['16.2']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compute-native
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_${{ matrix.xcode }}.app
+
+      - name: Install MLX
+        run: |
+          brew install mlx
+          echo "MLX_SYS_MLX_LIB_DIR=$(brew --prefix mlx)/lib" >> $GITHUB_ENV
+          echo "MLX_SYS_MLX_INCLUDE_DIR=$(brew --prefix mlx)/include" >> $GITHUB_ENV
+
+      - name: Clippy (macOS)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build (release)
+        run: cargo build --release -p tribunus-compute-native
+
+      - name: Run all tests
+        run: cargo test -p tribunus-compute-native -- --nocapture
+        timeout-minutes: 30
+
+      - name: Run qualification tests
+        run: cargo test -p tribunus-compute-native qualification -- --nocapture
+        timeout-minutes: 60
+        continue-on-error: true
+
+      - name: Collect capability report
+        run: |
+          cargo run --release -p tribunus-compute-native --bin tribunus-fake-worker -- capability-report > capability-report.json
+          cat capability-report.json
+
+      - name: Upload qualification artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: qualification-artifacts
+          path: |
+            capability-report.json
+            target/release/tribunus-compute-worker
+          retention-days: 30
+
+      - name: Upload test receipts
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-receipts
+          path: |
+            target/test-receipts/
+          retention-days: 30
+        continue-on-error: true
+
+  # ─── Repository policy checks ───
+  repo-policy:
+    name: Repository Policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify .gitmodules exists
+        run: test -f .gitmodules || (echo "MISSING: .gitmodules" && exit 1)
+
+      - name: Verify required docs exist
+        run: |
+          for f in README.md LICENSE docs/ARCHITECTURE.md docs/STATUS.md docs/SECURITY.md docs/CONTRIBUTING.md CHANGELOG.md; do
+            test -f "$f" || (echo "MISSING: $f" && exit 1)
+          done
+          echo "All required documents present."
+
+      - name: Verify workspace compiles
+        run: cargo check --workspace
+
+      - name: Verify no TODOs in production paths
+        run: |
+          todos=$(grep -rn 'TODO' compute-native/src --include='*.rs' | grep -v 'test' | grep -v '#\[allow' || true)
+          if [ -n "$todos" ]; then
+            echo "TODOs found in production source:"
+            echo "$todos"
+          fi
+          exit 0

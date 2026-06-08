@@ -1,0 +1,26 @@
+# Code Owners
+
+# Core kernel — requires maintainer review
+compute-native/src/   @tribunus-dev/maintainers
+
+# Frozen ABIs and contracts — requires maintainer sign-off
+compute-native/src/capability.rs       @tribunus-dev/maintainers
+compute-native/src/receipts.rs         @tribunus-dev/maintainers
+compute-native/src/arena.rs            @tribunus-dev/maintainers
+compute-native/src/arena_lifecycle.rs  @tribunus-dev/maintainers
+compute-native/src/worker_protocol.rs  @tribunus-dev/maintainers
+
+# MLX fork submodule
+mlx-rs-fork/   @tribunus-dev/maintainers
+
+# CI and build infrastructure
+.github/        @tribunus-dev/maintainers
+compute-native/build.rs  @tribunus-dev/maintainers
+Cargo.toml      @tribunus-dev/maintainers
+
+# Documentation
+docs/           @tribunus-dev/maintainers
+README.md       @tribunus-dev/maintainers
+
+# Security
+docs/SECURITY.md  @tribunus-dev/maintainers

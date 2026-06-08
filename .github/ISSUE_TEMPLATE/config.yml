@@ -1,0 +1,14 @@
+# Security Issue
+
+**IMPORTANT: Do not open a public issue for security vulnerabilities.**
+
+Instead, email `security@tribunus.io` with:
+
+1. A minimal reproduction case
+2. Affected component and version
+3. Impact description
+4. Any proposed fix or mitigation
+
+See [SECURITY.md](docs/SECURITY.md) for the full vulnerability reporting process.
+
+For non-security bugs, use the Bug Report template instead.
