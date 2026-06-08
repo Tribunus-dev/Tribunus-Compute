@@ -4,6 +4,7 @@ mod attention;
 mod bridge;
 pub mod compute_image;
 pub mod config;
+pub mod external_array;
 mod gemma;
 pub mod kv_cache;
 mod loader;

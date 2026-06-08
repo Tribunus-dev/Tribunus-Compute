@@ -1310,7 +1310,7 @@ impl NativeCapabilityReport {
             supports_dequantize,
             supports_memory_telemetry,
             supports_cache_control,
-            supports_external_array: false, // requires MLX C 0.6.0 no-copy constructor
+            supports_external_array: true, // qualified: no-copy round trip, finalizer fires once
             supports_multithreaded_execution: true, // qualified: 4 threads x 50 heavy matmul
             metal_available,
             accelerate_available: true,
