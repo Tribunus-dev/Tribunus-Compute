@@ -498,22 +498,42 @@ sign-off may be rejected.
 
 ## 10. License
 
-Tribunus Compute Kernel is free software: you can redistribute it and/or
-modify it under the terms of the GNU Affero General Public License as
-published by the Free Software Foundation, version 3 only.
 
-```
+## 10. License and Contributor Agreement
+
+The Tribunus Compute Kernel is dual-licensed under **AGPL-3.0-only** and a
+separate **commercial license**. See [README.md §12](../README.md#12-license)
+and [docs/LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md) for the full policy.
+
+### Contributor License Agreement
+
+To preserve the ability to continue dual-licensing the kernel, all substantial
+external contributions require a contributor license agreement (CLA) that
+grants Tribunus, Inc. sufficient copyright and patent rights to include the
+contribution under both the AGPL and the commercial license.
+
+Before submitting a substantial pull request:
+
+1. Contact `license@tribunus.io` with a summary of your intended contribution.
+2. You will receive a lightweight CLA form.
+3. Sign and return it before the PR is merged.
+
+Trivial contributions (typo fixes, one-line corrections, build configuration
+adjustments) do not require a CLA. If you are unsure whether your contribution
+is substantial, open an issue first.
+
+Without a CLA, external contributions limit the project's ability to offer
+commercial licenses. If an unsigned contribution is merged, it creates code
+that cannot be included in commercial-licensed distributions without the
+contributor's separate permission.
+
+### Third-Party Dependencies
+
+- **mlx-rs / mlx-sys**: MIT OR Apache-2.0 (upstream), AGPL-3.0-only (Tribunus patches)
+- **napi-rs / napi-derive**: MIT
+- **safetensors**: Apache-2.0
+- **MLX C**: MIT
+- **Core ML / IOSurface / Core Video**: Proprietary Apple frameworks — linked
+  at runtime on macOS; no distribution of framework binaries
+
 SPDX-License-Identifier: AGPL-3.0-only
-```
-
-This applies to all source files in `compute-native/`, the crate's build
-scripts, and supporting tooling in `tools/`.  The `mlx-rs-fork/` submodule
-carries its own MIT license (upstream) combined with Tribunus patches under
-AGPL-3.0-only; see `mlx-rs-fork/LICENSE` for details.
-
-Dependencies vendored or linked:
-- **mlx-rs / mlx-sys**: MIT (upstream), AGPL-3.0-only (Tribunus patches).
-- **napi-rs**: MIT.
-- **MLX C**: MIT.
-- **Core ML / IOSurface / Core Video**: Proprietary Apple frameworks —
-  linked at runtime on macOS; no distribution of framework binaries.
