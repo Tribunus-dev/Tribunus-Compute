@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Tribunus Compute Kernel — native MLX backend via napi-rs.
 
 mod attention;

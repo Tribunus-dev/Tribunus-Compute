@@ -31,7 +31,7 @@ You do not need a commercial license if:
 
 ## What a Commercial License Includes
 
-A commercial license from Tribunus, Inc. typically includes:
+A separately negotiated commercial license from the copyright holder may include:
 
 | Right | AGPL-3.0-only | Commercial |
 |---|---|---|
@@ -39,9 +39,9 @@ A commercial license from Tribunus, Inc. typically includes:
 | Distribute modified versions without source disclosure | No | Yes |
 | Operate a network service with modifications without Corresponding Source | No | Yes |
 | Embed the kernel in a proprietary product | No | Yes |
-| Warranties and indemnification | No (provided "AS IS") | Yes |
-| Broader patent rights beyond statutory AGPL grant | No | Yes |
-| Support and service-level agreements | No | Yes |
+| Warranties and indemnification | No (provided "AS IS") | Subject to negotiation |
+| Separately negotiated patent rights beyond AGPL §11 grant | No | Subject to negotiation |
+| Support and service-level agreements | No | Subject to negotiation |
 
 ## Patent Rights
 
@@ -54,7 +54,7 @@ beyond those necessarily infringed by the contributed code.
 
 ## How to Obtain a Commercial License
 
-Contact Tribunus, Inc. at **`license@tribunus.io`** with:
+Contact the copyright holder at **`license@tribunus.io`** with:
 
 1. Your name and organization.
 2. A description of the intended use (product, deployment model, scale).

@@ -375,3 +375,118 @@ MLX manages its own Metal command queues and GPU streams. The kernel does not cr
 ### 15.4 Core ML
 
 Core ML prediction runs on the calling thread (typically the inference thread). ANE scheduling is managed by Core ML internally.
+## 16. Security and Trust Model
+
+### 16.1 Session Isolation
+
+Every generation runs in its own ControlSessionState / InferenceSessionState machine. Session IDs are UUIDs. The state machine enforces a strict transition graph:
+
+```
+Created -> Admitted -> Submitted -> PrefillRunning -> Decoding -> Completed
+                                  `- Cancelled -'
+Any non-terminal state -> Failed
+```
+
+Terminal states (Completed, Cancelled, Failed) reject all transitions. The engine maintains a concurrent map of active sessions and refuses operations on unknown or terminal sessions.
+
+### 16.2 Worker Boundaries
+
+The model runtime executes in a separate OS subprocess. Communication is via framed JSON IPC over stdin/stdout:
+
+- **No tensor payload crosses the process boundary.** Only metadata, token IDs, and control frames are serialised.
+- The ProtocolValidator enforces frame ordering, message-kind contracts, and MAX_FRAME_SIZE_BYTES.
+- A watchdog thread monitors heartbeat frames (250 ms interval). Missing heartbeats trigger cascade: HealthCheckTimeout -> SIGKILL -> restart.
+- The engine supports transparent worker restart (up to restart_limit).
+
+### 16.3 Memory Accounting
+
+- **MLX active memory** queried via mlx_active_memory() FFI.
+- **Process RSS** sampled via task_info on macOS (mach API).
+- **Soft ceiling**: crossing worker_rss_soft_ceiling_bytes sends a MemoryPressure host command. If RSS does not fall below the reset threshold within the watchdog interval, the worker is killed.
+- **Hard ceiling**: crossing worker_rss_hard_ceiling_bytes terminates the worker immediately.
+- **Model admission**: ModelAdmissionEstimate computed at runtime-open time. The scheduler refuses admission if the estimate exceeds available budget.
+
+### 16.4 Cancellation
+
+- engine_cancel_generation() sends CancelGeneration via the host command channel.
+- The worker responds by setting an AtomicBool cancellation flag. The inference thread checks the flag between decode steps.
+- Cancellation grace period (cancellation_grace_period, default 5s). After the grace period, the worker is SIGKILL'd and restarted.
+- The stream emits Cancelled followed by no further events.
+
+### 16.5 Trust Boundaries
+
+| Boundary | Trust Model |
+|---|---|
+| JS <-> N-API | Untrusted caller. All inputs validated; arrays checked for bounds and dtype. |
+| Host <-> Worker | Worker is untrusted. Host validates all frames. Protocol version checked on handshake. |
+| Worker <-> MLX C | MLX C is trusted to not corrupt host memory. MLX C crash terminates worker. |
+| Worker <-> Core ML | Core ML is trusted for isolation (ANE/GPU memory is process-scoped). |
+| Worker <-> IOSurface | IOSurface is shared across processes only if explicitly exported (not in v0.1.0). |
+
+See SECURITY.md for detailed threat model, incident response, and disclosure process.
+
+## 17. Observability
+
+### 17.1 Receipt Schemas
+
+Receipts are serialised as JSON. Frozen per kernel major version:
+
+**ModelLoadReceipt** - image_hash, worker_pid, model_open_ms, mapped_virtual_bytes, persistent_resident_bytes, materialized_bytes, copied_bytes, tensor_binding_count, segment_count, mlx_active_limit_bytes, mlx_cache_limit_bytes, rss_before_bytes, rss_after_bytes, admission_estimate.
+
+**ArenaCreationReceipt** - arena_id (UUID), generation (monotonic counter), io_surface_id, logical_shape, physical_width, physical_height, bytes_per_row, total_bytes, pixel_format, profile, created_at.
+
+**CoreMlPredictionReceipt** - job_id, model_hash, island_id, input_arena_id, input_io_surface_id, input_shape, output_arena_id, output_io_surface_id, output_shape, output_backing_feature, duration_ms, copy_classification, internal_coreml_staging, success.
+
+**HybridJobReceipt** - full job lifecycle: job_id, session_id, compute_image_hash, coreml_artifact_hash, macos_version, capability_report_hash, state_id, arena IDs, lease_transitions, coreml_predictions, state_mutations, total_duration_ms, application_copy_free, finalizer_count, final_arena_state, success, error.
+
+**CopyClassification** values: application_copy_free, copied_fallback, materialized_layout_conversion, internal_coreml_staging_unknown.
+
+### 17.2 Reading Receipts
+
+Receipts are produced by the receipt emitter and returned as JSON strings through the N-API bridge. They serve as the source of truth for:
+
+- Proving whether a generation was application_copy_free (no app-level copies)
+- Verifying IOSurface IDs and arena shapes match expectations
+- Auditing worker memory consumption and MLX active-memory limits
+- Detecting internal Core ML staging (always true/unknown for IOSurface path)
+
+## 18. Storage Capabilities
+
+### 18.1 Storage Modes
+
+- **Copied-v0** (baseline): CPU-allocated, runtime-ready image.
+- **Mapped-no-copy-v1** (in progress): mmap'd segment files with TensorEntry offset tables, designed for direct Metal buffer wrapping.
+
+### 18.2 SharedTensorArena
+
+IOSurface-backed FP16 boundary tensors with ArenaInfo C-compatible struct. FFI to ObjC++ bridge for IOSurfaceCreate, CVPixelBufferCreate, MLMultiArray wrapping.
+
+### 18.3 IOSurface FP16 Canonical Boundary Path
+
+MLX writes arena A through external array -> evaluation completes -> ownership transfers to Core ML -> Core ML reads via MLMultiArray -> Core ML writes arena B through outputBackings -> ownership transfers to MLX -> MLX consumes via external array. Copy classification: application_copy_free = true.
+
+### 18.4 ExternalHostMemory Fallback
+
+Arena allocated via posix_memalign, MLX wraps via mlx_array_new_data_managed, Core ML reads via initWithDataPointer.
+
+## 19. Memory Management Detail
+
+### 19.1 Machine Profile Detection
+
+hw.memsize sysctl, system reserve subtraction, GPU family identification.
+
+### 19.2 MLX Limit Configuration
+
+Active memory ceiling, cache limit, RSS soft/hard ceilings. Configured via ExecutionPolicy.
+
+### 19.3 Residency Manager
+
+Prefetched -> Bound -> InFlight -> Retired lifecycle with configurable budget and safety reserve.
+
+### 19.4 Memory Telemetry
+
+mlx_active_memory() (MLX Metal active bytes), mlx_clear_cache() (MIL cache flush), sample_process_rss_self() via mach.
+
+### 19.5 Copy Ledger
+
+Per-operation copy tracking with CopyClass taxonomy (zero-copy-mapped, IO-surface-shared, explicit-CPU-staging, etc.).
