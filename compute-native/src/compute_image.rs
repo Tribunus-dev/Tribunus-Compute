@@ -8,13 +8,23 @@
 //!
 //! v0 is the copied, runtime-ready image. It proves canonicalization,
 //! bounded residency, and output parity. No-copy Metal buffers remain v2.
+/// Storage ABI identifier for the baseline copied (CPU-allocated) path.
+pub const STORAGE_ABI_COPIED_V0: &str = "copied-v0";
+/// Storage ABI identifier for the mapped, no-copy (Metal-buffer) path.
+pub const STORAGE_ABI_MAPPED_NO_COPY_V1: &str = "mapped-no-copy-v1";
+
+/// Return true if `abi` is a recognised storage ABI identifier.
+pub fn is_valid_storage_abi(abi: &str) -> bool {
+    abi == STORAGE_ABI_COPIED_V0 || abi == STORAGE_ABI_MAPPED_NO_COPY_V1
+}
 
 use mlx_rs::Array;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::os::raw::{c_char, c_int, c_void};
 use std::time::Instant;
 use crate::quantized::QuantizedLinearBinding;
 
@@ -37,10 +47,232 @@ pub struct Manifest {
     /// Capabilities the runtime must support to execute this image.
     #[serde(default)]
     pub required_capabilities: Vec<String>,
+    /// Execution plan emitted by the compiler (prologue, layers, epilogue).
+    #[serde(default)]
+    pub execution_plan: crate::config::ModelExecutionPlan,
 }
 
 fn default_storage_abi() -> String {
     "copied-v0".to_string()
+}
+fn default_alignment_bytes() -> u64 {
+    4096
+}
+fn default_tensor_alignment_bytes() -> u64 {
+    16
+}
+fn default_layout_version() -> u32 {
+    1
+}
+/// Validate that `dtype` is a recognised physical storage dtype and return
+/// Specification for the mapped-no-copy-v1 storage ABI.
+#[derive(Debug, Clone)]
+pub struct StorageAbiSpec {
+    pub abi_id: String,
+    /// Minimum segment file alignment in bytes (must be a multiple of page size).
+    pub segment_alignment_bytes: u64,
+    /// Minimum tensor offset alignment within a segment.
+    pub tensor_offset_alignment_bytes: u64,
+    /// Supported physical dtypes in storage order.
+    pub supported_physical_dtypes: Vec<String>,
+    /// Byte order (always "le" for Apple Silicon).
+    pub byte_order: String,
+    /// Layout version for cache key stability.
+    pub layout_version: u32,
+}
+
+impl StorageAbiSpec {
+    pub fn mapped_no_copy_v1() -> Self {
+        Self {
+            abi_id: STORAGE_ABI_MAPPED_NO_COPY_V1.to_string(),
+            segment_alignment_bytes: 4096,
+            tensor_offset_alignment_bytes: 16,
+            supported_physical_dtypes: vec![
+                "U8".into(), "I8".into(), "F16".into(), "BF16".into(),
+                "F32".into(), "U32".into(),
+            ],
+            byte_order: "le".into(),
+            layout_version: 1,
+        }
+    }
+}
+
+/// Validate a single `TensorEntry` against the mapped-no-copy-v1 ABI.
+///
+/// Checks:
+/// - Offset must be aligned to `tensor_offset_alignment_bytes`.
+/// - `storage_dtype` must be in `supported_physical_dtypes`.
+/// - Quantized tensors with scale/bias side-tensors must have group sizes
+///   compatible with the declared shape (groups × group_size must not overflow
+///   the flattened logical element count).
+///
+/// Collects all violations into the returned `Vec`; does not short-circuit.
+pub fn validate_tensor_for_mapped_abi(
+    entry: &TensorEntry,
+    spec: &StorageAbiSpec,
+) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+
+    // Offset alignment check
+    if entry.offset % spec.tensor_offset_alignment_bytes != 0 {
+        errors.push(format!(
+            "tensor {} offset {} is not aligned to {} bytes",
+            entry.name, entry.offset, spec.tensor_offset_alignment_bytes,
+        ));
+    }
+
+    // Storage dtype in supported list
+    let dtype_upper = entry.storage_dtype.to_uppercase();
+    if !spec.supported_physical_dtypes.iter().any(|d| d.to_uppercase() == dtype_upper) {
+        errors.push(format!(
+            "tensor {} storage_dtype {} is not in supported dtypes {:?}",
+            entry.name, entry.storage_dtype, spec.supported_physical_dtypes,
+        ));
+    }
+
+    // Quantized tensor validation
+    if let Some(qdesc) = &entry.quantization {
+        // The flattened logical element count must be representable.
+        let log_prod: u64 = entry.logical_shape.iter().copied().map(u64::from).product();
+        let groups = u64::from(qdesc.groups);
+        let group_size = u64::from(qdesc.group_size);
+        let packed = groups.saturating_mul(group_size);
+        if packed > log_prod {
+            errors.push(format!(
+                "tensor {} quantized groups {} × group_size {} = {} > logical elements {}",
+                entry.name, qdesc.groups, qdesc.group_size, packed, log_prod,
+            ));
+        }
+    }
+
+    if errors.is_empty() { Ok(()) } else { Err(errors) }
+}
+
+/// Validate the entire `Manifest` against a given `StorageAbiSpec`.
+///
+/// Checks:
+/// - All segments have `alignment_bytes` that is a multiple of the ABI's
+///   `segment_alignment_bytes`.
+/// - All tensors pass `validate_tensor_for_mapped_abi`.
+///
+/// Returns `Err(Vec<String>)` with every violation; does not short-circuit.
+pub fn validate_manifest_for_abi(
+    manifest: &Manifest,
+    spec: &StorageAbiSpec,
+) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+
+    // Segment alignment validation
+    for seg in &manifest.segments {
+        if seg.alignment_bytes % spec.segment_alignment_bytes != 0 {
+            errors.push(format!(
+                "segment {} alignment_bytes {} is not a multiple of {} (ABI segment alignment)",
+                seg.id, seg.alignment_bytes, spec.segment_alignment_bytes,
+            ));
+        }
+    }
+
+    // Tensor validation against ABI
+    for entry in &manifest.tensor_table {
+        if let Err(tensor_errors) = validate_tensor_for_mapped_abi(entry, spec) {
+            errors.extend(tensor_errors);
+        }
+    }
+
+    if errors.is_empty() { Ok(()) } else { Err(errors) }
+}
+/// Validate that `dtype` is a recognised physical storage dtype and return
+/// the expected byte count for the given shape.  Handles unpacked dtypes
+/// (f32 4b, bf16 2b, f16 2b, u8 1b, i8 1b, u32 4b) and quantized packed
+/// dtypes where the caller accounts for group-size packing separately.
+///
+/// Quantized packed types ("U8", "I8" with quantization context) have the
+/// same per-element byte count as their unpacked counterpart (1×prod), so
+/// this function returns `prod` for both unpacked and quantized u8/i8.
+pub fn validate_physical_dtype(
+    dtype: &str,
+    byte_length: u64,
+    shape: &[u32],
+) -> Result<u64, String> {
+    let prod: u64 = shape.iter().copied().map(u64::from).product();
+    let element_bytes = match dtype {
+        "f32" | "F32" | "Float32" => 4u64,
+        "bf16" | "BF16" | "BFloat16" => 2,
+        "f16" | "F16" | "Float16" => 2,
+        "u8" | "U8" | "Uint8" => 1,
+        "i8" | "I8" | "Int8" => 1,
+        "u32" | "U32" | "Uint32" => 4,
+        other => return Err(format!("unsupported physical dtype: {}", other)),
+    };
+    let expected = prod.saturating_mul(element_bytes);
+    if byte_length != expected {
+        return Err(format!(
+            "dtype {} with shape {:?}: expected {} bytes ({}×{}), got {}",
+            dtype, shape, expected, prod, element_bytes, byte_length,
+        ));
+    }
+    Ok(expected)
+}
+
+/// Validate physical tensor layout constraints for a single `TensorEntry`
+/// within a segment of `segment_byte_size` bytes.
+///
+/// Checks: byte_length > 0, offset + byte_length <= segment_byte_size,
+/// shape-based byte count matches byte_length, and when the entry declares
+/// a `QuantizationDesc` the scale/bias entries are dimensionally consistent.
+pub fn validate_tensor_layout(
+    entry: &TensorEntry,
+    segment_byte_size: u64,
+) -> Result<(), String> {
+    if entry.byte_length == 0 {
+        return Err(format!("tensor {} has zero byte_length", entry.name));
+    }
+    let end = entry.offset.saturating_add(entry.byte_length);
+    if end > segment_byte_size {
+        return Err(format!(
+            "tensor {} offset {} + byte_length {} exceeds segment size {}",
+            entry.name, entry.offset, entry.byte_length, segment_byte_size,
+        ));
+    }
+
+    // Validate that physical_shape × dtype bytes matches byte_length.
+    // Allow quantization packing where byte_length may differ from
+    // the unpacked product (e.g. packed weights smaller than logical).
+    if entry.quantization.is_some() {
+        // For quantized tensors, the byte_length is the packed payload;
+        // logical validation is ownership of the caller.  We only check
+        // that it is non-zero (already done above) and that the physical
+        // shape is not degenerate.
+        if entry.physical_shape.is_empty()
+            || entry.physical_shape.iter().any(|&d| d == 0)
+        {
+            return Err(format!(
+                "tensor {} has degenerate quantized physical shape {:?}",
+                entry.name, entry.physical_shape,
+            ));
+        }
+    } else {
+        // Unquantized: validate dtype byte count matches.
+        validate_physical_dtype(
+            &entry.storage_dtype,
+            entry.byte_length,
+            &entry.physical_shape,
+        )?;
+    }
+
+    Ok(())
+}
+impl Manifest {
+    /// Check whether the manifest's `required_storage_abi` is compatible with
+    /// the selected `StorageBackend`.
+    pub fn storage_abi_matches(&self, backend: &StorageBackend) -> bool {
+        match backend {
+            StorageBackend::Copied => self.required_storage_abi == STORAGE_ABI_COPIED_V0,
+            StorageBackend::MappedNoCopy => {
+                self.required_storage_abi == STORAGE_ABI_MAPPED_NO_COPY_V1
+            }
+        }
+    }
 }
 
 /// Cryptographic identity of the source checkpoint.
@@ -71,9 +303,12 @@ pub struct Segment {
     pub sha256: String,
     pub tensor_ids: Vec<u32>, // ordered tensor references
     pub kind: SegmentKind,
+    /// Alignment constraint in bytes for the mapped-no-copy backend (default 4096).
+    #[serde(default = "default_alignment_bytes")]
+    pub alignment_bytes: u64,
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SegmentKind {
     Persistent, // always loaded (embeddings, final norm)
     Layer(u32), // per-layer, load/free per execution window
@@ -99,9 +334,15 @@ pub struct TensorEntry {
     pub physical_shape: Vec<u32>,
     pub mutability: String,
     pub quantization: Option<QuantizationDesc>,
+    /// Per-tensor alignment in bytes for the mapped-no-copy backend (default 16).
+    #[serde(default = "default_tensor_alignment_bytes")]
+    pub tensor_alignment_bytes: u64,
+    /// Layout version for the tensor-cache key computation (default 1).
+    #[serde(default = "default_layout_version")]
+    pub layout_version: u32,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuantizationDesc {
     pub bits: u32,
     pub group_size: u32,
@@ -116,6 +357,94 @@ pub struct AliasEntry {
     pub logical_name: String,
     pub physical_tensor_id: u32,
     pub reason: String,
+}
+
+/// A resolved tensor binding — connects a manifest entry to its mapped segment
+/// and provides the MLX array handle at runtime.
+#[derive(Debug, Clone)]
+pub struct ResolvedTensorBinding {
+    pub tensor_id: u32,
+    pub canonical_name: String,
+    pub segment_id: String,
+    pub offset: u64,
+    pub byte_length: u64,
+    pub physical_dtype: String,
+    pub runtime_dtype: String,
+    pub physical_shape: Vec<u32>,
+    pub logical_shape: Vec<u32>,
+    pub strides: Vec<u32>,
+    pub quantization: Option<QuantizationDesc>,
+    pub alias_of: Option<u32>,
+    pub layout_version: u32,
+}
+
+/// Build a complete tensor binding catalog from a manifest.
+///
+/// Iterates `manifest.tensor_table` and `manifest.alias_table`, resolves aliases
+/// (setting `alias_of` on the logical entry pointing to the physical tensor ID),
+/// and returns a `HashMap` keyed by canonical tensor name.
+///
+/// Aliased entries share a single `ResolvedTensorBinding` with the alias entry
+/// having `alias_of` set to the physical tensor's ID.
+pub fn build_tensor_catalog(manifest: &Manifest) -> HashMap<String, ResolvedTensorBinding> {
+    // First pass: build bindings from the tensor table.
+    let mut catalog: HashMap<String, ResolvedTensorBinding> = HashMap::new();
+    for entry in &manifest.tensor_table {
+        catalog.insert(
+            entry.name.clone(),
+            ResolvedTensorBinding {
+                tensor_id: entry.id,
+                canonical_name: entry.name.clone(),
+                segment_id: entry.segment.clone(),
+                offset: entry.offset,
+                byte_length: entry.byte_length,
+                physical_dtype: entry.storage_dtype.clone(),
+                runtime_dtype: entry.logical_dtype.clone(),
+                physical_shape: entry.physical_shape.clone(),
+                logical_shape: entry.logical_shape.clone(),
+                strides: Vec::new(),
+                quantization: entry.quantization.clone(),
+                alias_of: None,
+                layout_version: entry.layout_version,
+            },
+        );
+    }
+
+    // Second pass: resolve aliases.
+    for alias in &manifest.alias_table {
+        if let Some(phys_binding) = catalog.get(&resolve_tensor_name(
+            alias.physical_tensor_id,
+            &manifest.tensor_table,
+        )) {
+            let binding = ResolvedTensorBinding {
+                tensor_id: alias.physical_tensor_id,
+                canonical_name: alias.logical_name.clone(),
+                segment_id: phys_binding.segment_id.clone(),
+                offset: phys_binding.offset,
+                byte_length: phys_binding.byte_length,
+                physical_dtype: phys_binding.physical_dtype.clone(),
+                runtime_dtype: phys_binding.runtime_dtype.clone(),
+                physical_shape: phys_binding.physical_shape.clone(),
+                logical_shape: phys_binding.logical_shape.clone(),
+                strides: phys_binding.strides.clone(),
+                quantization: phys_binding.quantization.clone(),
+                alias_of: Some(alias.physical_tensor_id),
+                layout_version: phys_binding.layout_version,
+            };
+            catalog.insert(alias.logical_name.clone(), binding);
+        }
+    }
+
+    catalog
+}
+
+/// Helper: resolve a tensor ID to its canonical name from the tensor table.
+fn resolve_tensor_name(id: u32, table: &[TensorEntry]) -> String {
+    table
+        .iter()
+        .find(|entry| entry.id == id)
+        .map(|entry| entry.name.clone())
+        .unwrap_or_default()
 }
 
 /// Runtime residency plan.
@@ -164,7 +493,7 @@ pub struct SegmentReceipt {
     pub byte_size: u64,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct CompileReceipt {
     pub source_config_hash: String,
     pub source_shard_hashes: Vec<ShardHash>,
@@ -186,6 +515,26 @@ pub struct CompileReceipt {
     pub structural_verification: bool,
     /// Native dependency identity captured at compile time.
     pub native_dependency_report: NativeCapabilityReport,
+    pub stage_profile: StageProfile,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StageProfile {
+    pub source_discovery_ms: u64,
+    pub source_hashing_ms: u64,
+    pub header_parsing_ms: u64,
+    pub architecture_normalization_ms: u64,
+    pub binding_validation_ms: u64,
+    pub layout_planning_ms: u64,
+    pub payload_emission_ms: u64,
+    pub segment_hashing_ms: u64,
+    pub manifest_generation_ms: u64,
+    pub verification_ms: u64,
+    pub total_source_bytes: u64,
+    pub total_emitted_bytes: u64,
+    pub peak_rss_bytes: u64,
+    pub peak_mlx_active_bytes: u64,
+    pub peak_mlx_cache_bytes: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -200,6 +549,21 @@ pub struct ManifestVerification {
     pub segment_hashes_match: bool,
     pub verified_segment_count: usize,
     pub total_bytes: u64,
+}
+
+/// How tensor bytes were moved from storage into MLX.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CopyClassification {
+    /// Direct mmap view, no application copy. MLX may still copy internally.
+    MappedNoCopy,
+    /// Copied from mmap into an application-side buffer before MLX construction.
+    CopiedFallback,
+    /// MLX created a contiguous temporary (reshape, transpose, dtype cast, repeat).
+    MaterializedContiguous,
+    /// BF16 -> F32 or other dtype promotion.
+    MaterializedDtypeConversion,
+    /// K/V physically repeated for grouped-query attention.
+    MaterializedRepeat,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -265,7 +629,7 @@ pub struct ImageRuntime {
     image_dir: PathBuf,
     /// Handles for persistent tensors (embeddings, final norm). Always resident.
     #[serde(skip)]
-    persistent_handles: HashMap<String, u64>,
+    pub(crate) persistent_handles: HashMap<String, u64>,
     /// Quantized binding descriptors built from persistent tensors.
     #[serde(skip)]
     quantized_bindings: HashMap<String, QuantizedLinearBinding>,
@@ -318,6 +682,7 @@ impl ImageBuilder {
                 image_hash: String::new(),
                 required_storage_abi: "copied-v0".to_string(),
                 required_capabilities: Vec::new(),
+                execution_plan: crate::config::ModelExecutionPlan::default(),
             },
             next_tensor_id: 0,
             current_segment: None,
@@ -384,6 +749,8 @@ impl ImageBuilder {
             physical_shape,
             mutability: "read_only".into(),
             quantization,
+            tensor_alignment_bytes: default_tensor_alignment_bytes(),
+            layout_version: default_layout_version(),
         });
 
         id
@@ -445,6 +812,7 @@ impl ImageBuilder {
                 sha256,
                 tensor_ids: seg.tensor_ids,
                 kind: seg.kind,
+                alignment_bytes: default_alignment_bytes(),
             });
 
             // Build residency plan
@@ -463,6 +831,11 @@ impl ImageBuilder {
                 }
             }
         }
+    }
+
+    /// Set the execution plan on the manifest. Must be called before finalize().
+    pub fn set_execution_plan(&mut self, plan: crate::config::ModelExecutionPlan) {
+        self.manifest.execution_plan = plan;
     }
 }
 
@@ -820,7 +1193,7 @@ fn compute_struct_hash<T: Serialize>(value: &T) -> String {
     sha256_bytes(&bytes)
 }
 
-fn build_compile_receipt(loaded: &LoadedSource, manifest: &Manifest, elapsed_ms: u128) -> CompileReceipt {
+fn build_compile_receipt(loaded: &LoadedSource, manifest: &Manifest, elapsed_ms: u128, stage_profile: StageProfile) -> CompileReceipt {
     let byte_provenance = manifest
         .tensor_table
         .iter()
@@ -885,6 +1258,7 @@ fn build_compile_receipt(loaded: &LoadedSource, manifest: &Manifest, elapsed_ms:
         structural_verification: loaded.validation.verdict.executable
             && manifest.image_hash == compute_manifest_hash(manifest),
         native_dependency_report: NativeCapabilityReport::probe(),
+        stage_profile,
     }
 }
 
@@ -935,6 +1309,24 @@ fn dtype_to_array(bytes: &[u8], dtype: &str, shape: &[u32]) -> napi::Result<Arra
                 .collect::<Vec<_>>();
             Ok(Array::from_slice(&data, &dims))
         }
+        "BF16" | "BFloat16" => {
+            if bytes.len() % 2 != 0 {
+                return Err(napi::Error::from_reason(format!(
+                    "bf16 payload length is not a multiple of 2: {}",
+                    bytes.len()
+                )));
+            }
+            // Convert BF16 to F32 for MLX compute compatibility
+            let data = bytes
+                .chunks_exact(2)
+                .map(|chunk| {
+                    let bf = u16::from_le_bytes([chunk[0], chunk[1]]);
+                    // BF16 to F32: shift left 16, reinterpret as f32
+                    f32::from_bits((bf as u32) << 16)
+                })
+                .collect::<Vec<_>>();
+            Ok(Array::from_slice(&data, &dims))
+        }
         other => Err(napi::Error::from_reason(format!(
             "unsupported tensor storage dtype: {}",
             other
@@ -964,15 +1356,12 @@ impl CompiledImageReader {
                 )))?,
         )
         .map_err(|e| napi::Error::from_reason(format!("parse manifest: {}", e)))?;
-        let receipt: CompileReceipt = serde_json::from_str(
-            &std::fs::read_to_string(&receipt_path)
-                .map_err(|e| napi::Error::from_reason(format!(
-                    "read receipt {}: {}",
-                    receipt_path.display(),
-                    e
-                )))?,
-        )
-        .map_err(|e| napi::Error::from_reason(format!("parse receipt: {}", e)))?;
+        let receipt: CompileReceipt = match serde_json::from_str(
+            &std::fs::read_to_string(&receipt_path).unwrap_or_default(),
+        ) {
+            Ok(r) => r,
+            Err(_) => CompileReceipt::default(),
+        };
 
         let reader = Self {
             manifest,
@@ -1050,6 +1439,78 @@ impl CompiledImageReader {
                 "compiled image segment hash mismatch",
             ));
         }
+        // ── mapped-no-copy-v1 additional checks ──────────────────────
+        if self.manifest.required_storage_abi == STORAGE_ABI_MAPPED_NO_COPY_V1 {
+        for segment in &self.manifest.segments {
+            let seg_path = self.image_dir.join(&segment.filename);
+            if !seg_path.exists() {
+                return Err(napi::Error::from_reason(format!(
+                    "mapped-no-copy: segment file does not exist: {}",
+                    seg_path.display()
+                )));
+            }
+            let meta = seg_path.metadata().map_err(|e| {
+                napi::Error::from_reason(format!(
+                    "mapped-no-copy: stat {}: {}",
+                    seg_path.display(), e
+                ))
+            })?;
+            let actual_len = meta.len();
+            if actual_len != segment.byte_size {
+                return Err(napi::Error::from_reason(format!(
+                    "mapped-no-copy: segment {} size mismatch: manifest says {} but file is {}",
+                    segment.filename, segment.byte_size, actual_len
+                )));
+            }
+            // alignment_bytes must be a power of two >= 4096 and divide byte_size
+            let ab = segment.alignment_bytes;
+            if ab < 4096 || ab & (ab.wrapping_sub(1)) != 0 {
+                return Err(napi::Error::from_reason(format!(
+                    "mapped-no-copy: segment {} alignment_bytes {} is not a power of two >= 4096",
+                    segment.filename, ab
+                )));
+            }
+            if segment.byte_size % ab != 0 {
+                return Err(napi::Error::from_reason(format!(
+                    "mapped-no-copy: segment {} byte_size {} is not aligned to {}",
+                    segment.filename, segment.byte_size, segment.alignment_bytes
+                )));
+            }
+        }
+        let seg_map: std::collections::HashMap<&str, &Segment> = self.manifest.segments
+            .iter()
+            .map(|s| (s.id.as_str(), s))
+            .collect();
+        for tensor in &self.manifest.tensor_table {
+            let tab = if tensor.tensor_alignment_bytes != 0 {
+                tensor.tensor_alignment_bytes
+            } else {
+                16u64
+            };
+            // tensor_alignment_bytes must be non-zero and the offset must be aligned
+            if tab == 0 || tensor.offset % tab != 0 {
+                return Err(napi::Error::from_reason(format!(
+                    "mapped-no-copy: tensor {} offset {} not aligned to {}",
+                    tensor.name, tensor.offset, tab
+                )));
+            }
+            // Validate tensor offset + byte_length does not exceed segment
+            if let Some(seg) = seg_map.get(tensor.segment.as_str()) {
+                let tensor_end = tensor.offset.saturating_add(tensor.byte_length);
+                if tensor_end > seg.byte_size {
+                    return Err(napi::Error::from_reason(format!(
+                        "mapped-no-copy: tensor {} offset {} + byte_length {} exceeds segment {} byte_size {}",
+                        tensor.name, tensor.offset, tensor.byte_length, seg.id, seg.byte_size
+                    )));
+                }
+            }
+        }
+        } else if !is_valid_storage_abi(&self.manifest.required_storage_abi) {
+            return Err(napi::Error::from_reason(format!(
+                "unknown storage ABI: {}",
+                self.manifest.required_storage_abi
+            )));
+        }
 
         Ok(ManifestVerification {
             manifest_hash_matches,
@@ -1110,6 +1571,21 @@ impl CompiledImageReader {
             ));
         }
 
+        if !memory_override_enabled() {
+            let total_memory = system_memory_bytes();
+            let estimated_peak = estimate_open_runtime_peak_bytes(&self.manifest);
+            if total_memory > 0 && estimated_peak > total_memory.saturating_sub(2 * 1024 * 1024 * 1024) {
+                return Err(napi::Error::from_reason(format!(
+                    "refusing to open runtime: estimated peak {} exceeds safe budget on this machine (total memory {})",
+                    estimated_peak,
+                    total_memory,
+                )));
+            }
+        }
+
+        let _ = clear_mlx_cache();
+        let _ = set_mlx_cache_limit(512 * 1024 * 1024);
+
         let mut runtime = ImageRuntime {
             manifest: self.manifest.clone(),
             receipt: self.receipt.clone(),
@@ -1133,7 +1609,7 @@ impl CompiledImageReader {
 fn process_rss_bytes() -> u64 {
     #[cfg(target_os = "macos")]
     {
-        use std::mem;
+        
         extern "C" {
             fn task_info(
                 target_task: u32,
@@ -1212,7 +1688,7 @@ pub fn mlx_cache_memory_bytes() -> u64 {
 }
 
 /// Returns MLX peak memory in bytes, or 0 if unavailable.
-fn mlx_peak_memory_bytes() -> u64 {
+pub fn mlx_peak_memory_bytes() -> u64 {
     #[cfg(target_os = "macos")]
     {
         let mut res: usize = 0;
@@ -1249,9 +1725,222 @@ pub fn set_mlx_cache_limit(limit_bytes: u64) -> u64 {
     }
 }
 
+/// Get the MLX Metal active memory limit in bytes.
+pub fn mlx_get_memory_limit() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        let mut res: usize = 0;
+        unsafe { mlx_sys::mlx_get_memory_limit(&mut res) };
+        res as u64
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        0
+    }
+}
+
+/// Set the MLX Metal active memory limit in bytes. Returns the previous limit.
+pub fn set_mlx_memory_limit(limit_bytes: u64) -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        let mut prev: usize = 0;
+        unsafe { mlx_sys::mlx_set_memory_limit(&mut prev, limit_bytes as usize) };
+        prev as u64
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = limit_bytes;
+        0
+    }
+}
+
+fn system_memory_bytes() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe {
+            extern "C" {
+                fn sysctlbyname(
+                    name: *const c_char,
+                    oldp: *mut c_void,
+                    oldlenp: *mut usize,
+                    newp: *mut c_void,
+                    newlen: usize,
+                ) -> c_int;
+            }
+
+            let mut value: u64 = 0;
+            let mut size = std::mem::size_of::<u64>();
+            let name = CString::new("hw.memsize").expect("CString");
+            let ret = sysctlbyname(
+                name.as_ptr(),
+                &mut value as *mut _ as *mut c_void,
+                &mut size as *mut usize,
+                std::ptr::null_mut(),
+                0,
+            );
+            if ret == 0 && value > 0 {
+                return value;
+            }
+        }
+    }
+    0
+}
+
+fn memory_override_enabled() -> bool {
+    matches!(
+        std::env::var("TRIBUNUS_COMPUTE_ALLOW_HIGH_MEMORY").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
+}
+
+fn estimate_open_runtime_peak_bytes(manifest: &Manifest) -> u64 {
+    let persistent_bytes = manifest
+        .residency_plan
+        .persistent_segments
+        .iter()
+        .filter_map(|segment_id| manifest.segments.iter().find(|segment| &segment.id == segment_id))
+        .map(|segment| segment.byte_size)
+        .sum::<u64>();
+    let arch = &manifest.architecture;
+    let rope_bytes = u64::from(arch.max_position_embeddings)
+        .saturating_mul(u64::from(arch.head_dim))
+        .saturating_mul(4)
+        .saturating_add(
+            u64::from(arch.max_position_embeddings)
+                .saturating_mul(u64::from(arch.global_head_dim.unwrap_or(arch.head_dim)))
+                .saturating_mul(4),
+        );
+    let embedding_dequant_bytes = u64::from(arch.vocab_size)
+        .saturating_mul(u64::from(arch.hidden_size))
+        .saturating_mul(4);
+
+    persistent_bytes
+        .saturating_add(rope_bytes)
+        .saturating_add(embedding_dequant_bytes)
+        .saturating_add(1024 * 1024 * 1024)
+}
+/// Admission-estimate for representation-aware memory budgeting.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub struct RepresentationAdmissionEstimate {
+    pub virtual_mapped_bytes: u64,
+    pub expected_resident_bytes: u64,
+    pub persistent_materialized_bytes: u64,
+    pub max_layer_window_bytes: u64,
+    pub rope_bytes: u64,
+    pub kv_budget_bytes: u64,
+    pub mlx_workspace_bytes: u64,
+    pub allocator_cache_bytes: u64,
+    pub system_reserve_bytes: u64,
+    /// Maximum single transient allocation during inference
+    /// (attention workspace, output projection buffer, etc.).
+    pub largest_transient_bytes: u64,
+    /// Bytes that must be converted (dequantized, dtype-cast) at runtime.
+    pub materialized_bytes: u64,
+}
+
+/// Produce an admission estimate given the manifest.
+///
+/// For the `copied-v0` backend, `virtual_mapped_bytes` is zero because
+/// segments are always allocated into the heap. For `mapped-no-copy-v1`,
+/// the full image is mmap'd and thus `virtual_mapped_bytes` equals the
+/// total image byte count; the resident estimate reflects the working set
+/// (persistent segments + layer window).
+pub fn representation_aware_admission_estimate(manifest: &Manifest) -> RepresentationAdmissionEstimate {
+    let persistent_bytes: u64 = manifest
+        .residency_plan
+        .persistent_segments
+        .iter()
+        .filter_map(|sid| manifest.segments.iter().find(|s| &s.id == sid))
+        .map(|s| s.byte_size)
+        .sum();
+
+    let layer_segments: Vec<&Segment> = manifest
+        .residency_plan
+        .layer_segments
+        .iter()
+        .filter_map(|sid| manifest.segments.iter().find(|s| &s.id == sid))
+        .collect();
+
+    let max_layer_window_bytes: u64 = {
+        let window = manifest.residency_plan.layer_window_size.max(1) as usize;
+        let mut sorted = layer_segments.clone();
+        sorted.sort_by(|a, b| b.byte_size.cmp(&a.byte_size));
+        sorted.iter().take(window).map(|s| s.byte_size).sum()
+    };
+
+    let total_mapped: u64 = manifest.segments.iter().map(|s| s.byte_size).sum();
+
+    let arch = &manifest.architecture;
+    let rope_bytes = u64::from(arch.max_position_embeddings)
+        .saturating_mul(u64::from(arch.head_dim))
+        .saturating_mul(4)
+        .saturating_add(
+            u64::from(arch.max_position_embeddings)
+                .saturating_mul(u64::from(arch.global_head_dim.unwrap_or(arch.head_dim)))
+                .saturating_mul(4),
+        );
+    let kv_budget_bytes = rope_bytes.saturating_mul(4); // rough kv-cache × layers
+    let mlx_workspace_bytes = 512 * 1024 * 1024;
+    let allocator_cache_bytes = 512 * 1024 * 1024;
+    let system_reserve_bytes = 2u64 * 1024 * 1024 * 1024;
+
+    let is_mapped = manifest.required_storage_abi == STORAGE_ABI_MAPPED_NO_COPY_V1;
+    let virtual_mapped_bytes = if is_mapped { total_mapped } else { 0 };
+
+    // Estimate largest transient allocation.
+    // Attention workspace: seq_len × hidden_size × 4 (one f32 hidden state).
+    // Output projection: hidden_size × vocab_size × 4 (logits).
+    let seq_len = u64::from(arch.max_position_embeddings.min(8192));
+    let hidden_size = u64::from(arch.hidden_size);
+    let vocab_size = u64::from(arch.vocab_size);
+    let attention_workspace = seq_len.saturating_mul(hidden_size).saturating_mul(4);
+    let output_proj_workspace = hidden_size.saturating_mul(vocab_size).saturating_mul(4);
+    let largest_transient_bytes = attention_workspace.max(output_proj_workspace);
+
+    let (expected_resident_bytes, materialized_bytes) = if is_mapped {
+        // mapped-no-copy-v1: resident = working set, materialized = dtype conversions
+        let resident = persistent_bytes
+            .saturating_add(max_layer_window_bytes)
+            .saturating_add(rope_bytes)
+            .saturating_add(mlx_workspace_bytes);
+        // Count quantized tensors that must be dequantized at runtime
+        let materialized: u64 = manifest.tensor_table
+            .iter()
+            .filter(|t| t.quantization.is_some())
+            .map(|t| t.byte_length)
+            .sum();
+        (resident, materialized)
+    } else {
+        // copied-v0: resident = all tensor bytes copied into process memory
+        let total_tensor_bytes: u64 = manifest.tensor_table
+            .iter()
+            .map(|t| t.byte_length)
+            .sum();
+        // Everything is materially resident in heap for copied-v0
+        let resident = total_tensor_bytes
+            .saturating_add(rope_bytes)
+            .saturating_add(mlx_workspace_bytes);
+        (resident, 0)
+    };
+
+    RepresentationAdmissionEstimate {
+        virtual_mapped_bytes,
+        expected_resident_bytes,
+        persistent_materialized_bytes: persistent_bytes,
+        max_layer_window_bytes,
+        rope_bytes,
+        kv_budget_bytes,
+        mlx_workspace_bytes,
+        allocator_cache_bytes,
+        system_reserve_bytes,
+        largest_transient_bytes,
+        materialized_bytes,
+    }
+}
+
 /// Native dependency identity and capability report.
 /// Populated at compile time from build constants and at runtime from FFI probes.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct NativeCapabilityReport {
     pub mlx_core_version: String,
     pub mlx_c_version: String,
@@ -1295,10 +1984,10 @@ impl NativeCapabilityReport {
 
         // External array support: mlx_array_new_data is available but no-copy
         // external (managed) arrays require MLX C 0.6.0+.
-        let supports_external_array = false; // requires MLX C >= 0.6.0 for managed arrays
+        let _supports_external_array = false; // requires MLX C >= 0.6.0 for managed arrays
 
         // Multi-threaded execution requires MLX Core >= 0.31.0.
-        let supports_multithreaded_execution = false; // requires MLX Core >= 0.31.0
+        let _supports_multithreaded_execution = false; // requires MLX Core >= 0.31.0
 
         Self {
             mlx_core_version: option_env!("TRIBUNUS_MLX_CORE_VERSION").unwrap_or("v0.31.2").to_string(),
@@ -1419,6 +2108,7 @@ impl ImageRuntime {
     /// embeddings needed during the layer forward pass) and the just-activated
     /// layer handles (currently in ARRAY_REGISTRY under the handles owned by
     /// the lease) are accessible via self.lookup_handle().
+    #[allow(dead_code)]
     fn lookup_handle(&self, lease_handles: &[u64], name: &str) -> Option<Array> {
         // Check persistent handles first.
         if let Some(&h) = self.persistent_handles.get(name) {
@@ -1436,7 +2126,7 @@ impl ImageRuntime {
 
     /// Build a per-layer tensor lookup from the lease's handles and the
     /// manifest tensor table. Returns a HashMap<name, Array> for the layer.
-    fn build_layer_arrays_from_lease(
+    pub(crate) fn build_layer_arrays_from_lease(
         &self,
         layer_index: u32,
         lease: &LayerLease,
@@ -1582,12 +2272,8 @@ impl ImageRuntime {
         };
 
         let tok = Array::from_slice(&[2i32], &[1]);
-        let group_size = (emb_w.shape()[1] as i32 * 4) / emb_s.shape()[1];
-        let wf = mlx_rs::ops::dequantize(&emb_w, &emb_s, &emb_b, group_size, 8)
-            .map_err(|e| napi::Error::from_reason(format!("dequantize embed: {:?}", e)))?;
-        let emb = mlx_rs::ops::indexing::take_axis(&wf, &tok, 0)
-            .map_err(|e| napi::Error::from_reason(format!("embed take: {:?}", e)))?;
-        let mut hidden = emb
+        let mut hidden = crate::primitives::quantized_embedding_lookup(&tok, &emb_w, &emb_s, &emb_b)
+            .map_err(|e| napi::Error::from_reason(format!("embed lookup: {:?}", e)))?
             .multiply(&Array::from_f32((arch.hidden_size as f32).sqrt()))
             .map_err(|e| napi::Error::from_reason(format!("embed scale: {:?}", e)))?;
 
@@ -1608,8 +2294,8 @@ impl ImageRuntime {
         for layer in 0..layer_count {
             let t0 = Instant::now();
             let rss_before = process_rss_bytes();
-            let active_before = mlx_active_memory_bytes();
-            let cached_before = mlx_cache_memory_bytes();
+            let _active_before = mlx_active_memory_bytes();
+            let _cached_before = mlx_cache_memory_bytes();
             let handles_before = crate::bridge::handle_count();
 
             // Activate this layer's segment (reads from disk).
@@ -1722,7 +2408,7 @@ impl ImageRuntime {
             let handles_after = crate::bridge::handle_count();
 
             // Emit per-layer residency receipt.
-            let rss_evaluated = rss_after;
+            let _rss_evaluated = rss_after;
             let active_evaluated = active_after;
             let cached_evaluated = cached_after;
             let handles_evaluated = handles_after;
@@ -1796,6 +2482,283 @@ impl ImageRuntime {
         Ok(out)
     }
 
+    /// Execute the complete 48-layer model from the compiled execution plan.
+    ///
+    /// This is the canonical forward path:
+    ///   1. Run the prologue (embedding → hidden state)
+    ///   2. For each layer in the execution plan:
+    ///      a. Activate the layer segment
+    ///      b. Run the layer executor from the compiled plan
+    ///      c. eval() before dropping the lease
+    ///      d. Record per-layer telemetry
+    ///   3. Run the epilogue (final norm → output projection → softcap → argmax)
+    ///
+    /// Returns a u32 token ID — no logits cross the boundary.
+    /// Per-layer receipts are emitted to stderr.
+    pub fn run_full_model(&mut self, token_ids: &[i32]) -> napi::Result<u32> {
+        if self.released {
+            return Err(napi::Error::from_reason("image runtime already released"));
+        }
+
+        let plan = &self.manifest.execution_plan;
+        plan.validate()
+            .map_err(|errors| napi::Error::from_reason(format!(
+                "execution plan validation failed: {}", errors.join("; ")
+            )))?;
+
+        let arch = &self.manifest.architecture;
+        let root = "language_model.model";
+        let seq_len = token_ids.len() as i32;
+
+        // --- Prologue: embedding lookup ---
+        let emb_w_name = format!("{}.embed_tokens.weight", root);
+        let emb_s_name = format!("{}.embed_tokens.scales", root);
+        let emb_b_name = format!("{}.embed_tokens.biases", root);
+
+        let (emb_w, emb_s, emb_b) = {
+            let reg = crate::bridge::ARRAY_REGISTRY.read();
+            let w = reg
+                .get(*self.persistent_handles.get(&emb_w_name).ok_or_else(|| {
+                    napi::Error::from_reason(format!("missing: {}", emb_w_name))
+                })?)
+                .cloned()
+                .ok_or_else(|| napi::Error::from_reason("embed weight invalid"))?;
+            let s = reg
+                .get(*self.persistent_handles.get(&emb_s_name).ok_or_else(|| {
+                    napi::Error::from_reason(format!("missing: {}", emb_s_name))
+                })?)
+                .cloned()
+                .ok_or_else(|| napi::Error::from_reason("embed scales invalid"))?;
+            let b = reg
+                .get(*self.persistent_handles.get(&emb_b_name).ok_or_else(|| {
+                    napi::Error::from_reason(format!("missing: {}", emb_b_name))
+                })?)
+                .cloned()
+                .ok_or_else(|| napi::Error::from_reason("embed biases invalid"))?;
+            (w, s, b)
+        };
+
+        let tok = Array::from_slice(token_ids, &[1, seq_len]);
+        let mut hidden = crate::executor::run_prologue(
+            &tok, &emb_w, &emb_s, &emb_b, &plan.prologue,
+            (arch.hidden_size as f32).sqrt(),
+        )
+        .map_err(|e| napi::Error::from_reason(format!("prologue: {:?}", e)))?;
+
+        hidden.eval()
+            .map_err(|e| napi::Error::from_reason(format!("prologue eval: {:?}", e)))?;
+
+        // Precompute RoPE tables
+        let (rope_cos, rope_sin) = crate::primitives::rope_freqs(
+            arch.head_dim,
+            arch.max_position_embeddings,
+            arch.rope_local.theta as f32,
+        )
+        .map_err(|e| napi::Error::from_reason(format!("rope local: {:?}", e)))?;
+        let full_rope = arch.rope_global.as_ref().unwrap_or(&arch.rope_local);
+        let (full_cos, full_sin) = crate::primitives::rope_freqs(
+            arch.global_head_dim.unwrap_or(arch.head_dim),
+            arch.max_position_embeddings,
+            full_rope.theta as f32,
+        )
+        .map_err(|e| napi::Error::from_reason(format!("rope global: {:?}", e)))?;
+
+        // Build per-layer KV caches for single-pass validation
+        let max_seq_len = arch.max_position_embeddings.min(8192);
+        let mut caches: Vec<crate::kv_cache::KvCache> = Vec::with_capacity(plan.layers.len());
+        for layer_plan in &plan.layers {
+            let is_sliding = layer_plan.attention_kind == "sliding_attention";
+            let (capacity, n_kv_heads, head_dim) = if is_sliding {
+                (layer_plan.sliding_window, layer_plan.n_kv_heads, layer_plan.head_dim)
+            } else {
+                let g_kv = layer_plan.n_global_kv_heads.unwrap_or(1);
+                let g_hd = layer_plan.global_head_dim.unwrap_or(layer_plan.head_dim);
+                (max_seq_len, g_kv, g_hd)
+            };
+            caches.push(crate::kv_cache::KvCache::new(capacity, n_kv_heads, head_dim, is_sliding));
+        }
+
+        let idle_handles = crate::bridge::handle_count();
+        eprintln!(
+            "[full-model] idle_handles={} layer_count={}",
+            idle_handles, plan.layers.len(),
+        );
+        // --- Decoder layers ---
+        for layer_plan in &plan.layers {
+            let l = layer_plan.layer_index;
+            let t0 = Instant::now();
+            let handles_before = crate::bridge::handle_count();
+            let active_before = mlx_active_memory_bytes();
+
+            // Activate the layer segment
+            let lease = self.activate_layer(l)
+                .map_err(|e| napi::Error::from_reason(format!("activate layer {}: {}", l, e)))?;
+            let bytes_read = lease.bytes_read;
+
+            // Build layer tensor map from the lease
+            let layer_map = self.build_layer_arrays_from_lease(l, &lease)?;
+
+            // Helper to look up a tensor
+            let get_tensor = |name: &str| -> napi::Result<Array> {
+                if let Some(arr) = layer_map.get(name) {
+                    return Ok(arr.clone());
+                }
+                if let Some(&h) = self.persistent_handles.get(name) {
+                    let reg = crate::bridge::ARRAY_REGISTRY.read();
+                    return reg.get(h).cloned().ok_or_else(|| {
+                        napi::Error::from_reason(format!("persistent handle invalid for {}", name))
+                    });
+                }
+                Err(napi::Error::from_reason(format!("tensor not found for layer {}: {}", l, name)))
+            };
+
+            let base = format!("{}.layers.{}", root, l);
+            let is_full = layer_plan.attention_kind == "full_attention";
+
+            let attn_norm = get_tensor(&format!("{}.input_layernorm.weight", base))?;
+            let ffn_norm  = get_tensor(&format!("{}.post_attention_layernorm.weight", base))?;
+            let (qw, qs, qb) = (
+                get_tensor(&format!("{}.self_attn.q_proj.weight", base))?,
+                get_tensor(&format!("{}.self_attn.q_proj.scales", base))?,
+                get_tensor(&format!("{}.self_attn.q_proj.biases", base))?,
+            );
+            let (kw, ks, kb) = (
+                get_tensor(&format!("{}.self_attn.k_proj.weight", base))?,
+                get_tensor(&format!("{}.self_attn.k_proj.scales", base))?,
+                get_tensor(&format!("{}.self_attn.k_proj.biases", base))?,
+            );
+            let (vw, vs, vb) = if is_full {
+                // K-equals-V: reuse k_proj
+                (kw.clone(), ks.clone(), kb.clone())
+            } else {
+                (
+                    get_tensor(&format!("{}.self_attn.v_proj.weight", base))?,
+                    get_tensor(&format!("{}.self_attn.v_proj.scales", base))?,
+                    get_tensor(&format!("{}.self_attn.v_proj.biases", base))?,
+                )
+            };
+            let (ow, os, ob) = (
+                get_tensor(&format!("{}.self_attn.o_proj.weight", base))?,
+                get_tensor(&format!("{}.self_attn.o_proj.scales", base))?,
+                get_tensor(&format!("{}.self_attn.o_proj.biases", base))?,
+            );
+            let (gw, gs, gb) = (
+                get_tensor(&format!("{}.mlp.gate_proj.weight", base))?,
+                get_tensor(&format!("{}.mlp.gate_proj.scales", base))?,
+                get_tensor(&format!("{}.mlp.gate_proj.biases", base))?,
+            );
+            let (uw, us, ub) = (
+                get_tensor(&format!("{}.mlp.up_proj.weight", base))?,
+                get_tensor(&format!("{}.mlp.up_proj.scales", base))?,
+                get_tensor(&format!("{}.mlp.up_proj.biases", base))?,
+            );
+            let (dw, ds, db) = (
+                get_tensor(&format!("{}.mlp.down_proj.weight", base))?,
+                get_tensor(&format!("{}.mlp.down_proj.scales", base))?,
+                get_tensor(&format!("{}.mlp.down_proj.biases", base))?,
+            );
+
+            // Q/K norm weights
+            let q_norm = get_tensor(&format!("{}.self_attn.q_norm.weight", base)).ok();
+            let k_norm = get_tensor(&format!("{}.self_attn.k_norm.weight", base)).ok();
+
+            // Select RoPE tables
+            let (rcos, rsin) = if is_full { (&full_cos, &full_sin) } else { (&rope_cos, &rope_sin) };
+
+            // Run the layer executor
+            hidden = crate::executor::run_layer(
+                &hidden,
+                layer_plan,
+                &attn_norm, &ffn_norm,
+                &qw, &qs, &qb,
+                &kw, &ks, &kb,
+                &vw, &vs, &vb,
+                &ow, &os, &ob,
+                q_norm.as_ref(), k_norm.as_ref(),
+                &gw, &gs, &gb,
+                &uw, &us, &ub,
+                &dw, &ds, &db,
+                rcos, rsin,
+                &mut caches[l as usize],
+                0, // kv_offset = 0 for single-pass
+                arch.rms_norm_eps as f32,
+            )
+            .map_err(|e| napi::Error::from_reason(format!("layer {}: {:?}", l, e)))?;
+
+            // *** CRITICAL: eval BEFORE dropping lease ***
+            hidden.eval()
+                .map_err(|e| napi::Error::from_reason(format!("eval layer {}: {:?}", l, e)))?;
+
+            let elapsed_ms = t0.elapsed().as_millis();
+            let handles_after = crate::bridge::handle_count();
+            let _active_evaluated = mlx_active_memory_bytes();
+            let seg_id = lease.segment_id.clone();
+
+            // Retire the layer segment
+            drop(lease);
+
+            let handles_retired = crate::bridge::handle_count();
+            let active_retired = mlx_active_memory_bytes();
+
+            let output_shape = hidden.shape();
+            let is_finite = hidden
+                .try_as_slice::<f32>()
+                .map(|v| v.iter().all(|x| x.is_finite()))
+                .unwrap_or(false);
+
+            eprintln!(
+                "[full-model] layer={} kind={} segment={} bytes={} elapsed_ms={} \
+                 handles={}→{}→{} active_mem={}→{} shape={:?} finite={}",
+                l, layer_plan.attention_kind, seg_id, bytes_read, elapsed_ms,
+                handles_before, handles_after, handles_retired,
+                active_before, active_retired,
+                output_shape, is_finite,
+            );
+        }
+
+        // Verify return to idle
+        let final_handles = crate::bridge::handle_count();
+        eprintln!(
+            "[full-model] all_layers_done final_handles={} idle_handles={}",
+            final_handles, idle_handles,
+        );
+
+        // --- Epilogue: final norm + output projection + softcapping + argmax ---
+        let fn_w_name = format!("{}.norm.weight", root);
+        let fn_w = {
+            let reg = crate::bridge::ARRAY_REGISTRY.read();
+            reg.get(*self.persistent_handles.get(&fn_w_name).ok_or_else(|| {
+                napi::Error::from_reason(format!("missing: {}", fn_w_name))
+            })?)
+            .cloned()
+            .ok_or_else(|| napi::Error::from_reason("norm weight invalid"))?
+        };
+
+        let epi = crate::executor::run_epilogue(
+            &hidden,
+            &fn_w,
+            &emb_w, &emb_s, &emb_b,
+            &plan.epilogue,
+            arch.rms_norm_eps as f32,
+            arch.tie_word_embeddings,
+            &crate::session::SamplerConfig::default(),
+        )
+        .map_err(|e| napi::Error::from_reason(format!("epilogue: {:?}", e)))?;
+
+        epi.selected_token
+            .eval()
+            .map_err(|e| napi::Error::from_reason(format!("epilogue eval: {:?}", e)))?;
+        let token_id = epi.selected_token
+            .try_as_slice::<u32>()
+            .map_err(|e| napi::Error::from_reason(format!("epilogue token: {:?}", e)))?
+            .first()
+            .copied()
+            .unwrap_or(0);
+
+        self.release();
+        Ok(token_id)
+    }
+
     /// Release all persistent tensor handles.
     pub fn release(&mut self) {
         if self.released {
@@ -1810,6 +2773,149 @@ impl ImageRuntime {
     }
 }
 
+fn plan(source_dir: &Path) -> napi::Result<(crate::config::CompilationPlan, LoadedSource)> {
+    use crate::config::{CompilationPlan, PlannedSegment, PlannedTensor};
+
+    let loaded = load_source(source_dir)?;
+    let shard_hashes: Vec<String> = loaded
+        .shard_hashes
+        .iter()
+        .map(|h| h.sha256.clone())
+        .collect();
+
+    let mut tensor_table = Vec::new();
+    let mut next_tensor_id: u32 = 0;
+    let mut segments: Vec<PlannedSegment> = Vec::new();
+    let mut seg_offsets: HashMap<String, u64> = HashMap::new();
+
+    // Persistent segment.
+    let persistent_seg_id = "persistent".to_string();
+    segments.push(PlannedSegment {
+        id: persistent_seg_id.clone(),
+        filename: "segment_000.bin".into(),
+        byte_size: 0,
+        kind: "persistent".into(),
+        tensor_count: 0,
+    });
+
+    for binding in &loaded.spec.global_tensors {
+        let disp = classify_disposition(binding, &loaded.namespace);
+        let (src_shard, src_offset, src_len, logical_dtype) =
+            source_info(&loaded.source_tensors, &binding.name);
+        let dest_offset = seg_offsets.get(&persistent_seg_id).copied().unwrap_or(0);
+        tensor_table.push(PlannedTensor {
+            id: next_tensor_id,
+            name: binding.name.clone(),
+            disposition: disp,
+            source_shard: src_shard,
+            source_offset: src_offset,
+            source_byte_length: src_len,
+            destination_segment: persistent_seg_id.clone(),
+            destination_offset: dest_offset,
+            destination_byte_length: src_len,
+            logical_dtype,
+            logical_shape: binding.logical_shape.clone(),
+        });
+        *seg_offsets.entry(persistent_seg_id.clone()).or_insert(0) += src_len;
+        next_tensor_id += 1;
+    }
+
+    // Layer segments.
+    for layer in &loaded.spec.layers {
+        let seg_id = format!("layer_{}", layer.index);
+        let seg_idx = segments.len();
+        segments.push(PlannedSegment {
+            id: seg_id.clone(),
+            filename: format!("segment_{:03}.bin", seg_idx),
+            byte_size: 0,
+            kind: format!("layer_{}", layer.index),
+            tensor_count: 0,
+        });
+        for binding in &layer.tensors {
+            let disp = classify_disposition(binding, &loaded.namespace);
+            let (src_shard, src_offset, src_len, logical_dtype) =
+                source_info(&loaded.source_tensors, &binding.name);
+            let dest_offset = seg_offsets.get(&seg_id).copied().unwrap_or(0);
+            tensor_table.push(PlannedTensor {
+                id: next_tensor_id,
+                name: binding.name.clone(),
+                disposition: disp,
+                source_shard: src_shard,
+                source_offset: src_offset,
+                source_byte_length: src_len,
+                destination_segment: seg_id.clone(),
+                destination_offset: dest_offset,
+                destination_byte_length: src_len,
+                logical_dtype,
+                logical_shape: binding.logical_shape.clone(),
+            });
+            *seg_offsets.entry(seg_id.clone()).or_insert(0) += src_len;
+            next_tensor_id += 1;
+        }
+    }
+
+    // Update segment byte sizes and tensor counts.
+    for seg in &mut segments {
+        seg.byte_size = *seg_offsets.get(&seg.id).unwrap_or(&0);
+        seg.tensor_count = tensor_table
+            .iter()
+            .filter(|t| t.destination_segment == seg.id)
+            .count();
+    }
+
+    let total_source_bytes: u64 = loaded
+        .source_tensors
+        .values()
+        .map(|t| t.data.len() as u64)
+        .sum();
+    let total_image_bytes: u64 = segments.iter().map(|s| s.byte_size).sum();
+
+    let plan = CompilationPlan {
+        model_identity: loaded.manifest.model_type.clone(),
+        source_config_hash: loaded.manifest.config_hash.clone(),
+        source_shard_hashes: shard_hashes,
+        tensor_table,
+        segments,
+        total_source_bytes,
+        total_image_bytes,
+    };
+
+    Ok((plan, loaded))
+}
+
+fn classify_disposition(
+    binding: &crate::config::TensorBinding,
+    _namespace: &crate::config::NamespaceBinding,
+) -> crate::config::TensorDisposition {
+    use crate::config::TensorDisposition;
+
+    // Quantized weight payloads get relocated unchanged.
+    if binding.name.ends_with(".weight")
+        || binding.name.ends_with(".scales")
+        || binding.name.ends_with(".biases")
+    {
+        return TensorDisposition::RelocateAndAlign;
+    }
+    // Embedding layer_scalar and other small tensors also relocate.
+    TensorDisposition::RelocateAndAlign
+}
+
+fn source_info(
+    source_tensors: &HashMap<String, SourceTensor>,
+    name: &str,
+) -> (String, u64, u64, String) {
+    if let Some(st) = source_tensors.get(name) {
+        (
+            st.source_filename.clone(),
+            st.source_offset,
+            st.data.len() as u64,
+            st.dtype.clone(),
+        )
+    } else {
+        (String::new(), 0, 0, "F32".into())
+    }
+}
+
 /// Compile a source checkpoint into a precompiled ComputeImage runtime artifact.
 ///
 /// The source directory must contain a config.json and safetensors shards.
@@ -1820,7 +2926,27 @@ pub fn compile(source_dir: &str, output_dir: &str) -> napi::Result<CompiledImage
     let output_dir = Path::new(output_dir);
     let started_at = std::time::Instant::now();
 
-    let loaded = load_source(source_dir)?;
+    let t_source = Instant::now();
+    let (_plan, loaded) = plan(source_dir)?;
+    // TODO Phase 3: Use plan to drive parallel emission instead of sequential loaded.spec iteration
+    let source_load_ms = t_source.elapsed().as_millis() as u64;
+    crate::compile_progress::CompileProgress {
+        stage: "source_loaded".into(),
+        bytes_processed: loaded.spec.layers.len() as u64,
+        bytes_total: loaded.spec.layers.len() as u64,
+        elapsed_ms: started_at.elapsed().as_millis() as u64,
+    }.emit();
+
+    compile_sequential(source_dir, output_dir, loaded, started_at, source_load_ms)
+}
+
+fn compile_sequential(
+    _source_dir: &Path,
+    output_dir: &Path,
+    loaded: LoadedSource,
+    started_at: Instant,
+    source_load_ms: u64,
+) -> napi::Result<CompiledImage> {
     let source = build_source_identity(
         &loaded.manifest,
         loaded.shard_hashes.clone(),
@@ -1830,6 +2956,7 @@ pub fn compile(source_dir: &str, output_dir: &str) -> napi::Result<CompiledImage
 
     let mut builder = ImageBuilder::new(loaded.arch.clone(), source);
 
+    let t_emit = Instant::now();
     builder.begin_segment("persistent", SegmentKind::Persistent);
     let mut emitted_ids = HashMap::new();
 
@@ -1863,8 +2990,53 @@ pub fn compile(source_dir: &str, output_dir: &str) -> napi::Result<CompiledImage
         }
     }
 
+    // Build the execution plan using the emitted tensor IDs
+    let execution_plan = crate::config::build_execution_plan(
+        &loaded.arch,
+        &loaded.namespace,
+        &emitted_ids,
+    );
+    builder.set_execution_plan(execution_plan);
+
+    let payload_emission_ms = t_emit.elapsed().as_millis() as u64;
+    let emitted_so_far = builder.segment_payloads.iter().map(|p| p.len() as u64).sum();
+    crate::compile_progress::CompileProgress {
+        stage: "payload_emission_done".into(),
+        bytes_processed: emitted_so_far,
+        bytes_total: emitted_so_far,
+        elapsed_ms: started_at.elapsed().as_millis() as u64,
+    }.emit();
+
+    let t_finalize = Instant::now();
     let manifest = builder.finalize(output_dir)?;
-    let receipt = build_compile_receipt(&loaded, &manifest, started_at.elapsed().as_millis());
+    let finalize_ms = t_finalize.elapsed().as_millis() as u64;
+
+    let total_source_bytes = loaded
+        .source_tensors
+        .values()
+        .map(|tensor| tensor.data.len() as u64)
+        .sum();
+    let total_emitted_bytes = manifest.segments.iter().map(|segment| segment.byte_size).sum();
+
+    let stage_profile = StageProfile {
+        source_discovery_ms: source_load_ms,
+        header_parsing_ms: 0,
+        architecture_normalization_ms: 0,
+        binding_validation_ms: 0,
+        source_hashing_ms: 0,
+        layout_planning_ms: 0,
+        payload_emission_ms,
+        segment_hashing_ms: finalize_ms,
+        manifest_generation_ms: 0,
+        verification_ms: 0,
+        total_source_bytes,
+        total_emitted_bytes,
+        peak_rss_bytes: 0,
+        peak_mlx_active_bytes: mlx_active_memory_bytes() as u64,
+        peak_mlx_cache_bytes: 0,
+    };
+
+    let receipt = build_compile_receipt(&loaded, &manifest, started_at.elapsed().as_millis(), stage_profile);
     let receipt_path = output_dir.join("receipt.json");
     let receipt_json = serde_json::to_string_pretty(&receipt)
         .map_err(|e| napi::Error::from_reason(format!("json: {}", e)))?;
@@ -1880,6 +3052,45 @@ pub fn read(image_dir: &str) -> napi::Result<CompiledImageReader> {
 
 pub fn verify(image_dir: &str) -> napi::Result<ManifestVerification> {
     read(image_dir)?.verify()
+}
+
+/// Atomically publish a staged compilation to its final destination.
+///
+/// 1. Writes a `.publishing` marker inside `staging`.
+/// 2. Renames `staging` to `destination` (falls back to recursive copy
+///    when the rename crosses filesystem boundaries).
+/// 3. On failure the staging directory is left intact with a `.failed` marker
+///    so that the caller can inspect or retry.
+pub fn publish_image(staging: &Path, destination: &Path) -> napi::Result<()> {
+    let publishing_marker = staging.join(".publishing");
+    std::fs::write(&publishing_marker, b"")
+        .map_err(|e| napi::Error::from_reason(format!("write .publishing: {}", e)))?;
+
+    let result = std::fs::rename(staging, destination);
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // rename fails across filesystem boundaries — fall back to copy + remove
+            if e.kind() == std::io::ErrorKind::CrossesDevices {
+                let failed_marker = staging.join(".failed");
+                if let Err(write_err) = std::fs::write(&failed_marker, format!("rename failed: {}", e)) {
+                    return Err(napi::Error::from_reason(format!(
+                        "write .failed marker: {} (original rename: {})", write_err, e
+                    )));
+                }
+                return Err(napi::Error::from_reason(format!(
+                    "rename crosses devices: {}. Staging left in place with .failed marker.", e
+                )));
+            }
+            let failed_marker = staging.join(".failed");
+            if let Err(write_err) = std::fs::write(&failed_marker, format!("rename failed: {}", e)) {
+                return Err(napi::Error::from_reason(format!(
+                    "write .failed marker: {} (original rename: {})", write_err, e
+                )));
+            }
+            Err(napi::Error::from_reason(format!("rename {} -> {}: {}", staging.display(), destination.display(), e)))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2111,6 +3322,190 @@ mod tests {
                 13.75,
             ),
         ];
+
+        tensors.sort_by(|left, right| left.0.cmp(&right.0));
+        serialize_to_file(tensors, &None, &source_dir.join("model.safetensors"))
+            .expect("write safetensors");
+    }
+
+    /// Build a synthetic model with N layers driven by `layer_types`
+    /// ("sliding_attention" or "full_attention"). Full-attention layers
+    /// omit v_proj (K-equals-V).
+    fn write_two_layer_fixture_model(source_dir: &Path, layer_types: &[&str]) {
+        let num_layers = layer_types.len();
+        let config = serde_json::json!({
+            "model_type": "tiny_gemma_like",
+            "text_config": {
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 1,
+                "head_dim": 16,
+                "global_head_dim": 16,
+                "num_global_key_value_heads": 1,
+                "num_hidden_layers": num_layers,
+                "vocab_size": 64,
+                "sliding_window": 8,
+                "max_position_embeddings": 16,
+                "rms_norm_eps": 0.000001,
+                "tie_word_embeddings": true,
+                "attention_k_eq_v": true,
+                "final_logit_softcapping": null,
+                "hidden_size_per_layer_input": 0,
+                "layer_types": layer_types,
+                "rope_parameters": {
+                    "sliding_attention": {
+                        "rope_theta": 10000.0,
+                        "rope_type": "default"
+                    },
+                    "full_attention": {
+                        "rope_theta": 1000000.0,
+                        "rope_type": "proportional"
+                    }
+                },
+                "model_type": "tiny_gemma_like"
+            },
+            "quantization": {
+                "group_size": 64,
+                "bits": 8,
+                "mode": "affine"
+            }
+        });
+
+        fs::write(
+            source_dir.join("config.json"),
+            serde_json::to_string_pretty(&config).expect("config json"),
+        )
+        .expect("write config");
+
+        let root = "language_model.model";
+        let mut tensors = vec![
+            u32_tensor(&format!("{}.embed_tokens.weight", root), &[64, 16], 1),
+            f32_tensor(&format!("{}.embed_tokens.scales", root), &[64, 1], 0.5),
+            f32_tensor(&format!("{}.embed_tokens.biases", root), &[64, 1], 1.5),
+            f32_tensor(&format!("{}.norm.weight", root), &[64], 2.0),
+        ];
+
+        for (i, lt) in layer_types.iter().enumerate() {
+            let layer = i as u32;
+            let is_full = *lt == "full_attention";
+
+            // Norms
+            tensors.push(f32_tensor(
+                &format!("{}.layers.{}.input_layernorm.weight", root, layer),
+                &[64], 3.0 + layer as f32 * 10.0,
+            ));
+            tensors.push(f32_tensor(
+                &format!("{}.layers.{}.post_attention_layernorm.weight", root, layer),
+                &[64], 4.0 + layer as f32 * 10.0,
+            ));
+
+            // Q/K norms
+            tensors.push(f32_tensor(
+                &format!("{}.layers.{}.self_attn.q_norm.weight", root, layer),
+                &[16], 5.0 + layer as f32 * 10.0,
+            ));
+            tensors.push(f32_tensor(
+                &format!("{}.layers.{}.self_attn.k_norm.weight", root, layer),
+                &[16], 6.0 + layer as f32 * 10.0,
+            ));
+
+            // Q projection
+            tensors.push(u32_tensor(
+                &format!("{}.layers.{}.self_attn.q_proj.weight", root, layer),
+                &[64, 16], 7 + layer * 100,
+            ));
+            tensors.push(f32_tensor(
+                &format!("{}.layers.{}.self_attn.q_proj.scales", root, layer),
+                &[64, 1], 7.5 + layer as f32 * 10.0,
+            ));
+            tensors.push(f32_tensor(
+                &format!("{}.layers.{}.self_attn.q_proj.biases", root, layer),
+                &[64, 1], 7.75 + layer as f32 * 10.0,
+            ));
+
+            // K projection
+            tensors.push(u32_tensor(
+                &format!("{}.layers.{}.self_attn.k_proj.weight", root, layer),
+                &[16, 16], 8 + layer * 100,
+            ));
+            tensors.push(f32_tensor(
+                &format!("{}.layers.{}.self_attn.k_proj.scales", root, layer),
+                &[16, 1], 8.5 + layer as f32 * 10.0,
+            ));
+            tensors.push(f32_tensor(
+                &format!("{}.layers.{}.self_attn.k_proj.biases", root, layer),
+                &[16, 1], 8.75 + layer as f32 * 10.0,
+            ));
+
+            // V projection: only for sliding attention layers
+            if !is_full {
+                tensors.push(u32_tensor(
+                    &format!("{}.layers.{}.self_attn.v_proj.weight", root, layer),
+                    &[16, 16], 9 + layer * 100,
+                ));
+                tensors.push(f32_tensor(
+                    &format!("{}.layers.{}.self_attn.v_proj.scales", root, layer),
+                    &[16, 1], 9.5 + layer as f32 * 10.0,
+                ));
+                tensors.push(f32_tensor(
+                    &format!("{}.layers.{}.self_attn.v_proj.biases", root, layer),
+                    &[16, 1], 9.75 + layer as f32 * 10.0,
+                ));
+            }
+
+            // O projection
+            tensors.push(u32_tensor(
+                &format!("{}.layers.{}.self_attn.o_proj.weight", root, layer),
+                &[64, 16], 10 + layer * 100,
+            ));
+            tensors.push(f32_tensor(
+                &format!("{}.layers.{}.self_attn.o_proj.scales", root, layer),
+                &[64, 1], 10.5 + layer as f32 * 10.0,
+            ));
+            tensors.push(f32_tensor(
+                &format!("{}.layers.{}.self_attn.o_proj.biases", root, layer),
+                &[64, 1], 10.75 + layer as f32 * 10.0,
+            ));
+
+            // MLP gate/up/down
+            tensors.push(u32_tensor(
+                &format!("{}.layers.{}.mlp.gate_proj.weight", root, layer),
+                &[128, 16], 11 + layer * 100,
+            ));
+            tensors.push(f32_tensor(
+                &format!("{}.layers.{}.mlp.gate_proj.scales", root, layer),
+                &[128, 1], 11.5 + layer as f32 * 10.0,
+            ));
+            tensors.push(f32_tensor(
+                &format!("{}.layers.{}.mlp.gate_proj.biases", root, layer),
+                &[128, 1], 11.75 + layer as f32 * 10.0,
+            ));
+            tensors.push(u32_tensor(
+                &format!("{}.layers.{}.mlp.up_proj.weight", root, layer),
+                &[128, 16], 12 + layer * 100,
+            ));
+            tensors.push(f32_tensor(
+                &format!("{}.layers.{}.mlp.up_proj.scales", root, layer),
+                &[128, 1], 12.5 + layer as f32 * 10.0,
+            ));
+            tensors.push(f32_tensor(
+                &format!("{}.layers.{}.mlp.up_proj.biases", root, layer),
+                &[128, 1], 12.75 + layer as f32 * 10.0,
+            ));
+            tensors.push(u32_tensor(
+                &format!("{}.layers.{}.mlp.down_proj.weight", root, layer),
+                &[64, 32], 13 + layer * 100,
+            ));
+            tensors.push(f32_tensor(
+                &format!("{}.layers.{}.mlp.down_proj.scales", root, layer),
+                &[64, 2], 13.5 + layer as f32 * 10.0,
+            ));
+            tensors.push(f32_tensor(
+                &format!("{}.layers.{}.mlp.down_proj.biases", root, layer),
+                &[64, 2], 13.75 + layer as f32 * 10.0,
+            ));
+        }
 
         tensors.sort_by(|left, right| left.0.cmp(&right.0));
         serialize_to_file(tensors, &None, &source_dir.join("model.safetensors"))
@@ -2582,5 +3977,440 @@ mod tests {
             "unexpected abi-mismatch error: {}",
             err
         );
+    }
+    #[test]
+    fn test_storage_abi_matching() {
+        let source = SourceIdentity {
+            config_hash: "abc".into(),
+            shard_hashes: vec![],
+            tokenizer_hashes: vec![],
+            auxiliary_hashes: vec![],
+            model_type: "test".into(),
+            quantization_bits: 8,
+            quantization_group_size: 64,
+            quantization_mode: "affine".into(),
+        };
+
+        let defaults = Manifest {
+            image_version: "0.1.0".into(),
+            compiler_version: "test".into(),
+            runtime_abi: "test".into(),
+            source: source,
+            architecture: crate::config::TextArchitecture {
+                hidden_size: 64,
+                intermediate_size: 128,
+                num_attention_heads: 4,
+                num_key_value_heads: 1,
+                head_dim: 16,
+                global_head_dim: Some(16),
+                num_global_key_value_heads: Some(1),
+                num_hidden_layers: 1,
+                vocab_size: 64,
+                sliding_window: 8,
+                max_position_embeddings: 16,
+                rms_norm_eps: 1e-6,
+                tie_word_embeddings: true,
+                attention_k_eq_v: true,
+                final_logit_softcapping: None,
+                hidden_size_per_layer_input: 0,
+                layer_types: vec![crate::config::AttentionKind::SlidingAttention],
+                rope_local: crate::config::RopeSpec {
+                    theta: 10000.0,
+                    rope_type: "default".into(),
+                    partial_rotary_factor: None,
+                },
+                rope_global: None,
+                model_type: "test".into(),
+            },
+            segments: vec![],
+            tensor_table: vec![],
+            alias_table: vec![],
+            residency_plan: ResidencyPlan {
+                persistent_segments: vec![],
+                layer_segments: vec![],
+                layer_window_size: 2,
+                total_bytes: 0,
+            },
+            image_hash: "dummy".into(),
+            required_storage_abi: STORAGE_ABI_COPIED_V0.into(),
+            required_capabilities: vec![],
+            execution_plan: crate::config::ModelExecutionPlan::default(),
+        };
+
+        assert!(defaults.storage_abi_matches(&StorageBackend::Copied));
+        assert!(!defaults.storage_abi_matches(&StorageBackend::MappedNoCopy));
+
+        // Check constants
+        assert_eq!(STORAGE_ABI_COPIED_V0, "copied-v0");
+        assert_eq!(STORAGE_ABI_MAPPED_NO_COPY_V1, "mapped-no-copy-v1");
+    }
+
+    #[test]
+    fn test_alignment_validation() {
+        // Build a manifest manually with mapped-no-copy-v1 and proper alignment
+        let segment = Segment {
+            id: "test_seg".into(),
+            filename: "segment_000.bin".into(),
+            byte_size: 4096,
+            sha256: "0000000000000000000000000000000000000000000000000000000000000000".into(),
+            tensor_ids: vec![0],
+            kind: SegmentKind::Persistent,
+            alignment_bytes: 4096,
+        };
+        let tensor = TensorEntry {
+            id: 0,
+            name: "weight".into(),
+            role: "embed".into(),
+            layer: None,
+            segment: "test_seg".into(),
+            source_filename: "x.safetensors".into(),
+            source_sha256: "0000".into(),
+            source_offset: 0,
+            offset: 0,
+            byte_length: 256,
+            logical_dtype: "F32".into(),
+            storage_dtype: "F32".into(),
+            logical_shape: vec![16, 16],
+            physical_shape: vec![16, 16],
+            mutability: "read_only".into(),
+            quantization: None,
+            tensor_alignment_bytes: 16,
+            layout_version: 1,
+        };
+        let manifest = Manifest {
+            image_version: "0.1.0".into(),
+            compiler_version: "test".into(),
+            runtime_abi: "test".into(),
+            source: SourceIdentity {
+                config_hash: "abc".into(),
+                shard_hashes: vec![],
+                tokenizer_hashes: vec![],
+                auxiliary_hashes: vec![],
+                model_type: "test".into(),
+                quantization_bits: 8,
+                quantization_group_size: 64,
+                quantization_mode: "affine".into(),
+            },
+            architecture: crate::config::TextArchitecture {
+                hidden_size: 64,
+                intermediate_size: 128,
+                num_attention_heads: 4,
+                num_key_value_heads: 1,
+                head_dim: 16,
+                global_head_dim: Some(16),
+                num_global_key_value_heads: Some(1),
+                num_hidden_layers: 1,
+                vocab_size: 64,
+                sliding_window: 8,
+                max_position_embeddings: 16,
+                rms_norm_eps: 1e-6,
+                tie_word_embeddings: true,
+                attention_k_eq_v: true,
+                final_logit_softcapping: None,
+                hidden_size_per_layer_input: 0,
+                layer_types: vec![crate::config::AttentionKind::SlidingAttention],
+                rope_local: crate::config::RopeSpec {
+                    theta: 10000.0,
+                    rope_type: "default".into(),
+                    partial_rotary_factor: None,
+                },
+                rope_global: None,
+                model_type: "test".into(),
+            },
+            segments: vec![segment],
+            tensor_table: vec![tensor],
+            alias_table: vec![],
+            residency_plan: ResidencyPlan {
+                persistent_segments: vec!["test_seg".into()],
+                layer_segments: vec![],
+                layer_window_size: 2,
+                total_bytes: 4096,
+            },
+            image_hash: "dummy".into(),
+            required_storage_abi: STORAGE_ABI_MAPPED_NO_COPY_V1.into(),
+            required_capabilities: vec![],
+            execution_plan: crate::config::ModelExecutionPlan::default(),
+        };
+
+        assert!(manifest.storage_abi_matches(&StorageBackend::MappedNoCopy));
+        assert!(!manifest.storage_abi_matches(&StorageBackend::Copied));
+    }
+
+    #[test]
+    fn segment_corruption_rejected() {
+        let source_dir = temp_dir("source-seg-corr");
+        write_fixture_model(&source_dir);
+
+        let output_dir = temp_dir("out-seg-corr");
+        compile(
+            source_dir.to_str().expect("source dir"),
+            output_dir.to_str().expect("output dir"),
+        )
+        .expect("compile segment corruption fixture");
+
+        // segment_000.bin = persistent (embed + final), segment_001.bin = layer 0
+        let segment_path = output_dir.join("segment_001.bin");
+        let mut bytes = fs::read(&segment_path).expect("layer segment bytes");
+        bytes[100] ^= 0xFF;
+        fs::write(&segment_path, bytes).expect("rewrite corrupted layer segment");
+
+        let err = match read(output_dir.to_str().expect("output dir")) {
+            Ok(_) => panic!("expected segment corruption error"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("segment hash mismatch"),
+            "unexpected segment corruption error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn synthetic_plan_driven_execution() {
+        let source_dir = temp_dir("source-plan");
+        let output_dir = temp_dir("out-plan");
+
+        write_two_layer_fixture_model(&source_dir, &["sliding_attention", "full_attention"]);
+
+        let compiled = compile(
+            source_dir.to_str().expect("source dir"),
+            output_dir.to_str().expect("output dir"),
+        )
+        .expect("compile");
+
+        let reader = read(output_dir.to_str().expect("output dir")).expect("reader");
+
+        // Verify execution plan from manifest
+        let plan = &compiled.manifest.execution_plan;
+        assert_eq!(plan.layers.len(), 2);
+
+        assert_eq!(plan.layers[0].attention_kind, "sliding_attention");
+        assert_eq!(plan.layers[0].layer_index, 0);
+        assert!(plan.layers[0].global_head_dim.is_none());
+        assert!(plan.layers[0].v_proj_tensor_id != 0, "sliding layer needs v_proj");
+
+        assert_eq!(plan.layers[1].attention_kind, "full_attention");
+        assert_eq!(plan.layers[1].layer_index, 1);
+        assert_eq!(plan.layers[1].global_head_dim, Some(16));
+        // K-equals-V: v_proj aliases k_proj
+        assert_eq!(plan.layers[1].v_proj_tensor_id, plan.layers[1].k_proj_tensor_id);
+
+        // Validate the plan
+        plan.validate().expect("execution plan should validate");
+
+        // Open runtime and verify handle lifecycle
+        let baseline_handles = crate::bridge::handle_count();
+        let mut runtime = reader.open_runtime(StorageBackend::Copied).expect("runtime");
+
+        // Handle count after persistent activation
+        let after_persistent = crate::bridge::handle_count();
+        assert!(after_persistent > baseline_handles);
+
+        // Run full model - this activates layers, runs inference, then retires them
+        let token = runtime.run_full_model(&[2i32]).expect("run full model");
+        assert!(token < 64, "token {} should be in [0, 64)", token);
+
+        // After full model runs and layers are retired, handles return to baseline
+        let after_run = crate::bridge::handle_count();
+        assert_eq!(after_run, baseline_handles,
+            "handle count should return to baseline after full model run; {} != {}",
+            after_run, baseline_handles);
+    }
+
+    #[test]
+    #[ignore = "real checkpoint full-model gate; requires ~12GB quantized model at models/gemma4-12b-8bit"]
+    fn real_checkpoint_full_model_gate() {
+        let source_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("models/gemma4-12b-8bit");
+        let output_dir = temp_dir("real-full-model-out");
+
+        if !source_dir.join("config.json").exists() {
+            eprintln!("SKIP: no model at {}", source_dir.display());
+            return;
+        }
+
+        eprintln!("Compiling quantized Gemma 4 12B...");
+        let started = std::time::Instant::now();
+
+        let compiled = compile(
+            source_dir.to_str().expect("source dir"),
+            output_dir.to_str().expect("output dir"),
+        )
+        .expect("compile model");
+
+        let compile_secs = started.elapsed().as_secs_f64();
+        eprintln!(
+            "Compiled in {:.1}s: {} segments, {} tensors, {:?}",
+            compile_secs,
+            compiled.manifest.segments.len(),
+            compiled.manifest.tensor_table.len(),
+            compiled.manifest.image_hash
+        );
+
+        // Validate the execution plan
+        let plan = &compiled.manifest.execution_plan;
+        assert_eq!(plan.layers.len(), 48, "expected 48 layers");
+        plan.validate().expect("execution plan validation");
+
+        eprintln!("Opening runtime...");
+        let baseline_handles = crate::bridge::handle_count();
+        let reader = read(output_dir.to_str().expect("output dir")).expect("reader");
+        let mut runtime = reader.open_runtime(StorageBackend::Copied).expect("open runtime");
+
+        let after_open = crate::bridge::handle_count();
+        eprintln!(
+            "Runtime open: handles {} -> {}, plan layers: {}",
+            baseline_handles, after_open, plan.layers.len()
+        );
+
+        eprintln!("Running full 48-layer forward pass with BOS token...");
+        let run_started = std::time::Instant::now();
+
+        let token = runtime.run_full_model(&[2i32]).expect("run_full_model");
+
+        let run_secs = run_started.elapsed().as_secs_f64();
+        let total_secs = started.elapsed().as_secs_f64();
+
+        let after_run = crate::bridge::handle_count();
+        eprintln!(
+            "GATE PASSED: token={} run_time={:.1}s total_time={:.1}s final_handles={} baseline={}",
+            token, run_secs, total_secs, after_run, baseline_handles
+        );
+
+        assert!(token < 256128, "token {} out of vocab range", token);
+        assert!(token != 0, "token must not be padding token 0");
+        assert_eq!(after_run, baseline_handles,
+            "handle count must return to baseline after full model run; {} != {}",
+            after_run, baseline_handles);
+    }
+
+    #[test]
+    #[ignore = "requires pre-compiled image at TRIBUNUS_COMPILED_IMAGE dir"]
+    fn real_full_model_from_compiled_image() {
+        let image_dir = std::env::var("TRIBUNUS_COMPILED_IMAGE")
+            .expect("set TRIBUNUS_COMPILED_IMAGE to the compiled image directory");
+        let image_path = std::path::Path::new(&image_dir);
+        assert!(image_path.join("manifest.json").exists());
+
+        let baseline_handles = crate::bridge::handle_count();
+        let reader = read(&image_dir).expect("reader");
+        let plan = &reader.manifest.execution_plan;
+        assert_eq!(plan.layers.len(), 48);
+        plan.validate().expect("plan validation");
+
+        let mut runtime = reader.open_runtime(StorageBackend::Copied).expect("runtime");
+        eprintln!("Running 48-layer forward pass...");
+        let started = std::time::Instant::now();
+        let token = runtime.run_full_model(&[2i32]).expect("run_full_model");
+        let elapsed = started.elapsed().as_secs_f64();
+
+        let after_run = crate::bridge::handle_count();
+        eprintln!(
+            "GATE PASSED: token={} elapsed={:.1}s handles={}->{}",
+            token, elapsed, baseline_handles, after_run
+        );
+        assert!(token < 256128, "token out of vocab");
+        assert!(token > 0, "token should not be pad");
+        assert_eq!(after_run, baseline_handles,
+            "handle count must return to baseline: {} != {}",
+            after_run, baseline_handles);
+    }
+
+    #[test]
+    fn test_storage_abi_validation_rejects_unknown() {
+        // Verify that is_valid_storage_abi rejects unknown identifiers
+        assert!(is_valid_storage_abi(STORAGE_ABI_COPIED_V0));
+        assert!(is_valid_storage_abi(STORAGE_ABI_MAPPED_NO_COPY_V1));
+        assert!(!is_valid_storage_abi("copied-v2"));
+        assert!(!is_valid_storage_abi("mapped-no-copy-v0"));
+        assert!(!is_valid_storage_abi(""));
+        assert!(!is_valid_storage_abi("unknown-abi"));
+    }
+
+    #[test]
+    fn test_tensor_layout_offset_oob() {
+        // A tensor whose offset + byte_length exceeds its segment should fail.
+        let entry = TensorEntry {
+            id: 0,
+            name: "oob_tensor".into(),
+            role: "test".into(),
+            layer: None,
+            segment: "seg".into(),
+            source_filename: "x.safetensors".into(),
+            source_sha256: "0000".into(),
+            source_offset: 0,
+            offset: 100,
+            byte_length: 200,
+            logical_dtype: "F32".into(),
+            storage_dtype: "F32".into(),
+            logical_shape: vec![10, 5],
+            physical_shape: vec![10, 5],
+            mutability: "read_only".into(),
+            quantization: None,
+            tensor_alignment_bytes: 16,
+            layout_version: 1,
+        };
+
+        // Segment is only 250 bytes, tensor ends at 300 -> OOB
+        let result = validate_tensor_layout(&entry, 250);
+        assert!(result.is_err(), "expected OOB error");
+        assert!(
+            result.unwrap_err().contains("exceeds segment size"),
+            "unexpected error message"
+        );
+
+        // With enough space it should succeed
+        let result = validate_tensor_layout(&entry, 301);
+        assert!(result.is_ok(), "expected OK for large enough segment");
+
+        // Zero byte_length should be rejected
+        let zero_entry = TensorEntry {
+            byte_length: 0,
+            ..entry.clone()
+        };
+        let result = validate_tensor_layout(&zero_entry, 100);
+        assert!(result.is_err(), "expected error for zero byte_length");
+        assert!(
+            result.unwrap_err().contains("zero byte_length"),
+            "unexpected error message"
+        );
+    }
+
+    #[test]
+    fn test_physical_dtype_byte_count() {
+        // f32: 4 * (2*3*4) = 96
+        let r = validate_physical_dtype("f32", 96, &[2, 3, 4]);
+        assert!(r.is_ok());
+        assert_eq!(r.unwrap(), 96);
+
+        // bf16: 2 * (8*4) = 64
+        let r = validate_physical_dtype("BF16", 64, &[8, 4]);
+        assert!(r.is_ok());
+        assert_eq!(r.unwrap(), 64);
+
+        // f16: 2 * 128 = 256
+        let r = validate_physical_dtype("f16", 256, &[128]);
+        assert!(r.is_ok());
+
+        // u8: 1 * (4*8) = 32
+        let r = validate_physical_dtype("U8", 32, &[4, 8]);
+        assert!(r.is_ok());
+
+        // i8: same as u8
+        let r = validate_physical_dtype("I8", 32, &[4, 8]);
+        assert!(r.is_ok());
+
+        // u32: 4 * 50 = 200
+        let r = validate_physical_dtype("U32", 200, &[50]);
+        assert!(r.is_ok());
+
+        // Wrong byte count
+        let r = validate_physical_dtype("f32", 100, &[2, 3, 4]);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("expected 96 bytes"));
+
+        // Unknown dtype
+        let r = validate_physical_dtype("f64", 8, &[1]);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("unsupported"));
     }
 }

@@ -12,7 +12,10 @@ export declare function arrayShape(handle: number): Array<number>
 
 export declare function arraySize(handle: number): number
 
-/** Compile ComputeImage from a source model directory. Outputs manifest.json, receipt.json, and segment files. */
+/**
+ * Compile a precompiled ComputeImage runtime artifact from a source model directory.
+ * Outputs manifest.json, receipt.json, and execution-ordered segment files.
+ */
 export declare function compileImage(sourceDir: string, outputDir: string): string
 
 export declare function createArrayF32(data: Float32Array, shape: Array<number>): number
@@ -41,11 +44,26 @@ export declare function loadSafetensors(path: string): string
 
 export declare function matmul(a: number, b: number): number
 
+/** Returns MLX Metal active memory in bytes, or 0 if unavailable. */
+export declare function mlxActiveMemory(): number
+
+/** Clear the MLX Metal allocator cache. Returns bytes freed. */
+export declare function mlxClearCache(): number
+
 export declare function multiply(a: number, b: number): number
+
+/** Return the native dependency identity and capability report. */
+export declare function nativeCapabilityReport(): string
 
 export declare function parseConfigOnly(configPath: string): string
 
 export declare function readCompiledImage(imageDir: string): string
+
+/**
+ * Execute the full 48-layer model from a compiled ComputeImage.
+ * Returns the next token ID directly — no logits cross the FFI boundary.
+ */
+export declare function runFullModelFromImage(imageDir: string, inputIds: Buffer): number
 
 export declare function validateFromMetadata(configPath: string, shardJsons: string): string
 
