@@ -7,6 +7,7 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use super::{dtype::AccelerateDType, layout::AccelerateLayout, ops::CanonicalOp, subsystem::AccelerateSubsystem, lowering::AccelerateLoweringKind};
+use super::native::NativeSymbol;
 
 /// Accelerate execution receipt.
 ///
@@ -53,6 +54,10 @@ pub struct AccelerateExecutionReceipt {
     pub fallback_reason: Option<String>,
     /// Graph hash (if applicable).
     pub graph_hash: Option<String>,
+    /// The native symbol that was actually called (if any).
+    /// Only populated when executed_subsystem is not Reference.
+    /// Examples: "vDSP_vadd", "vDSP_vmul", "cblas_sgemm"
+    pub native_symbol: Option<String>,
     /// Timestamp of execution start.
     pub start_timestamp: String,
     /// Timestamp of execution end.
@@ -99,6 +104,7 @@ impl AccelerateExecutionReceipt {
             fallback_used: false,
             fallback_reason: None,
             graph_hash: None,
+            native_symbol: None,
             start_timestamp: Self::format_timestamp(start),
             end_timestamp: Self::format_timestamp(start), // Will be updated
         }
@@ -131,6 +137,15 @@ impl AccelerateExecutionReceipt {
         assert!(!reason.is_empty(), "fallback_reason cannot be empty when fallback_used=true");
         self.fallback_used = true;
         self.fallback_reason = Some(reason.to_string());
+        self
+    }
+
+    /// Sets the native symbol that was called.
+    /// 
+    /// This should only be called when executed_subsystem is not Reference
+    /// and a native Accelerate call actually occurred.
+    pub fn with_native_symbol(mut self, symbol: NativeSymbol) -> Self {
+        self.native_symbol = Some(symbol.to_string());
         self
     }
 
@@ -681,7 +696,7 @@ mod tests {
         
         let plan = plan.unwrap();
         assert_eq!(plan.op, CanonicalOp::Add);
-        assert_eq!(plan.subsystem, AccelerateSubsystem::Vdsp);
+        assert_eq!(plan.lowering_subsystem, AccelerateSubsystem::Vdsp);
     }
 
     #[test]

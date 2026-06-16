@@ -1,27 +1,37 @@
 //! Accelerate CPU inference backend for Tribunus.
 //!
-//! This module provides a **native-ready scaffold** for a first-class Accelerate backend.
-//! It includes capability discovery, operation support classification, lowering decisions,
-//! and execution receipts with truthful evidence reporting.
+//! This module provides a first-class Accelerate backend with **native f32 add/multiply/matmul on macOS**
+//! and reference fallback elsewhere. It includes capability discovery, operation support classification,
+//! lowering decisions, and execution receipts with truthful evidence reporting.
 //!
 //! # Implementation Status
 //!
-//! **Current State (HARDEN-ACCELERATE-PR2-TRUTHFUL-EVIDENCE-0001)**:
+//! **Current State (NATIVE-ACCELERATE-F32-KERNELS-0001)**:
 //!
-//! - ✅ **Modeling Complete**: Full pipeline model with capability discovery, support classification,
-//!   lowering decisions, and execution receipts.
-//! - ✅ **Reference Backend**: All operations execute via reference implementations on all platforms.
+//! - ✅ **Native f32 Kernels**: Direct Accelerate.framework calls for add (vDSP_vadd), multiply (vDSP_vmul), 
+//!   and matmul (cblas_sgemm) on macOS.
 //! - ✅ **Truthful Evidence**: Execution receipts distinguish between `lowering_subsystem` (intended)
-//!   and `executed_subsystem` (actual), with mandatory fallback reasons.
+//!   and `executed_subsystem` (actual), with `native_symbol` field recording which native function ran.
 //! - ✅ **Portable API**: All public types available on all platforms; only FFI linkage gated by cfg.
-//! - ❌ **Native Calls**: No direct Accelerate.framework calls yet (vDSP, BLAS, BNNS not bound).
+//! - ✅ **Conservative Matmul**: Native BLAS path only accepts contiguous row-major f32 matrices.
 //!
 //! **What This Means**:
 //!
-//! - On macOS: Lowering decisions target vDSP/BLAS/BNNS, but execution uses reference fallback.
-//! - On Linux: Same behavior, with explicit "Accelerate unavailable" fallback reasons.
-//! - BackendClassification::Pass means **native execution succeeded** (not yet achievable).
-//! - BackendClassification::Fallback means reference was used (current state for all ops).
+//! - On macOS: add/multiply/matmul execute natively via vDSP/BLAS with `executed_subsystem = vDSP/BLAS`
+//!   and `native_symbol` populated. Other ops use reference fallback.
+//! - On Linux: All ops use reference fallback with `executed_subsystem = Reference` and appropriate reasons.
+//! - BackendClassification::Pass means **native Accelerate execution succeeded** (achievable for f32 add/mul/matmul on macOS).
+//! - BackendClassification::Fallback means reference was used.
+//!
+//! **NOT Implemented** (intentionally narrow scope):
+//! - ❌ sigmoid, SiLU, softmax (activation functions)
+//! - ❌ BNNS, BNNSGraph (neural network layers)
+//! - ❌ f16, bf16, f64, int8 (other dtypes)
+//! - ❌ KV cache operations
+//! - ❌ Quantization
+//! - ❌ Layout expansion, model loading, tokenizer logic
+//! - ❌ Repo-level conformance integration
+//! - ❌ Full inference execution
 //!
 //! # Architecture
 //!
@@ -61,6 +71,7 @@ pub mod kernels;
 pub mod layout;
 pub mod layout_handler;
 pub mod lowering;
+pub mod native;
 pub mod ops;
 pub mod subsystem;
 pub mod support;
@@ -77,6 +88,7 @@ pub use kernels::{KernelContext, KernelDispatcher, KernelResult};
 pub use layout::AccelerateLayout;
 pub use layout_handler::{BlasLayoutAnalyzer, BlasLayoutDecision, LayoutHandler, LayoutTransform, TensorLayout};
 pub use lowering::AccelerateLoweringKind;
+pub use native::{AccelerateNativeError, AccelerateNativeResult, NativeDispatcher, NativeSymbol};
 pub use ops::CanonicalOp;
 pub use subsystem::AccelerateSubsystem;
 pub use support::AccelerateSupport;

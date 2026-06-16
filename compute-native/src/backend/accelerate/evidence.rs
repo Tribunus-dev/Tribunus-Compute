@@ -8,6 +8,7 @@ use std::fmt;
 
 use super::{dtype::AccelerateDType, ops::CanonicalOp, subsystem::AccelerateSubsystem};
 use super::execution::NumericalStatus;
+use super::native::NativeSymbol;
 
 /// Accelerate evidence record.
 ///
@@ -51,6 +52,10 @@ pub struct AccelerateEvidence {
     pub wall_time_ns: u64,
     /// Allocation count (if measurable).
     pub allocation_count: Option<usize>,
+    /// The native symbol that was actually called (if any).
+    /// Only populated when the operation executed natively.
+    /// Examples: "vDSP_vadd", "vDSP_vmul", "cblas_sgemm"
+    pub native_symbol: Option<String>,
     /// Evidence generation timestamp.
     pub timestamp: String,
 }
@@ -108,6 +113,12 @@ impl AccelerateEvidence {
             self.numerical_status = NumericalStatus::Failed;
         }
         
+        self
+    }
+
+    /// Sets the native symbol that was called.
+    pub fn with_native_symbol(mut self, symbol: NativeSymbol) -> Self {
+        self.native_symbol = Some(symbol.to_string());
         self
     }
 
@@ -170,16 +181,22 @@ impl AccelerateEvidence {
 
 impl fmt::Display for AccelerateEvidence {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let native_info = if let Some(symbol) = &self.native_symbol {
+            format!(" native={}", symbol)
+        } else {
+            String::new()
+        };
         write!(
             f,
-            "Evidence[{}] op={} backend={} subsystem={} dtype={} shape={} passed={}",
+            "Evidence[{}] op={} backend={} subsystem={} dtype={} shape={} passed={}{}",
             self.evidence_id,
             self.op,
             self.backend,
             self.subsystem,
             self.dtype,
             self.shape_key,
-            self.passed
+            self.passed,
+            native_info
         )
     }
 }
@@ -324,6 +341,54 @@ impl EvidenceValidator {
             passed,
         )
         .with_timing(wall_time_ns, allocation_count)
+    }
+
+    /// Creates an evidence record with native symbol from validation results.
+    pub fn create_evidence_with_native_symbol(
+        &self,
+        evidence_id: String,
+        phase_id: String,
+        op: CanonicalOp,
+        dtype: AccelerateDType,
+        shape_key: String,
+        layout_key: String,
+        subsystem: AccelerateSubsystem,
+        max_abs_error: Option<f64>,
+        max_rel_error: Option<f64>,
+        cosine_similarity: Option<f64>,
+        wall_time_ns: u64,
+        allocation_count: Option<usize>,
+        native_symbol: NativeSymbol,
+    ) -> AccelerateEvidence {
+        let passed = if op.is_memory() || op.is_layout() {
+            // For memory/layout ops, we expect perfect results
+            max_abs_error.map(|e| self.thresholds.is_identity_error_ok(e)).unwrap_or(true)
+        } else if op.is_matmul() || op.is_reduction() {
+            // For matmul/softmax, use cosine similarity
+            cosine_similarity.map(|cs| self.thresholds.is_cosine_similarity_ok(cs)).unwrap_or(false)
+        } else {
+            // For elementwise/activation ops, use error thresholds
+            max_abs_error.map(|e| self.thresholds.is_abs_error_ok(e)).unwrap_or(false) &&
+            max_rel_error.map(|e| self.thresholds.is_rel_error_ok(e)).unwrap_or(false)
+        };
+
+        AccelerateEvidence::new(
+            evidence_id,
+            phase_id,
+            op,
+            dtype,
+            shape_key,
+            layout_key,
+            subsystem,
+        )
+        .with_numerical_results(
+            max_abs_error,
+            max_rel_error,
+            cosine_similarity,
+            passed,
+        )
+        .with_timing(wall_time_ns, allocation_count)
+        .with_native_symbol(native_symbol)
     }
 }
 

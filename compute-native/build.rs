@@ -10,7 +10,7 @@ fn main() {
     // Detect the target OS
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_else(|_| "unknown".to_string());
     
-    println!("cargo:rerun-if-changed=build_accelerate.rs");
+    println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/backend/accelerate/");
 
     if target_os == "macos" {

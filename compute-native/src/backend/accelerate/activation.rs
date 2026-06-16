@@ -608,7 +608,7 @@ mod tests {
             let result = dispatcher.dispatch_sigmoid(&input, &[3]);
             
             assert!(result.receipt.fallback_used);
-            assert_eq!(result.receipt.subsystem, AccelerateSubsystem::Reference);
+            assert_eq!(result.receipt.executed_subsystem, AccelerateSubsystem::Reference);
             
             if let Some(evidence) = result.evidence {
                 assert!(evidence.fallback_used);
