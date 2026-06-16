@@ -24,22 +24,32 @@
 //!
 //! 5. **Evidence**: Reference-checked numerical validation with JSON evidence output.
 
+pub mod activation;
 pub mod capabilities;
+pub mod conformance;
 pub mod dtype;
 pub mod evidence;
 pub mod execution;
+pub mod ffi;
+pub mod kernels;
 pub mod layout;
+pub mod layout_handler;
 pub mod lowering;
 pub mod ops;
 pub mod subsystem;
 pub mod support;
 
 // Re-export the main types for convenience
+pub use activation::{ActivationContext, ActivationDispatcher, ActivationResult};
 pub use capabilities::AccelerateBackendCapabilities;
+pub use conformance::{BackendClassification, BackendId, BackendMatrix, BackendRegistry, ConformanceResult, AccelerateConformanceRunner};
 pub use dtype::AccelerateDType;
 pub use evidence::AccelerateEvidence;
 pub use execution::{AccelerateExecutionPlan, AccelerateExecutionReceipt, NumericalStatus};
+pub use ffi::{AccelerateHandle, AccelerateLinkage, AccelerateResult};
+pub use kernels::{KernelContext, KernelDispatcher, KernelResult};
 pub use layout::AccelerateLayout;
+pub use layout_handler::{BlasLayoutAnalyzer, BlasLayoutDecision, LayoutHandler, LayoutTransform, TensorLayout};
 pub use lowering::AccelerateLoweringKind;
 pub use ops::CanonicalOp;
 pub use subsystem::AccelerateSubsystem;
