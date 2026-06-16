@@ -109,7 +109,7 @@ impl AccelerateExecutionReceipt {
 
     /// Formats a timestamp as a string.
     fn format_timestamp(instant: Instant) -> String {
-        let duration = instant.duration_since(Instant::now().checked_sub(instant).unwrap_or(Duration::ZERO));
+        let duration = instant.elapsed();
         format!("{:?}", duration)
     }
 

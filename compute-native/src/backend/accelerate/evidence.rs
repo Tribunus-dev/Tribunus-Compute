@@ -334,7 +334,7 @@ impl Default for EvidenceValidator {
 }
 
 /// Evidence collector for aggregating multiple evidence records.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EvidenceCollector {
     /// Collected evidence records.
     pub records: Vec<AccelerateEvidence>,
