@@ -107,6 +107,14 @@ impl Arena {
         unsafe { tribunus_arena_io_surface_id(&self.info) }
     }
 
+    /// Returns the raw IOSurfaceRef pointer.
+    /// This is the canonical way to get the IOSurface for cross-accelerator
+    /// sharing (ANE, MLX external arrays, Core ML pixel buffers).
+    /// Returns null if the arena has no IOSurface backing.
+    pub fn io_surface_ptr(&self) -> *mut std::ffi::c_void {
+        self.info.io_surface
+    }
+
     /// Authoritative row stride in bytes (CVPixelBufferGetBytesPerRow).
     /// May differ from logical_dim1 * sizeof(element) due to alignment padding.
     pub fn bytes_per_row(&self) -> u32 {
