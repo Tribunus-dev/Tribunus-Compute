@@ -30,6 +30,7 @@ use super::{dtype::AccelerateDType, execution::{AccelerateExecutionReceipt, Buff
           ffi::{AccelerateHandle, AccelerateResult}, layout::AccelerateLayout, 
           ops::CanonicalOp, subsystem::AccelerateSubsystem, evidence::{AccelerateEvidence, EvidenceValidator},
           native::{NativeDispatcher, NativeSymbol}};
+use super::native::AccelerateNativeError;
 
 /// Kernel execution context.
 pub struct KernelContext {
@@ -268,13 +269,13 @@ pub mod kernels {
                     Err(err) => {
                         // Native call failed, use reference fallback
                         let reason = match err {
-                            super::native::AccelerateNativeError::BackendUnavailable => 
+                            AccelerateNativeError::BackendUnavailable => 
                                 "Accelerate unavailable".to_string(),
-                            super::native::AccelerateNativeError::LengthMismatch { expected, actual } => 
+                            AccelerateNativeError::LengthMismatch { expected, actual } => 
                                 format!("Length mismatch: expected {}, got {}", expected, actual),
-                            super::native::AccelerateNativeError::EmptyInput => 
+                            AccelerateNativeError::EmptyInput => 
                                 "Empty input not supported by native path".to_string(),
-                            super::native::AccelerateNativeError::DimensionError(msg) => msg,
+                            AccelerateNativeError::DimensionError(msg) => msg,
                             _ => "Native vDSP call failed".to_string(),
                         };
                         (reference::add(a, b), AccelerateSubsystem::Reference, true, Some(reason), None)
@@ -400,13 +401,13 @@ pub mod kernels {
                     Err(err) => {
                         // Native call failed, use reference fallback
                         let reason = match err {
-                            super::native::AccelerateNativeError::BackendUnavailable => 
+                            AccelerateNativeError::BackendUnavailable => 
                                 "Accelerate unavailable".to_string(),
-                            super::native::AccelerateNativeError::LengthMismatch { expected, actual } => 
+                            AccelerateNativeError::LengthMismatch { expected, actual } => 
                                 format!("Length mismatch: expected {}, got {}", expected, actual),
-                            super::native::AccelerateNativeError::EmptyInput => 
+                            AccelerateNativeError::EmptyInput => 
                                 "Empty input not supported by native path".to_string(),
-                            super::native::AccelerateNativeError::DimensionError(msg) => msg,
+                            AccelerateNativeError::DimensionError(msg) => msg,
                             _ => "Native vDSP call failed".to_string(),
                         };
                         (reference::multiply(a, b), AccelerateSubsystem::Reference, true, Some(reason), None)
@@ -547,13 +548,13 @@ pub mod kernels {
                         Err(err) => {
                             // Native call failed, use reference fallback
                             let reason = match err {
-                                super::native::AccelerateNativeError::BackendUnavailable => 
+                                AccelerateNativeError::BackendUnavailable => 
                                     "Accelerate unavailable".to_string(),
-                                super::native::AccelerateNativeError::LengthMismatch { expected, actual } => 
+                                AccelerateNativeError::LengthMismatch { expected, actual } => 
                                     format!("Length mismatch: expected {}, got {}", expected, actual),
-                                super::native::AccelerateNativeError::EmptyInput => 
+                                AccelerateNativeError::EmptyInput => 
                                     "Empty input not supported by native path".to_string(),
-                                super::native::AccelerateNativeError::DimensionError(msg) => msg,
+                                AccelerateNativeError::DimensionError(msg) => msg,
                                 _ => "Native BLAS call failed".to_string(),
                             };
                             (reference::matmul(a, b, m, n, p), AccelerateSubsystem::Reference, true, Some(reason), None)

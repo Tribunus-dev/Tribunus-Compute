@@ -816,7 +816,7 @@ impl Default for AccelerateConformanceRunner {
 }
 
 /// Backend matrix showing conformance results for all backends and operations.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BackendMatrix {
     /// Results organized by backend and operation.
     pub results: HashMap<BackendId, Vec<ConformanceResult>>,

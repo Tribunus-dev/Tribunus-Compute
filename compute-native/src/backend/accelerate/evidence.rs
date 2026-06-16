@@ -88,6 +88,7 @@ impl AccelerateEvidence {
             passed: false,
             fallback_used: false,
             fallback_reason: None,
+            native_symbol: None,
             wall_time_ns: 0,
             allocation_count: None,
             timestamp: Self::current_timestamp(),

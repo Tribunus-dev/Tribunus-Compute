@@ -75,7 +75,7 @@ impl AccelerateLinkage {
 }
 
 /// Result type for Accelerate FFI operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccelerateResult<T> {
     /// Operation succeeded with result.
     Success(T),
@@ -149,6 +149,8 @@ impl<T: fmt::Debug> fmt::Display for AccelerateResult<T> {
 ///
 /// This module contains the actual FFI bindings and platform-specific implementations.
 pub mod platform {
+    use super::AccelerateResult;
+
     /// Initialize Accelerate framework.
     /// 
     /// On macOS, this may perform framework initialization.
