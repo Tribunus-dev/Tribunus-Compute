@@ -6,6 +6,7 @@ pub mod arena;
 pub mod arena_lifecycle;
 pub mod arena_pool;
 mod bridge;
+pub mod backend;
 pub mod capability;
 pub mod compute_image;
 pub mod compile_pipeline;
