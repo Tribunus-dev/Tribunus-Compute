@@ -1,15 +1,21 @@
 //! Accelerate kernel implementations.
 //!
-//! This module provides the actual kernel implementations for Accelerate operations.
+//! This module provides **native-ready scaffold** kernel implementations for Accelerate operations.
 //! Each kernel produces execution receipts and evidence for verification.
 //!
-//! # PR3 Scope
+//! # Implementation Status
 //!
-//! This module implements the first real kernels for PR3:
-//! - Identity: f32 execution
-//! - Add: f32 elementwise addition via vDSP
-//! - Multiply: f32 elementwise multiplication via vDSP
-//! - Matmul: f32 matrix multiplication via BLAS GEMM
+//! **Current State**: All kernels use reference implementations on all platforms.
+//! The lowering decisions target the appropriate subsystems (vDSP for elementwise, BLAS for matmul),
+//! but actual execution is via reference fallback until native FFI bindings are implemented.
+//!
+//! # Intended PR3 Scope (Not Yet Implemented)
+//!
+//! When native calls are added, this module will implement:
+//! - Identity: f32 execution (memory operation)
+//! - Add: f32 elementwise addition via vDSP_vadd
+//! - Multiply: f32 elementwise multiplication via vDSP_vmul
+//! - Matmul: f32 matrix multiplication via cblas_sgemm
 //!
 //! # Design Principles
 //!
@@ -17,6 +23,7 @@
 //! 2. **Reference-Checked**: Results are compared against reference implementations.
 //! 3. **Portable**: Non-macOS platforms use reference fallback with explicit evidence.
 //! 4. **Type-Safe**: Only f32 is implemented initially; other dtypes return unsupported.
+//! 5. **Truthful**: Receipts clearly distinguish lowering_subsystem (intended) from executed_subsystem (actual).
 
 use std::time::{Duration, Instant};
 use super::{dtype::AccelerateDType, execution::{AccelerateExecutionReceipt, BufferInfo, NumericalStatus}, 
@@ -150,24 +157,35 @@ pub mod kernels {
     /// 
     /// On macOS: Can be a no-op view or validated copy.
     /// On non-macOS: Always uses reference implementation.
+    /// 
+    /// # Note
+    /// 
+    /// This implementation uses reference fallback on all platforms.
+    /// The lowering_subsystem reflects the intended subsystem (Reference for identity),
+    /// while executed_subsystem is always Reference until native Accelerate calls are implemented.
     pub fn identity(ctx: &KernelContext, input: &[f32], shape: &[usize], layout: AccelerateLayout) -> KernelResult {
         let start = Instant::now();
         let input_size = input.len();
         let shape_key = format!("[{}]", shape.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(","));
         let layout_key = layout.to_string();
         
-        let (output, subsystem, fallback_used, fallback_reason) = if ctx.is_available() {
+        // For identity, the intended lowering is Reference (memory operation)
+        let lowering_subsystem = AccelerateSubsystem::Reference;
+        
+        let (output, executed_subsystem, fallback_used, fallback_reason) = if ctx.is_available() {
             // On macOS, we could use Accelerate for memory operations
-            // For v0, we'll use reference implementation but mark as available
+            // For now, we use reference implementation
+            // lowering_subsystem = Reference, executed_subsystem = Reference (no fallback)
             (reference::identity(input), AccelerateSubsystem::Reference, false, None)
         } else {
             // On non-macOS, explicitly use reference fallback
+            // lowering_subsystem = Reference, executed_subsystem = Reference, but fallback_used = true
             (reference::identity(input), AccelerateSubsystem::Reference, true, Some("Accelerate unavailable".to_string()))
         };
         
         let wall_time = start.elapsed();
         
-        // Create receipt
+        // Create receipt with both lowering and executed subsystems
         let receipt = AccelerateExecutionReceipt::new(
             uuid::Uuid::new_v4().to_string(),
             "identity".to_string(),
@@ -175,7 +193,8 @@ pub mod kernels {
             AccelerateDType::F32,
             shape_key.clone(),
             layout_key.clone(),
-            subsystem,
+            lowering_subsystem,
+            executed_subsystem,
         )
         .with_results(
             wall_time,
@@ -204,7 +223,7 @@ pub mod kernels {
                 AccelerateDType::F32,
                 shape_key,
                 layout_key,
-                subsystem,
+                executed_subsystem,
                 Some(max_abs_error),
                 None,
                 None,
@@ -220,25 +239,36 @@ pub mod kernels {
 
     /// Add kernel.
     /// 
-    /// On macOS: Uses vDSP for vector addition.
+    /// On macOS: Intended to use vDSP for vector addition (not yet implemented).
     /// On non-macOS: Uses reference implementation with fallback evidence.
+    /// 
+    /// # Note
+    /// 
+    /// This implementation uses reference fallback on all platforms.
+    /// The lowering_subsystem is vDSP (intended), while executed_subsystem is Reference
+    /// until native vDSP calls are implemented.
     pub fn add(ctx: &KernelContext, a: &[f32], b: &[f32], shape: &[usize], layout: AccelerateLayout) -> KernelResult {
         let start = Instant::now();
         let shape_key = format!("[{}]", shape.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(","));
         let layout_key = layout.to_string();
         
-        let (output, subsystem, fallback_used, fallback_reason) = if ctx.is_available() {
+        // For add, the intended lowering is vDSP
+        let lowering_subsystem = AccelerateSubsystem::Vdsp;
+        
+        let (output, executed_subsystem, fallback_used, fallback_reason) = if ctx.is_available() {
             // On macOS, we would use vDSP here
-            // For now, use reference but mark as vDSP subsystem
-            (reference::add(a, b), AccelerateSubsystem::Vdsp, false, None)
+            // For now, use reference but mark intended as vDSP
+            // lowering_subsystem = vDSP, executed_subsystem = Reference (fallback)
+            (reference::add(a, b), AccelerateSubsystem::Reference, true, Some("vDSP not yet implemented".to_string()))
         } else {
             // On non-macOS, use reference fallback
+            // lowering_subsystem = vDSP, executed_subsystem = Reference, fallback_used = true
             (reference::add(a, b), AccelerateSubsystem::Reference, true, Some("Accelerate unavailable".to_string()))
         };
         
         let wall_time = start.elapsed();
         
-        // Create receipt
+        // Create receipt with both lowering and executed subsystems
         let receipt = AccelerateExecutionReceipt::new(
             uuid::Uuid::new_v4().to_string(),
             "add".to_string(),
@@ -246,7 +276,8 @@ pub mod kernels {
             AccelerateDType::F32,
             shape_key.clone(),
             layout_key.clone(),
-            subsystem,
+            lowering_subsystem,
+            executed_subsystem,
         )
         .with_results(
             wall_time,
@@ -280,7 +311,7 @@ pub mod kernels {
                 AccelerateDType::F32,
                 shape_key,
                 layout_key,
-                subsystem,
+                executed_subsystem,
                 Some(max_abs_error),
                 Some(max_rel_error),
                 None,
@@ -296,24 +327,36 @@ pub mod kernels {
 
     /// Multiply kernel.
     /// 
-    /// On macOS: Uses vDSP for vector multiplication.
+    /// On macOS: Intended to use vDSP for vector multiplication (not yet implemented).
     /// On non-macOS: Uses reference implementation with fallback evidence.
+    /// 
+    /// # Note
+    /// 
+    /// This implementation uses reference fallback on all platforms.
+    /// The lowering_subsystem is vDSP (intended), while executed_subsystem is Reference
+    /// until native vDSP calls are implemented.
     pub fn multiply(ctx: &KernelContext, a: &[f32], b: &[f32], shape: &[usize], layout: AccelerateLayout) -> KernelResult {
         let start = Instant::now();
         let shape_key = format!("[{}]", shape.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(","));
         let layout_key = layout.to_string();
         
-        let (output, subsystem, fallback_used, fallback_reason) = if ctx.is_available() {
+        // For multiply, the intended lowering is vDSP
+        let lowering_subsystem = AccelerateSubsystem::Vdsp;
+        
+        let (output, executed_subsystem, fallback_used, fallback_reason) = if ctx.is_available() {
             // On macOS, we would use vDSP here
-            (reference::multiply(a, b), AccelerateSubsystem::Vdsp, false, None)
+            // For now, use reference but mark intended as vDSP
+            // lowering_subsystem = vDSP, executed_subsystem = Reference (fallback)
+            (reference::multiply(a, b), AccelerateSubsystem::Reference, true, Some("vDSP not yet implemented".to_string()))
         } else {
             // On non-macOS, use reference fallback
+            // lowering_subsystem = vDSP, executed_subsystem = Reference, fallback_used = true
             (reference::multiply(a, b), AccelerateSubsystem::Reference, true, Some("Accelerate unavailable".to_string()))
         };
         
         let wall_time = start.elapsed();
         
-        // Create receipt
+        // Create receipt with both lowering and executed subsystems
         let receipt = AccelerateExecutionReceipt::new(
             uuid::Uuid::new_v4().to_string(),
             "multiply".to_string(),
@@ -321,7 +364,8 @@ pub mod kernels {
             AccelerateDType::F32,
             shape_key.clone(),
             layout_key.clone(),
-            subsystem,
+            lowering_subsystem,
+            executed_subsystem,
         )
         .with_results(
             wall_time,
@@ -355,7 +399,7 @@ pub mod kernels {
                 AccelerateDType::F32,
                 shape_key,
                 layout_key,
-                subsystem,
+                executed_subsystem,
                 Some(max_abs_error),
                 Some(max_rel_error),
                 None,
@@ -371,27 +415,38 @@ pub mod kernels {
 
     /// Matmul kernel.
     /// 
-    /// On macOS: Uses BLAS GEMM for matrix multiplication.
+    /// On macOS: Intended to use BLAS GEMM for matrix multiplication (not yet implemented).
     /// On non-macOS: Uses reference implementation with fallback evidence.
     /// 
     /// Assumes row-major layout for inputs.
+    /// 
+    /// # Note
+    /// 
+    /// This implementation uses reference fallback on all platforms.
+    /// The lowering_subsystem is BLAS (intended), while executed_subsystem is Reference
+    /// until native BLAS calls are implemented.
     pub fn matmul(ctx: &KernelContext, a: &[f32], b: &[f32], m: usize, n: usize, p: usize) -> KernelResult {
         let start = Instant::now();
         let shape_key = format!("[{},{},{}]", m, n, p);
         let layout_key = "row_major".to_string();
         
-        let (output, subsystem, fallback_used, fallback_reason) = if ctx.is_available() {
+        // For matmul, the intended lowering is BLAS
+        let lowering_subsystem = AccelerateSubsystem::Blas;
+        
+        let (output, executed_subsystem, fallback_used, fallback_reason) = if ctx.is_available() {
             // On macOS, we would use BLAS GEMM here
-            // For now, use reference but mark as BLAS subsystem
-            (reference::matmul(a, b, m, n, p), AccelerateSubsystem::Blas, false, None)
+            // For now, use reference but mark intended as BLAS
+            // lowering_subsystem = Blas, executed_subsystem = Reference (fallback)
+            (reference::matmul(a, b, m, n, p), AccelerateSubsystem::Reference, true, Some("BLAS not yet implemented".to_string()))
         } else {
             // On non-macOS, use reference fallback
+            // lowering_subsystem = Blas, executed_subsystem = Reference, fallback_used = true
             (reference::matmul(a, b, m, n, p), AccelerateSubsystem::Reference, true, Some("Accelerate unavailable".to_string()))
         };
         
         let wall_time = start.elapsed();
         
-        // Create receipt
+        // Create receipt with both lowering and executed subsystems
         let receipt = AccelerateExecutionReceipt::new(
             uuid::Uuid::new_v4().to_string(),
             "matmul".to_string(),
@@ -399,7 +454,8 @@ pub mod kernels {
             AccelerateDType::F32,
             shape_key.clone(),
             layout_key.clone(),
-            subsystem,
+            lowering_subsystem,
+            executed_subsystem,
         )
         .with_results(
             wall_time,
@@ -444,7 +500,7 @@ pub mod kernels {
                 AccelerateDType::F32,
                 shape_key,
                 layout_key,
-                subsystem,
+                executed_subsystem,
                 Some(max_abs_error),
                 None,
                 Some(cosine_similarity),

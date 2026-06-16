@@ -1,11 +1,27 @@
 //! Accelerate CPU inference backend for Tribunus.
 //!
-//! This module provides a first-class Accelerate backend with capability discovery,
-//! operation support classification, lowering decisions, and execution receipts.
-//! The backend models Accelerate as a deterministic Apple CPU execution target with
-//! multiple internal lowering paths: BNNS/BNNSGraph for neural-network-shaped graphs,
-//! BLAS/LAPACK for dense linear algebra, vDSP/vForce for vector elementwise/reduction/math
-//! kernels, and fallback scalar/reference kernels for unsupported ops.
+//! This module provides a **native-ready scaffold** for a first-class Accelerate backend.
+//! It includes capability discovery, operation support classification, lowering decisions,
+//! and execution receipts with truthful evidence reporting.
+//!
+//! # Implementation Status
+//!
+//! **Current State (HARDEN-ACCELERATE-PR2-TRUTHFUL-EVIDENCE-0001)**:
+//!
+//! - ✅ **Modeling Complete**: Full pipeline model with capability discovery, support classification,
+//!   lowering decisions, and execution receipts.
+//! - ✅ **Reference Backend**: All operations execute via reference implementations on all platforms.
+//! - ✅ **Truthful Evidence**: Execution receipts distinguish between `lowering_subsystem` (intended)
+//!   and `executed_subsystem` (actual), with mandatory fallback reasons.
+//! - ✅ **Portable API**: All public types available on all platforms; only FFI linkage gated by cfg.
+//! - ❌ **Native Calls**: No direct Accelerate.framework calls yet (vDSP, BLAS, BNNS not bound).
+//!
+//! **What This Means**:
+//!
+//! - On macOS: Lowering decisions target vDSP/BLAS/BNNS, but execution uses reference fallback.
+//! - On Linux: Same behavior, with explicit "Accelerate unavailable" fallback reasons.
+//! - BackendClassification::Pass means **native execution succeeded** (not yet achievable).
+//! - BackendClassification::Fallback means reference was used (current state for all ops).
 //!
 //! # Architecture
 //!
@@ -18,11 +34,21 @@
 //!    with structured `AccelerateSupport` records.
 //!
 //! 3. **Lowering**: Compiler choices between BNNS, BLAS, vDSP/vForce, or reference fallback.
+//!    Currently all operations lower to their intended subsystems but execute via reference.
 //!
 //! 4. **Runtime Execution**: `AccelerateExecutionPlan` that takes canonical phase IR
 //!    plus input buffers and returns output buffers plus execution receipts.
 //!
 //! 5. **Evidence**: Reference-checked numerical validation with JSON evidence output.
+//!    Evidence now includes both lowering_subsystem and executed_subsystem for truthful reporting.
+//!
+//! # Next Steps
+//!
+//! The next PR should implement actual native Accelerate calls:
+//! - Bind vDSP_vadd, vDSP_vmul for add/multiply
+//! - Bind cblas_sgemm for matmul
+//! - Update kernels to call these when available
+//! - Then BackendClassification::Pass will be achievable
 
 pub mod activation;
 pub mod capabilities;

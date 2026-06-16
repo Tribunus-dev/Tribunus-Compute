@@ -1,13 +1,20 @@
 //! Accelerate activation function kernels.
 //!
-//! This module implements PR5: f32 sigmoid, SiLU, and softmax kernels.
+//! This module provides **native-ready scaffold** for PR5: f32 sigmoid, SiLU, and softmax kernels.
 //! 
+//! # Implementation Status
+//!
+//! **Current State**: All activation kernels use reference implementations on all platforms.
+//! The lowering decisions target vDSP/vForce, but actual execution is via reference fallback
+//! until native FFI bindings are implemented.
+//!
 //! # Design Principles
 //!
 //! 1. **Numerical Stability**: Softmax uses max-subtraction for stability.
-//! 2. **Composite Lowering**: SiLU is explicitly lowered as sigmoid * multiply.
+//! 2. **Composite Lowering**: SiLU is explicitly lowered as sigmoid * multiply (not a native primitive).
 //! 3. **Evidence-Driven**: Each kernel produces detailed evidence.
-//! 4. **Fallback Support**: Unsupported cases use reference fallback with explicit evidence.
+//! 4. **Fallback Support**: All cases currently use reference fallback with explicit evidence.
+//! 5. **Truthful**: Receipts clearly distinguish lowering_subsystem from executed_subsystem.
 
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -69,27 +76,38 @@ impl ActivationResult {
 
 /// Sigmoid kernel.
 /// 
-/// On macOS: Uses vDSP/vForce for vector sigmoid.
+/// On macOS: Intended to use vDSP/vForce for vector sigmoid (not yet implemented).
 /// On non-macOS: Uses reference implementation with fallback evidence.
 /// 
 /// Formula: sigmoid(x) = 1 / (1 + exp(-x))
+/// 
+/// # Note
+/// 
+/// This implementation uses reference fallback on all platforms.
+/// The lowering_subsystem is vDSP (intended), while executed_subsystem is Reference
+/// until native vDSP calls are implemented.
 pub fn sigmoid(ctx: &ActivationContext, input: &[f32], shape: &[usize]) -> ActivationResult {
     let start = Instant::now();
     let shape_key = format!("[{}]", shape.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(","));
     let layout_key = "row_major".to_string();
     
-    let (output, subsystem, fallback_used, fallback_reason) = if ctx.is_available() {
+    // For sigmoid, the intended lowering is vDSP
+    let lowering_subsystem = AccelerateSubsystem::Vdsp;
+    
+    let (output, executed_subsystem, fallback_used, fallback_reason) = if ctx.is_available() {
         // On macOS, we would use vDSP/vForce here
-        // For now, use reference but mark as vDSP subsystem
-        (reference::sigmoid(input), AccelerateSubsystem::Vdsp, false, None)
+        // For now, use reference but mark intended as vDSP
+        // lowering_subsystem = vDSP, executed_subsystem = Reference (fallback)
+        (reference::sigmoid(input), AccelerateSubsystem::Reference, true, Some("vDSP not yet implemented".to_string()))
     } else {
         // On non-macOS, use reference fallback
+        // lowering_subsystem = vDSP, executed_subsystem = Reference, fallback_used = true
         (reference::sigmoid(input), AccelerateSubsystem::Reference, true, Some("Accelerate unavailable".to_string()))
     };
     
     let wall_time = start.elapsed();
     
-    // Create receipt
+    // Create receipt with both lowering and executed subsystems
     let receipt = AccelerateExecutionReceipt::new(
         Uuid::new_v4().to_string(),
         "sigmoid".to_string(),
@@ -97,7 +115,8 @@ pub fn sigmoid(ctx: &ActivationContext, input: &[f32], shape: &[usize]) -> Activ
         AccelerateDType::F32,
         shape_key.clone(),
         layout_key.clone(),
-        subsystem,
+        lowering_subsystem,
+        executed_subsystem,
     )
     .with_results(
         wall_time,
@@ -131,7 +150,7 @@ pub fn sigmoid(ctx: &ActivationContext, input: &[f32], shape: &[usize]) -> Activ
             AccelerateDType::F32,
             shape_key,
             layout_key,
-            subsystem,
+            executed_subsystem,
             Some(max_abs_error),
             Some(max_rel_error),
             None,
@@ -152,32 +171,43 @@ pub fn sigmoid(ctx: &ActivationContext, input: &[f32], shape: &[usize]) -> Activ
 /// This must be implemented as a composite lowering of sigmoid followed by multiply,
 /// not as an imaginary native primitive.
 /// 
-/// On macOS: Uses vDSP for both sigmoid and multiply operations.
+/// On macOS: Intended to use vDSP for both sigmoid and multiply operations (not yet implemented).
 /// On non-macOS: Uses reference implementation with fallback evidence.
+/// 
+/// # Note
+/// 
+/// This implementation uses reference fallback on all platforms.
+/// The lowering_subsystem is vDSP (intended), while executed_subsystem is Reference
+/// until native vDSP calls are implemented.
 pub fn silu(ctx: &ActivationContext, input: &[f32], shape: &[usize]) -> ActivationResult {
     let start = Instant::now();
     let shape_key = format!("[{}]", shape.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(","));
     let layout_key = "row_major".to_string();
     
-    let (output, subsystem, fallback_used, fallback_reason) = if ctx.is_available() {
+    // For SiLU, the intended lowering is vDSP (composite: sigmoid + multiply)
+    let lowering_subsystem = AccelerateSubsystem::Vdsp;
+    
+    let (output, executed_subsystem, fallback_used, fallback_reason) = if ctx.is_available() {
         // On macOS, we would use vDSP for both operations
-        // For now, use reference but mark as vDSP subsystem
+        // For now, use reference but mark intended as vDSP
         // This is a composite operation: sigmoid(x) * x
         let sigmoid_output = reference::sigmoid(input);
         let output = sigmoid_output.iter().zip(input.iter())
             .map(|(&s, &x)| s * x)
             .collect::<Vec<f32>>();
         
-        (output, AccelerateSubsystem::Vdsp, false, None)
+        // lowering_subsystem = vDSP, executed_subsystem = Reference (fallback)
+        (output, AccelerateSubsystem::Reference, true, Some("vDSP not yet implemented".to_string()))
     } else {
         // On non-macOS, use reference fallback
         let output = reference::silu(input);
+        // lowering_subsystem = vDSP, executed_subsystem = Reference, fallback_used = true
         (output, AccelerateSubsystem::Reference, true, Some("Accelerate unavailable".to_string()))
     };
     
     let wall_time = start.elapsed();
     
-    // Create receipt - note this is a composite operation
+    // Create receipt with both lowering and executed subsystems - note this is a composite operation
     let receipt = AccelerateExecutionReceipt::new(
         Uuid::new_v4().to_string(),
         "silu".to_string(),
@@ -185,7 +215,8 @@ pub fn silu(ctx: &ActivationContext, input: &[f32], shape: &[usize]) -> Activati
         AccelerateDType::F32,
         shape_key.clone(),
         layout_key.clone(),
-        subsystem,
+        lowering_subsystem,
+        executed_subsystem,
     )
     .with_results(
         wall_time,
@@ -219,7 +250,7 @@ pub fn silu(ctx: &ActivationContext, input: &[f32], shape: &[usize]) -> Activati
             AccelerateDType::F32,
             shape_key,
             layout_key,
-            subsystem,
+            executed_subsystem,
             Some(max_abs_error),
             Some(max_rel_error),
             None,
@@ -239,25 +270,36 @@ pub fn silu(ctx: &ActivationContext, input: &[f32], shape: &[usize]) -> Activati
 /// 
 /// Formula: softmax(x)_i = exp(x_i - max(x)) / sum(exp(x_j - max(x)))
 /// 
-/// On macOS: Uses vDSP for exp, max reduction, sum reduction, and divide operations.
+/// On macOS: Intended to use vDSP for exp, max reduction, sum reduction, and divide operations (not yet implemented).
 /// On non-macOS: Uses reference implementation with fallback evidence.
+/// 
+/// # Note
+/// 
+/// This implementation uses reference fallback on all platforms.
+/// The lowering_subsystem is vDSP (intended), while executed_subsystem is Reference
+/// until native vDSP calls are implemented.
 pub fn softmax(ctx: &ActivationContext, input: &[f32], shape: &[usize]) -> ActivationResult {
     let start = Instant::now();
     let shape_key = format!("[{}]", shape.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(","));
     let layout_key = "row_major".to_string();
     
-    let (output, subsystem, fallback_used, fallback_reason) = if ctx.is_available() {
+    // For softmax, the intended lowering is vDSP
+    let lowering_subsystem = AccelerateSubsystem::Vdsp;
+    
+    let (output, executed_subsystem, fallback_used, fallback_reason) = if ctx.is_available() {
         // On macOS, we would use vDSP for the component operations
-        // For now, use reference but mark as vDSP subsystem
-        (reference::softmax(input), AccelerateSubsystem::Vdsp, false, None)
+        // For now, use reference but mark intended as vDSP
+        // lowering_subsystem = vDSP, executed_subsystem = Reference (fallback)
+        (reference::softmax(input), AccelerateSubsystem::Reference, true, Some("vDSP not yet implemented".to_string()))
     } else {
         // On non-macOS, use reference fallback
+        // lowering_subsystem = vDSP, executed_subsystem = Reference, fallback_used = true
         (reference::softmax(input), AccelerateSubsystem::Reference, true, Some("Accelerate unavailable".to_string()))
     };
     
     let wall_time = start.elapsed();
     
-    // Create receipt
+    // Create receipt with both lowering and executed subsystems
     let receipt = AccelerateExecutionReceipt::new(
         Uuid::new_v4().to_string(),
         "softmax".to_string(),
@@ -265,7 +307,8 @@ pub fn softmax(ctx: &ActivationContext, input: &[f32], shape: &[usize]) -> Activ
         AccelerateDType::F32,
         shape_key.clone(),
         layout_key.clone(),
-        subsystem,
+        lowering_subsystem,
+        executed_subsystem,
     )
     .with_results(
         wall_time,
@@ -310,7 +353,7 @@ pub fn softmax(ctx: &ActivationContext, input: &[f32], shape: &[usize]) -> Activ
             AccelerateDType::F32,
             shape_key,
             layout_key,
-            subsystem,
+            executed_subsystem,
             Some(max_abs_error),
             None,
             Some(cosine_similarity),

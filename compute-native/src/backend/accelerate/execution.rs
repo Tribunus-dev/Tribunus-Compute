@@ -12,6 +12,15 @@ use super::{dtype::AccelerateDType, layout::AccelerateLayout, ops::CanonicalOp, 
 ///
 /// This receipt captures the result of executing a canonical phase through Accelerate,
 /// including timing, numerical status, and execution details.
+///
+/// # Subsystem Distinction
+///
+/// - `lowering_subsystem`: The subsystem that was *intended* to execute (based on lowering decision)
+/// - `executed_subsystem`: The subsystem that *actually* executed
+///
+/// For example, on Linux: lowering_subsystem=vDSP, executed_subsystem=Reference
+/// On macOS with native calls: lowering_subsystem=vDSP, executed_subsystem=vDSP
+/// This distinction is critical for truthful evidence reporting.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccelerateExecutionReceipt {
     /// Unique identifier for this execution.
@@ -20,8 +29,10 @@ pub struct AccelerateExecutionReceipt {
     pub phase_id: String,
     /// The backend that executed this phase.
     pub backend: String,
-    /// The subsystem that executed this phase.
-    pub subsystem: AccelerateSubsystem,
+    /// The subsystem that was *intended* to execute (from lowering decision).
+    pub lowering_subsystem: AccelerateSubsystem,
+    /// The subsystem that *actually* executed.
+    pub executed_subsystem: AccelerateSubsystem,
     /// The canonical operation.
     pub op: CanonicalOp,
     /// The data type used.
@@ -38,7 +49,7 @@ pub struct AccelerateExecutionReceipt {
     pub numerical_status: NumericalStatus,
     /// Whether fallback was used.
     pub fallback_used: bool,
-    /// Fallback reason (if applicable).
+    /// Fallback reason. MANDATORY when fallback_used=true.
     pub fallback_reason: Option<String>,
     /// Graph hash (if applicable).
     pub graph_hash: Option<String>,
@@ -50,6 +61,17 @@ pub struct AccelerateExecutionReceipt {
 
 impl AccelerateExecutionReceipt {
     /// Creates a new execution receipt.
+    ///
+    /// # Arguments
+    ///
+    /// * `execution_id` - Unique identifier for this execution
+    /// * `phase_id` - The canonical phase/operation identifier
+    /// * `op` - The canonical operation
+    /// * `dtype` - The data type used
+    /// * `shape_key` - String representation of shape
+    /// * `layout_key` - String representation of layout
+    /// * `lowering_subsystem` - The subsystem that was *intended* to execute
+    /// * `executed_subsystem` - The subsystem that *actually* executed
     pub fn new(
         execution_id: String,
         phase_id: String,
@@ -57,14 +79,16 @@ impl AccelerateExecutionReceipt {
         dtype: AccelerateDType,
         shape_key: String,
         layout_key: String,
-        subsystem: AccelerateSubsystem,
+        lowering_subsystem: AccelerateSubsystem,
+        executed_subsystem: AccelerateSubsystem,
     ) -> Self {
         let start = Instant::now();
         Self {
             execution_id,
             phase_id,
             backend: super::BACKEND_ACCELERATE.to_string(),
-            subsystem,
+            lowering_subsystem,
+            executed_subsystem,
             op,
             dtype,
             shape_key,
@@ -95,7 +119,16 @@ impl AccelerateExecutionReceipt {
     }
 
     /// Marks this execution as using fallback.
+    /// 
+    /// # Arguments
+    ///
+    /// * `reason` - The reason for using fallback. This is MANDATORY and cannot be empty.
+    /// 
+    /// # Panics
+    ///
+    /// Panics if reason is empty, as fallback_reason must always be provided when fallback is used.
     pub fn with_fallback(mut self, reason: &str) -> Self {
+        assert!(!reason.is_empty(), "fallback_reason cannot be empty when fallback_used=true");
         self.fallback_used = true;
         self.fallback_reason = Some(reason.to_string());
         self
@@ -114,8 +147,16 @@ impl AccelerateExecutionReceipt {
     }
 
     /// Returns true if the execution was successful.
+    /// 
+    /// Success means: no fallback used AND numerical status is OK.
+    /// This ensures that only actual native execution (not reference fallback) counts as success.
     pub fn is_success(&self) -> bool {
         !self.fallback_used && self.numerical_status.is_ok()
+    }
+
+    /// Returns true if this execution used native Accelerate (not reference fallback).
+    pub fn is_native_execution(&self) -> bool {
+        !self.fallback_used && self.executed_subsystem != AccelerateSubsystem::Reference
     }
 
     /// Returns the execution time in milliseconds.
@@ -126,11 +167,12 @@ impl AccelerateExecutionReceipt {
     /// Returns a summary of the receipt.
     pub fn summary(&self) -> String {
         format!(
-            "AccelerateExecutionReceipt: op={}, dtype={}, shape={}, subsystem={}, time={:.3}ms, status={}, fallback={}",
+            "AccelerateExecutionReceipt: op={}, dtype={}, shape={}, lowering={}, executed={}, time={:.3}ms, status={}, fallback={}",
             self.op,
             self.dtype,
             self.shape_key,
-            self.subsystem,
+            self.lowering_subsystem,
+            self.executed_subsystem,
             self.wall_time_ms(),
             self.numerical_status,
             self.fallback_used
@@ -142,11 +184,12 @@ impl fmt::Display for AccelerateExecutionReceipt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Receipt[{}] op={} backend={} subsystem={} dtype={} shape={} time={}ns status={}",
+            "Receipt[{}] op={} backend={} lowering={} executed={} dtype={} shape={} time={}ns status={}",
             self.execution_id,
             self.op,
             self.backend,
-            self.subsystem,
+            self.lowering_subsystem,
+            self.executed_subsystem,
             self.dtype,
             self.shape_key,
             self.wall_time_ns,
@@ -218,8 +261,8 @@ pub struct AccelerateExecutionPlan {
     pub op: CanonicalOp,
     /// The lowering kind to use.
     pub lowering_kind: AccelerateLoweringKind,
-    /// The subsystem to use.
-    pub subsystem: AccelerateSubsystem,
+    /// The subsystem that was *intended* to execute (from lowering decision).
+    pub lowering_subsystem: AccelerateSubsystem,
     /// Input buffer information.
     pub input_buffers: Vec<BufferInfo>,
     /// Output buffer information.
@@ -233,11 +276,12 @@ pub struct AccelerateExecutionPlan {
 impl AccelerateExecutionPlan {
     /// Creates a new execution plan.
     pub fn new(plan_id: String, op: CanonicalOp, lowering_kind: AccelerateLoweringKind) -> Self {
+        let lowering_subsystem = lowering_kind.subsystem();
         Self {
             plan_id,
             op,
             lowering_kind,
-            subsystem: lowering_kind.subsystem(),
+            lowering_subsystem,
             input_buffers: Vec::new(),
             output_buffers: Vec::new(),
             receipt: None,
@@ -503,12 +547,14 @@ mod tests {
             "[2,3]".to_string(),
             "row_major".to_string(),
             AccelerateSubsystem::Vdsp,
+            AccelerateSubsystem::Vdsp,
         );
 
         assert_eq!(receipt.execution_id, "exec1");
         assert_eq!(receipt.phase_id, "phase1");
         assert_eq!(receipt.backend, "accelerate");
-        assert_eq!(receipt.subsystem, AccelerateSubsystem::Vdsp);
+        assert_eq!(receipt.lowering_subsystem, AccelerateSubsystem::Vdsp);
+        assert_eq!(receipt.executed_subsystem, AccelerateSubsystem::Vdsp);
         assert_eq!(receipt.op, CanonicalOp::Add);
         assert!(!receipt.is_success()); // Not computed yet
     }
@@ -523,6 +569,7 @@ mod tests {
             "[2,3]".to_string(),
             "row_major".to_string(),
             AccelerateSubsystem::Vdsp,
+            AccelerateSubsystem::Vdsp,
         )
         .with_results(
             Duration::from_millis(10),
@@ -531,6 +578,7 @@ mod tests {
         );
 
         assert!(receipt.is_success());
+        assert!(receipt.is_native_execution());
         assert_eq!(receipt.wall_time_ns, 10_000_000); // 10ms in ns
         assert_eq!(receipt.allocation_count, Some(2));
     }
@@ -544,13 +592,33 @@ mod tests {
             AccelerateDType::F32,
             "[2,3]".to_string(),
             "row_major".to_string(),
-            AccelerateSubsystem::Reference,
+            AccelerateSubsystem::Vdsp,  // lowering intended vDSP
+            AccelerateSubsystem::Reference,  // but executed with Reference
         )
-        .with_fallback("unsupported operation");
+        .with_fallback("Accelerate unavailable");
 
         assert!(receipt.fallback_used);
-        assert_eq!(receipt.fallback_reason, Some("unsupported operation".to_string()));
+        assert_eq!(receipt.fallback_reason, Some("Accelerate unavailable".to_string()));
         assert!(!receipt.is_success());
+        assert!(!receipt.is_native_execution());
+        assert_eq!(receipt.lowering_subsystem, AccelerateSubsystem::Vdsp);
+        assert_eq!(receipt.executed_subsystem, AccelerateSubsystem::Reference);
+    }
+
+    #[test]
+    #[should_panic(expected = "fallback_reason cannot be empty")]
+    fn test_execution_receipt_empty_fallback_reason_panics() {
+        let receipt = AccelerateExecutionReceipt::new(
+            "exec1".to_string(),
+            "phase1".to_string(),
+            CanonicalOp::Add,
+            AccelerateDType::F32,
+            "[2,3]".to_string(),
+            "row_major".to_string(),
+            AccelerateSubsystem::Vdsp,
+            AccelerateSubsystem::Reference,
+        )
+        .with_fallback(""); // Empty reason should panic
     }
 
     #[test]
@@ -564,7 +632,7 @@ mod tests {
         assert_eq!(plan.plan_id, "plan1");
         assert_eq!(plan.op, CanonicalOp::Add);
         assert_eq!(plan.lowering_kind, AccelerateLoweringKind::VdspVector);
-        assert_eq!(plan.subsystem, AccelerateSubsystem::Vdsp);
+        assert_eq!(plan.lowering_subsystem, AccelerateSubsystem::Vdsp);
         assert!(!plan.is_executed());
     }
 

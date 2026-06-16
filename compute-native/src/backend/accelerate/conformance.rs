@@ -1,7 +1,14 @@
 //! Accelerate backend conformance runner integration.
 //!
-//! This module implements PR6: Integration of Accelerate into the existing
-//! backend qualification/conformance runner.
+//! This module provides **native-ready scaffold** for PR6: Integration of Accelerate into
+//! the existing backend qualification/conformance runner.
+//!
+//! # Implementation Status
+//!
+//! **Current State**: The conformance runner is implemented as a local module within the
+//! Accelerate backend. It is NOT yet wired into the existing repo-level conformance command.
+//! This is an intermediate state - the runner can generate a BackendMatrix but cannot yet
+//! emit Accelerate rows alongside MLX/Core ML/reference in the existing qualification path.
 //!
 //! # Design Principles
 //!
@@ -9,9 +16,11 @@
 //!    without hardcoding one-off paths.
 //! 2. **Classification**: Each canonical phase classified as pass, unsupported,
 //!    fallback, numerical_divergence, backend_unavailable, or execution_failed.
+//!    **Important**: Pass means native execution succeeded; Fallback means reference was used.
 //! 3. **Schema Compatibility**: Output schema remains compatible with existing
 //!    backend evidence pipeline.
 //! 4. **Portable**: Non-macOS behavior remains consistent.
+//! 5. **Truthful**: BackendClassification clearly distinguishes native passes from fallback.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -23,16 +32,36 @@ use super::{dtype::AccelerateDType, ops::CanonicalOp, subsystem::AccelerateSubsy
           ffi::AccelerateHandle};
 
 /// Backend classification for conformance results.
+///
+/// # Classification Semantics
+///
+/// - **Pass**: Operation executed natively on the requested backend and passed all checks.
+///   This means actual Accelerate.framework calls were made (vDSP, BLAS, etc.) and succeeded.
+/// 
+/// - **Fallback**: Operation used reference fallback implementation. Numerical correctness
+///   may have passed, but this is NOT a native backend pass. The backend was available
+///   but the operation was not executed natively.
+/// 
+/// - **NumericalDivergence**: Native execution passed but with numerical divergence within tolerance.
+///   This still counts as a native pass, just with warnings.
+/// 
+/// - **Unsupported**: Operation is not supported by this backend (no lowering path exists).
+/// 
+/// - **BackendUnavailable**: Backend is not available on this platform (e.g., Accelerate on Linux).
+/// 
+/// - **ExecutionFailed**: Execution failed (panicked, errored, or produced invalid results).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendClassification {
-    /// Operation passed all checks.
+    /// Operation executed natively and passed all checks.
+    /// This means actual backend framework calls were made and succeeded.
     Pass,
     /// Operation is unsupported by this backend.
     Unsupported,
-    /// Operation used fallback implementation.
+    /// Operation used fallback implementation (not native execution).
+    /// Even if numerical checks passed, this is NOT a native backend pass.
     Fallback,
-    /// Operation passed but with numerical divergence within tolerance.
+    /// Native execution passed but with numerical divergence within tolerance.
     NumericalDivergence,
     /// Backend is unavailable on this platform.
     BackendUnavailable,
@@ -54,7 +83,10 @@ impl fmt::Display for BackendClassification {
 }
 
 impl BackendClassification {
-    /// Returns true if this classification indicates success.
+    /// Returns true if this classification indicates native backend success.
+    /// 
+    /// **Important**: Pass means actual native execution succeeded.
+    /// Fallback with passing numerical checks does NOT count as success.
     pub fn is_success(&self) -> bool {
         matches!(self, BackendClassification::Pass | BackendClassification::NumericalDivergence)
     }
@@ -70,8 +102,18 @@ impl BackendClassification {
     }
 
     /// Returns true if this classification indicates fallback was used.
+    /// 
+    /// **Important**: Fallback means the operation did NOT execute natively,
+    /// even if numerical results were correct.
     pub fn is_fallback(&self) -> bool {
         matches!(self, BackendClassification::Fallback)
+    }
+
+    /// Returns true if this classification indicates native execution.
+    /// 
+    /// This is the inverse of is_fallback() for native execution.
+    pub fn is_native(&self) -> bool {
+        matches!(self, BackendClassification::Pass | BackendClassification::NumericalDivergence)
     }
 }
 
@@ -323,42 +365,58 @@ impl AccelerateConformanceRunner {
         
         let result = self.kernel_dispatcher.dispatch_identity(&input, &shape, AccelerateLayout::RowMajor);
         
+        // Check if this was native execution or fallback
         if result.receipt.fallback_used {
+            // Fallback was used - this is NOT a native pass
             ConformanceResult::new(
                 BackendId::Accelerate,
                 CanonicalOp::Identity,
                 super::dtype::AccelerateDType::F32,
                 "[4]".to_string(),
                 BackendClassification::Fallback,
-            ).with_notes("Used reference fallback")
-        } else if let Some(evidence) = result.evidence {
-            if evidence.is_success() {
-                ConformanceResult::with_evidence(
+            ).with_notes(&format!("Used reference fallback: lowering={}, executed={}", 
+                result.receipt.lowering_subsystem, result.receipt.executed_subsystem))
+        } else if result.receipt.is_native_execution() {
+            // Native execution succeeded
+            if let Some(evidence) = result.evidence {
+                if evidence.is_success() {
+                    ConformanceResult::with_evidence(
+                        BackendId::Accelerate,
+                        CanonicalOp::Identity,
+                        super::dtype::AccelerateDType::F32,
+                        "[4]".to_string(),
+                        BackendClassification::Pass,
+                        evidence,
+                    )
+                } else {
+                    ConformanceResult::with_evidence(
+                        BackendId::Accelerate,
+                        CanonicalOp::Identity,
+                        super::dtype::AccelerateDType::F32,
+                        "[4]".to_string(),
+                        BackendClassification::ExecutionFailed,
+                        evidence,
+                    ).with_notes("Evidence indicates failure")
+                }
+            } else {
+                ConformanceResult::new(
                     BackendId::Accelerate,
                     CanonicalOp::Identity,
                     super::dtype::AccelerateDType::F32,
                     "[4]".to_string(),
                     BackendClassification::Pass,
-                    evidence,
                 )
-            } else {
-                ConformanceResult::with_evidence(
-                    BackendId::Accelerate,
-                    CanonicalOp::Identity,
-                    super::dtype::AccelerateDType::F32,
-                    "[4]".to_string(),
-                    BackendClassification::ExecutionFailed,
-                    evidence,
-                ).with_notes("Evidence indicates failure")
             }
         } else {
+            // Not native execution, not fallback - this means reference was used without fallback flag
+            // This should not happen with our current implementation, but handle it as fallback
             ConformanceResult::new(
                 BackendId::Accelerate,
                 CanonicalOp::Identity,
                 super::dtype::AccelerateDType::F32,
                 "[4]".to_string(),
-                BackendClassification::Pass,
-            )
+                BackendClassification::Fallback,
+            ).with_notes("Reference execution without fallback flag - should not occur")
         }
     }
 
@@ -372,6 +430,7 @@ impl AccelerateConformanceRunner {
         
         let result = self.kernel_dispatcher.dispatch_add(&a, &b, &shape, AccelerateLayout::RowMajor);
         
+        // Check if this was native execution or fallback
         if result.receipt.fallback_used {
             ConformanceResult::new(
                 BackendId::Accelerate,
@@ -379,26 +438,37 @@ impl AccelerateConformanceRunner {
                 super::dtype::AccelerateDType::F32,
                 "[3]".to_string(),
                 BackendClassification::Fallback,
-            ).with_notes("Used reference fallback")
-        } else if let Some(evidence) = result.evidence {
-            if evidence.is_success() {
-                ConformanceResult::with_evidence(
+            ).with_notes(&format!("Used reference fallback: lowering={}, executed={}", 
+                result.receipt.lowering_subsystem, result.receipt.executed_subsystem))
+        } else if result.receipt.is_native_execution() {
+            if let Some(evidence) = result.evidence {
+                if evidence.is_success() {
+                    ConformanceResult::with_evidence(
+                        BackendId::Accelerate,
+                        CanonicalOp::Add,
+                        super::dtype::AccelerateDType::F32,
+                        "[3]".to_string(),
+                        BackendClassification::Pass,
+                        evidence,
+                    )
+                } else {
+                    ConformanceResult::with_evidence(
+                        BackendId::Accelerate,
+                        CanonicalOp::Add,
+                        super::dtype::AccelerateDType::F32,
+                        "[3]".to_string(),
+                        BackendClassification::ExecutionFailed,
+                        evidence,
+                    ).with_notes("Evidence indicates failure")
+                }
+            } else {
+                ConformanceResult::new(
                     BackendId::Accelerate,
                     CanonicalOp::Add,
                     super::dtype::AccelerateDType::F32,
                     "[3]".to_string(),
                     BackendClassification::Pass,
-                    evidence,
                 )
-            } else {
-                ConformanceResult::with_evidence(
-                    BackendId::Accelerate,
-                    CanonicalOp::Add,
-                    super::dtype::AccelerateDType::F32,
-                    "[3]".to_string(),
-                    BackendClassification::ExecutionFailed,
-                    evidence,
-                ).with_notes("Evidence indicates failure")
             }
         } else {
             ConformanceResult::new(
@@ -406,8 +476,8 @@ impl AccelerateConformanceRunner {
                 CanonicalOp::Add,
                 super::dtype::AccelerateDType::F32,
                 "[3]".to_string(),
-                BackendClassification::Pass,
-            )
+                BackendClassification::Fallback,
+            ).with_notes("Reference execution without fallback flag - should not occur")
         }
     }
 
@@ -428,26 +498,37 @@ impl AccelerateConformanceRunner {
                 super::dtype::AccelerateDType::F32,
                 "[3]".to_string(),
                 BackendClassification::Fallback,
-            ).with_notes("Used reference fallback")
-        } else if let Some(evidence) = result.evidence {
-            if evidence.is_success() {
-                ConformanceResult::with_evidence(
+            ).with_notes(&format!("Used reference fallback: lowering={}, executed={}", 
+                result.receipt.lowering_subsystem, result.receipt.executed_subsystem))
+        } else if result.receipt.is_native_execution() {
+            if let Some(evidence) = result.evidence {
+                if evidence.is_success() {
+                    ConformanceResult::with_evidence(
+                        BackendId::Accelerate,
+                        CanonicalOp::Multiply,
+                        super::dtype::AccelerateDType::F32,
+                        "[3]".to_string(),
+                        BackendClassification::Pass,
+                        evidence,
+                    )
+                } else {
+                    ConformanceResult::with_evidence(
+                        BackendId::Accelerate,
+                        CanonicalOp::Multiply,
+                        super::dtype::AccelerateDType::F32,
+                        "[3]".to_string(),
+                        BackendClassification::ExecutionFailed,
+                        evidence,
+                    ).with_notes("Evidence indicates failure")
+                }
+            } else {
+                ConformanceResult::new(
                     BackendId::Accelerate,
                     CanonicalOp::Multiply,
                     super::dtype::AccelerateDType::F32,
                     "[3]".to_string(),
                     BackendClassification::Pass,
-                    evidence,
                 )
-            } else {
-                ConformanceResult::with_evidence(
-                    BackendId::Accelerate,
-                    CanonicalOp::Multiply,
-                    super::dtype::AccelerateDType::F32,
-                    "[3]".to_string(),
-                    BackendClassification::ExecutionFailed,
-                    evidence,
-                ).with_notes("Evidence indicates failure")
             }
         } else {
             ConformanceResult::new(
@@ -455,8 +536,8 @@ impl AccelerateConformanceRunner {
                 CanonicalOp::Multiply,
                 super::dtype::AccelerateDType::F32,
                 "[3]".to_string(),
-                BackendClassification::Pass,
-            )
+                BackendClassification::Fallback,
+            ).with_notes("Reference execution without fallback flag - should not occur")
         }
     }
 
@@ -474,26 +555,37 @@ impl AccelerateConformanceRunner {
                 super::dtype::AccelerateDType::F32,
                 "[2,3,2]".to_string(),
                 BackendClassification::Fallback,
-            ).with_notes("Used reference fallback")
-        } else if let Some(evidence) = result.evidence {
-            if evidence.is_success() {
-                ConformanceResult::with_evidence(
+            ).with_notes(&format!("Used reference fallback: lowering={}, executed={}", 
+                result.receipt.lowering_subsystem, result.receipt.executed_subsystem))
+        } else if result.receipt.is_native_execution() {
+            if let Some(evidence) = result.evidence {
+                if evidence.is_success() {
+                    ConformanceResult::with_evidence(
+                        BackendId::Accelerate,
+                        CanonicalOp::Matmul,
+                        super::dtype::AccelerateDType::F32,
+                        "[2,3,2]".to_string(),
+                        BackendClassification::Pass,
+                        evidence,
+                    )
+                } else {
+                    ConformanceResult::with_evidence(
+                        BackendId::Accelerate,
+                        CanonicalOp::Matmul,
+                        super::dtype::AccelerateDType::F32,
+                        "[2,3,2]".to_string(),
+                        BackendClassification::ExecutionFailed,
+                        evidence,
+                    ).with_notes("Evidence indicates failure")
+                }
+            } else {
+                ConformanceResult::new(
                     BackendId::Accelerate,
                     CanonicalOp::Matmul,
                     super::dtype::AccelerateDType::F32,
                     "[2,3,2]".to_string(),
                     BackendClassification::Pass,
-                    evidence,
                 )
-            } else {
-                ConformanceResult::with_evidence(
-                    BackendId::Accelerate,
-                    CanonicalOp::Matmul,
-                    super::dtype::AccelerateDType::F32,
-                    "[2,3,2]".to_string(),
-                    BackendClassification::ExecutionFailed,
-                    evidence,
-                ).with_notes("Evidence indicates failure")
             }
         } else {
             ConformanceResult::new(
@@ -501,8 +593,8 @@ impl AccelerateConformanceRunner {
                 CanonicalOp::Matmul,
                 super::dtype::AccelerateDType::F32,
                 "[2,3,2]".to_string(),
-                BackendClassification::Pass,
-            )
+                BackendClassification::Fallback,
+            ).with_notes("Reference execution without fallback flag - should not occur")
         }
     }
 
@@ -520,26 +612,37 @@ impl AccelerateConformanceRunner {
                 super::dtype::AccelerateDType::F32,
                 "[5]".to_string(),
                 BackendClassification::Fallback,
-            ).with_notes("Used reference fallback")
-        } else if let Some(evidence) = result.evidence {
-            if evidence.is_success() {
-                ConformanceResult::with_evidence(
+            ).with_notes(&format!("Used reference fallback: lowering={}, executed={}", 
+                result.receipt.lowering_subsystem, result.receipt.executed_subsystem))
+        } else if result.receipt.is_native_execution() {
+            if let Some(evidence) = result.evidence {
+                if evidence.is_success() {
+                    ConformanceResult::with_evidence(
+                        BackendId::Accelerate,
+                        CanonicalOp::Sigmoid,
+                        super::dtype::AccelerateDType::F32,
+                        "[5]".to_string(),
+                        BackendClassification::Pass,
+                        evidence,
+                    )
+                } else {
+                    ConformanceResult::with_evidence(
+                        BackendId::Accelerate,
+                        CanonicalOp::Sigmoid,
+                        super::dtype::AccelerateDType::F32,
+                        "[5]".to_string(),
+                        BackendClassification::ExecutionFailed,
+                        evidence,
+                    ).with_notes("Evidence indicates failure")
+                }
+            } else {
+                ConformanceResult::new(
                     BackendId::Accelerate,
                     CanonicalOp::Sigmoid,
                     super::dtype::AccelerateDType::F32,
                     "[5]".to_string(),
                     BackendClassification::Pass,
-                    evidence,
                 )
-            } else {
-                ConformanceResult::with_evidence(
-                    BackendId::Accelerate,
-                    CanonicalOp::Sigmoid,
-                    super::dtype::AccelerateDType::F32,
-                    "[5]".to_string(),
-                    BackendClassification::ExecutionFailed,
-                    evidence,
-                ).with_notes("Evidence indicates failure")
             }
         } else {
             ConformanceResult::new(
@@ -547,8 +650,8 @@ impl AccelerateConformanceRunner {
                 CanonicalOp::Sigmoid,
                 super::dtype::AccelerateDType::F32,
                 "[5]".to_string(),
-                BackendClassification::Pass,
-            )
+                BackendClassification::Fallback,
+            ).with_notes("Reference execution without fallback flag - should not occur")
         }
     }
 
@@ -566,26 +669,37 @@ impl AccelerateConformanceRunner {
                 super::dtype::AccelerateDType::F32,
                 "[5]".to_string(),
                 BackendClassification::Fallback,
-            ).with_notes("Used reference fallback")
-        } else if let Some(evidence) = result.evidence {
-            if evidence.is_success() {
-                ConformanceResult::with_evidence(
+            ).with_notes(&format!("Used reference fallback: lowering={}, executed={}", 
+                result.receipt.lowering_subsystem, result.receipt.executed_subsystem))
+        } else if result.receipt.is_native_execution() {
+            if let Some(evidence) = result.evidence {
+                if evidence.is_success() {
+                    ConformanceResult::with_evidence(
+                        BackendId::Accelerate,
+                        CanonicalOp::Silu,
+                        super::dtype::AccelerateDType::F32,
+                        "[5]".to_string(),
+                        BackendClassification::Pass,
+                        evidence,
+                    )
+                } else {
+                    ConformanceResult::with_evidence(
+                        BackendId::Accelerate,
+                        CanonicalOp::Silu,
+                        super::dtype::AccelerateDType::F32,
+                        "[5]".to_string(),
+                        BackendClassification::ExecutionFailed,
+                        evidence,
+                    ).with_notes("Evidence indicates failure")
+                }
+            } else {
+                ConformanceResult::new(
                     BackendId::Accelerate,
                     CanonicalOp::Silu,
                     super::dtype::AccelerateDType::F32,
                     "[5]".to_string(),
                     BackendClassification::Pass,
-                    evidence,
                 )
-            } else {
-                ConformanceResult::with_evidence(
-                    BackendId::Accelerate,
-                    CanonicalOp::Silu,
-                    super::dtype::AccelerateDType::F32,
-                    "[5]".to_string(),
-                    BackendClassification::ExecutionFailed,
-                    evidence,
-                ).with_notes("Evidence indicates failure")
             }
         } else {
             ConformanceResult::new(
@@ -593,8 +707,8 @@ impl AccelerateConformanceRunner {
                 CanonicalOp::Silu,
                 super::dtype::AccelerateDType::F32,
                 "[5]".to_string(),
-                BackendClassification::Pass,
-            )
+                BackendClassification::Fallback,
+            ).with_notes("Reference execution without fallback flag - should not occur")
         }
     }
 
@@ -612,26 +726,37 @@ impl AccelerateConformanceRunner {
                 super::dtype::AccelerateDType::F32,
                 "[4]".to_string(),
                 BackendClassification::Fallback,
-            ).with_notes("Used reference fallback")
-        } else if let Some(evidence) = result.evidence {
-            if evidence.is_success() {
-                ConformanceResult::with_evidence(
+            ).with_notes(&format!("Used reference fallback: lowering={}, executed={}", 
+                result.receipt.lowering_subsystem, result.receipt.executed_subsystem))
+        } else if result.receipt.is_native_execution() {
+            if let Some(evidence) = result.evidence {
+                if evidence.is_success() {
+                    ConformanceResult::with_evidence(
+                        BackendId::Accelerate,
+                        CanonicalOp::Softmax,
+                        super::dtype::AccelerateDType::F32,
+                        "[4]".to_string(),
+                        BackendClassification::Pass,
+                        evidence,
+                    )
+                } else {
+                    ConformanceResult::with_evidence(
+                        BackendId::Accelerate,
+                        CanonicalOp::Softmax,
+                        super::dtype::AccelerateDType::F32,
+                        "[4]".to_string(),
+                        BackendClassification::ExecutionFailed,
+                        evidence,
+                    ).with_notes("Evidence indicates failure")
+                }
+            } else {
+                ConformanceResult::new(
                     BackendId::Accelerate,
                     CanonicalOp::Softmax,
                     super::dtype::AccelerateDType::F32,
                     "[4]".to_string(),
                     BackendClassification::Pass,
-                    evidence,
                 )
-            } else {
-                ConformanceResult::with_evidence(
-                    BackendId::Accelerate,
-                    CanonicalOp::Softmax,
-                    super::dtype::AccelerateDType::F32,
-                    "[4]".to_string(),
-                    BackendClassification::ExecutionFailed,
-                    evidence,
-                ).with_notes("Evidence indicates failure")
             }
         } else {
             ConformanceResult::new(
@@ -639,8 +764,8 @@ impl AccelerateConformanceRunner {
                 CanonicalOp::Softmax,
                 super::dtype::AccelerateDType::F32,
                 "[4]".to_string(),
-                BackendClassification::Pass,
-            )
+                BackendClassification::Fallback,
+            ).with_notes("Reference execution without fallback flag - should not occur")
         }
     }
 

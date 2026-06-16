@@ -1,8 +1,20 @@
 //! Accelerate FFI bindings and platform boundary.
 //!
-//! This module provides the platform boundary for Accelerate.framework linkage.
-//! On macOS, it links Accelerate.framework and provides native function bindings.
-//! On non-macOS platforms, it provides stub implementations that report unavailable.
+//! This module provides the **native-ready scaffold** for Accelerate.framework linkage.
+//! It defines the platform boundary types and stub implementations.
+//!
+//! # Implementation Status
+//!
+//! **Current State**: This module provides the type definitions and platform detection
+//! for Accelerate.framework, but does NOT yet include actual FFI bindings to:
+//! - vDSP functions (vDSP_vadd, vDSP_vmul, etc.)
+//! - BLAS functions (cblas_sgemm, etc.)
+//! - BNNS/BNNSGraph functions
+//! - vForce functions
+//!
+//! The `platform` module contains placeholder functions that return success on macOS
+//! but do not actually call into Accelerate.framework. Native bindings will be added
+//! in a follow-up PR.
 //!
 //! # Design Principles
 //!
@@ -12,6 +24,7 @@
 //! 3. **Explicit Unavailability**: Non-macOS platforms must explicitly report Accelerate as
 //!    unavailable, not silently fail or panic.
 //! 4. **No Global State**: Avoid global mutable backend state.
+//! 5. **Truthful**: The module clearly documents what is and isn't yet implemented.
 
 use std::fmt;
 
