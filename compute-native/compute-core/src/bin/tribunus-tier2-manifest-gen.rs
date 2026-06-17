@@ -88,7 +88,7 @@ fn main() {
                 return;
             }
             other => {
-                eprintln!("Unknown argument: {other}");
+                tribunus_compute_core::log_error!("Unknown argument: {other}");
                 return;
             }
         }
@@ -96,26 +96,26 @@ fn main() {
     }
 
     std::fs::create_dir_all(&output_dir).unwrap_or_else(|e| {
-        eprintln!("Error creating {:?}: {e}", output_dir);
+        tribunus_compute_core::log_error!("Error creating {:?}: {}", output_dir, e);
         std::process::exit(1);
     });
 
     // ── 1. Generate and write manifest ─────────────────────────────────
-    eprintln!("Generating Tier 2 Batch 1 manifest...");
+    tribunus_compute_core::log_info!("Generating Tier 2 Batch 1 manifest...");
     let manifest = tier2_batch1_manifest();
     let manifest_path = output_dir.join("decode_microphase_manifest.json");
     manifest.write_to_file(&manifest_path).unwrap_or_else(|e| {
-        eprintln!("Error writing manifest: {e}");
+        tribunus_compute_core::log_error!("Error writing manifest: {}", e);
         std::process::exit(1);
     });
-    eprintln!(
+    tribunus_compute_core::log_info!(
         "  Wrote {} rows to {:?}",
         manifest.rows.len(),
         manifest_path
     );
 
     // ── 2. Generate and write support matrix ───────────────────────────
-    eprintln!("Generating support matrix...");
+    tribunus_compute_core::log_info!("Generating support matrix...");
     let claimed_matrix_entries: Vec<ClaimedSupportMatrixEntry> = manifest
         .rows
         .iter()
@@ -168,10 +168,10 @@ fn main() {
         &claimed_matrix_entries,
     )
     .unwrap_or_else(|e| {
-        eprintln!("Error writing claimed support matrix: {e}");
+        tribunus_compute_core::log_error!("Error writing claimed support matrix: {}", e);
         std::process::exit(1);
     });
-    eprintln!(
+    tribunus_compute_core::log_info!(
         "  Wrote {} entries to {:?}",
         claimed_matrix_entries.len(),
         claimed_matrix_path
@@ -238,34 +238,34 @@ fn main() {
         &matrix_entries,
     )
     .unwrap_or_else(|e| {
-        eprintln!("Error writing support matrix: {e}");
+        tribunus_compute_core::log_error!("Error writing support matrix: {}", e);
         std::process::exit(1);
     });
-    eprintln!(
+    tribunus_compute_core::log_info!(
         "  Wrote {} entries to {:?}",
         matrix_entries.len(),
         matrix_path
     );
 
     // ── 3. Write shape map ────────────────────────────────────────────
-    eprintln!("Generating shape map...");
+    tribunus_compute_core::log_info!("Generating shape map...");
     let shape_map_path = output_dir.join("decode_microphase_shape_map.json");
     serde_json::to_writer_pretty(
         std::fs::File::create(&shape_map_path).unwrap(),
         &ALL_DECODE_SHAPES,
     )
     .unwrap_or_else(|e| {
-        eprintln!("Error writing shape map: {e}");
+        tribunus_compute_core::log_error!("Error writing shape map: {}", e);
         std::process::exit(1);
     });
-    eprintln!(
+    tribunus_compute_core::log_info!(
         "  Wrote {} profiles to {:?}",
         ALL_DECODE_SHAPES.len(),
         shape_map_path
     );
 
     // ── 4. Write receipt index ────────────────────────────────────────
-    eprintln!("Generating receipt index...");
+    tribunus_compute_core::log_info!("Generating receipt index...");
     let index_entries: Vec<ReceiptIndexEntry> = manifest
         .rows
         .iter()
@@ -319,17 +319,17 @@ fn main() {
     let index_path = output_dir.join("decode_microphase_receipt_index.json");
     serde_json::to_writer_pretty(std::fs::File::create(&index_path).unwrap(), &index_entries)
         .unwrap_or_else(|e| {
-            eprintln!("Error writing receipt index: {e}");
+            tribunus_compute_core::log_error!("Error writing receipt index: {}", e);
             std::process::exit(1);
         });
-    eprintln!(
+    tribunus_compute_core::log_info!(
         "  Wrote {} entries to {:?}",
         index_entries.len(),
         index_path
     );
 
     // ── 5. Generate and write KV contracts ─────────────────────────────
-    eprintln!("Generating KV contracts...");
+    tribunus_compute_core::log_info!("Generating KV contracts...");
     let kv_backends = ["coreml", "mlx", "accelerate"];
     let all_kv_contracts: Vec<_> = ALL_DECODE_SHAPES
         .iter()
@@ -343,19 +343,18 @@ fn main() {
     let kv_path = output_dir.join("kv_contracts.json");
     serde_json::to_writer_pretty(std::fs::File::create(&kv_path).unwrap(), &all_kv_contracts)
         .unwrap_or_else(|e| {
-            eprintln!("Error writing KV contracts: {e}");
+            tribunus_compute_core::log_error!("Error writing KV contracts: {}", e);
             std::process::exit(1);
         });
-    eprintln!(
+    tribunus_compute_core::log_info!(
         "  Wrote {} entries to {:?}",
         all_kv_contracts.len(),
         kv_path
     );
 
     let elapsed = start.elapsed();
-    eprintln!();
-    eprintln!("=== Tier 2 Batch 1 manifest summary ===");
-    eprintln!("  Rows: {}", manifest.rows.len());
+    tribunus_compute_core::log_info!("=== Tier 2 Batch 1 manifest summary ===");
+    tribunus_compute_core::log_info!("  Rows: {}", manifest.rows.len());
     let native_count = matrix_entries
         .iter()
         .filter(|e| e.support_status == "supported_native")
@@ -376,11 +375,10 @@ fn main() {
         .iter()
         .filter(|e| e.blocked_by_tier1_defect.is_some())
         .count();
-    eprintln!("  Native:     {native_count}");
-    eprintln!("  Composed:   {composed_count}");
-    eprintln!("  Pending:    {pending_count}");
-    eprintln!("  Unsupported: {unsupported_count}");
-    eprintln!("  Blocked by Tier 1: {blocked_count}");
-    eprintln!();
-    eprintln!("Generated in {:.1}s", elapsed.as_secs_f64());
+    tribunus_compute_core::log_info!("  Native:     {}", native_count);
+    tribunus_compute_core::log_info!("  Composed:   {}", composed_count);
+    tribunus_compute_core::log_info!("  Pending:    {}", pending_count);
+    tribunus_compute_core::log_info!("  Unsupported: {}", unsupported_count);
+    tribunus_compute_core::log_info!("  Blocked by Tier 1: {}", blocked_count);
+    tribunus_compute_core::log_info!("Generated in {:.1}s", elapsed.as_secs_f64());
 }

@@ -158,7 +158,7 @@ fn main() {
                 include_generated = parse_flag_value(&args, "--include-generated", true);
             }
             other => {
-                eprintln!("Unknown argument: {other}");
+                tribunus_compute_core::log_error!("Unknown argument: {other}");
                 std::process::exit(1);
             }
         }
@@ -171,19 +171,19 @@ fn main() {
         if let Some(path) = cargo_build_log.as_ref() {
             match load_cargo_build_log(path) {
                 Ok(items) => gaps.extend(items),
-                Err(err) => eprintln!("cargo build log error: {err}"),
+                Err(err) => tribunus_compute_core::log_error!("cargo build log error: {err}"),
             }
         }
         if let Some(path) = cargo_test_log.as_ref() {
             match load_cargo_test_log(path) {
                 Ok(items) => gaps.extend(items),
-                Err(err) => eprintln!("cargo test log error: {err}"),
+                Err(err) => tribunus_compute_core::log_error!("cargo test log error: {err}"),
             }
         }
         if let Some(path) = cargo_clippy_log.as_ref() {
             match load_cargo_clippy_log(path) {
                 Ok(items) => gaps.extend(items),
-                Err(err) => eprintln!("cargo clippy log error: {err}"),
+                Err(err) => tribunus_compute_core::log_error!("cargo clippy log error: {err}"),
             }
         }
     }
@@ -191,26 +191,26 @@ fn main() {
     if include_generated {
         match load_tier1_defects(&tier1_run_dir) {
             Ok(items) => gaps.extend(items),
-            Err(err) => eprintln!("tier1 defects error: {err}"),
+            Err(err) => tribunus_compute_core::log_error!("tier1 defects error: {err}"),
         }
         match load_tier2_manifest(&tier2_output_dir) {
             Ok(items) => gaps.extend(items),
-            Err(err) => eprintln!("tier2 manifest error: {err}"),
+            Err(err) => tribunus_compute_core::log_error!("tier2 manifest error: {err}"),
         }
         match load_support_matrix(&tier2_output_dir) {
             Ok(items) => gaps.extend(items),
-            Err(err) => eprintln!("support matrix error: {err}"),
+            Err(err) => tribunus_compute_core::log_error!("support matrix error: {err}"),
         }
         match load_kv_contracts(&tier2_output_dir) {
             Ok(items) => gaps.extend(items),
-            Err(err) => eprintln!("kv contracts error: {err}"),
+            Err(err) => tribunus_compute_core::log_error!("kv contracts error: {err}"),
         }
     }
 
     if let Some(path) = python_ref_dir.as_ref() {
         match load_python_reference(std::slice::from_ref(path)) {
             Ok(items) => gaps.extend(items),
-            Err(err) => eprintln!("python reference error: {err}"),
+            Err(err) => tribunus_compute_core::log_error!("python reference error: {err}"),
         }
     }
 
@@ -228,14 +228,14 @@ fn main() {
     let backend_matrix = build_backend_gap_matrix();
 
     if let Err(err) = write_gap_report_artifacts(&output_dir, &gaps, &receipt, &backend_matrix) {
-        eprintln!("gap report error: {err}");
+        tribunus_compute_core::log_error!("gap report error: {err}");
         std::process::exit(1);
     }
 
     let critical = gaps
         .iter()
         .any(|gap| gap.severity.as_numeric() >= 3 || gap.status == GapStatus::BlockedUpstream);
-    eprintln!(
+    tribunus_compute_core::log_info!(
         "Total gaps: {} (S0: {}, S1: {}, S2: {}, S3: {}, S4: {}) | Tier1 observed/pass/nonpass/gaps: {}/{}/{}/{} | Tier2 observed/gaps: {}/{} | KV observed/gaps: {}/{} | False qualification risks: {} | Artifacts: {}",
         gaps.len(),
         gaps.iter().filter(|gap| gap.severity == tribunus_compute_core::decode_attribution::gap_report::GapSeverity::S0).count(),

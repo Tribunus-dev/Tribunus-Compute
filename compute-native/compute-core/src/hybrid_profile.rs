@@ -679,7 +679,7 @@ mod tests {
                     kv_cache_start: 0,
                     kv_cache_length: 10,
                     backend_id: 0, // MLX
-                    kv_cache_arena: None,
+                    kv_cache_pages: vec![],
                 },
                 Slot {
                     id: 1,
@@ -688,7 +688,7 @@ mod tests {
                     kv_cache_start: 0,
                     kv_cache_length: 10,
                     backend_id: 1, // Accelerate
-                    kv_cache_arena: None,
+                    kv_cache_pages: vec![],
                 },
                 Slot {
                     id: 2,
@@ -697,7 +697,7 @@ mod tests {
                     kv_cache_start: 0,
                     kv_cache_length: 10,
                     backend_id: 0, // MLX
-                    kv_cache_arena: None,
+                    kv_cache_pages: vec![],
                 },
             ],
             batch_size: 3,

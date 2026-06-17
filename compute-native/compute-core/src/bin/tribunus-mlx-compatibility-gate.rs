@@ -78,10 +78,11 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     let authority_mode = args.iter().any(|a| a == "--authority-mode" || a == "-a")
         || env::var("TRIBUNUS_MLX_SHORT_DECODE_AUTHORITY").is_ok();
-
-    println!("============================================================");
-    println!("TRIBUNUS MLX COMPATIBILITY & SHORT DECODE GATE-0001");
-    println!(
+    tribunus_compute_core::log_info!(
+        "============================================================"
+    );
+    tribunus_compute_core::log_info!("TRIBUNUS MLX COMPATIBILITY & SHORT DECODE GATE-0001");
+    tribunus_compute_core::log_info!(
         "Mode: {}",
         if authority_mode {
             "AUTHORITY (Full Sweep)"
@@ -89,28 +90,30 @@ fn main() {
             "SMOKE (Fast Verification)"
         }
     );
-    println!("============================================================");
+    tribunus_compute_core::log_info!(
+        "============================================================"
+    );
 
     // 1. Compile-time check / API validation
-    println!("[1/4] Verifying MLX FFI bindings signatures...");
+    tribunus_compute_core::log_info!("[1/4] Verifying MLX FFI bindings signatures...");
     let _compat_mask = MlxApiCompat::get_sdpa_mask_params(&CompatAttentionMask::Causal);
     let _opt_int = MlxApiCompat::optional_int(256);
     let _opt_dtype = MlxApiCompat::optional_dtype_none();
-    println!("      -> API Check: passed");
+    tribunus_compute_core::log_info!("      -> API Check: passed");
 
     // 2. Probe telemetry
-    println!("[2/4] Gathering system and MLX runtime telemetry...");
+    tribunus_compute_core::log_info!("[2/4] Gathering system and MLX runtime telemetry...");
     let report = MlxRuntimeProbeReport::probe();
-    println!("      -> macOS: {}", report.os_version);
-    println!(
+    tribunus_compute_core::log_info!("      -> macOS: {}", report.os_version);
+    tribunus_compute_core::log_info!(
         "      -> Metal forced fallback: {}",
         report.metal_fallback_forced
     );
-    println!("      -> NAX checks bypassed: {}", report.nax_disabled);
-    println!("      -> Python in path: {}", report.python_present);
+    tribunus_compute_core::log_info!("      -> NAX checks bypassed: {}", report.nax_disabled);
+    tribunus_compute_core::log_info!("      -> Python in path: {}", report.python_present);
 
     // 3. Benchmarking
-    println!("[3/4] Running microbenchmarks...");
+    tribunus_compute_core::log_info!("[3/4] Running microbenchmarks...");
     let _device = Device::gpu();
     let stream = Stream::new();
 
@@ -276,16 +279,18 @@ fn main() {
     }
 
     // Print summary stats
-    println!("\nBenchmark results (sdpa_causal_mask_only):");
+    tribunus_compute_core::log_info!("\nBenchmark results (sdpa_causal_mask_only):");
     for s in &sdpa_results {
-        println!(
+        tribunus_compute_core::log_info!(
             "  Sequence Length {}: median={:.2}us, p90={:.2}us",
-            s.seq_len, s.median_us, s.p90_us
+            s.seq_len,
+            s.median_us,
+            s.p90_us
         );
     }
 
     // 4. Decision classification logic
-    println!("\n[4/4] Generating compatibility decision...");
+    tribunus_compute_core::log_info!("\n[4/4] Generating compatibility decision...");
 
     // Check 127/128 ratio
     let median_127 = sdpa_results
@@ -299,11 +304,13 @@ fn main() {
         .map(|s| s.median_us)
         .unwrap_or(1.0);
     let ratio = median_127 / median_128;
-    println!("      -> SDPA Latency Ratio (127 / 128): {:.4}", ratio);
+    tribunus_compute_core::log_info!("      -> SDPA Latency Ratio (127 / 128): {:.4}", ratio);
 
     let mut cliff_detected = false;
     if ratio > 1.5 {
-        println!("      [WARNING] Short-sequence decode performance cliff detected!");
+        tribunus_compute_core::log_warn!(
+            "      [WARNING] Short-sequence decode performance cliff detected!"
+        );
         cliff_detected = true;
     }
 
@@ -317,7 +324,7 @@ fn main() {
         "authority_eligible".to_string()
     };
 
-    println!("      -> Decision: {}", decision_str);
+    tribunus_compute_core::log_info!("      -> Decision: {}", decision_str);
 
     let decision = CompatibilityDecision {
         mlx_compatibility_decision: decision_str,
@@ -373,6 +380,8 @@ fn main() {
     );
     fs::write(compat_path.join("short_decode_gate.md"), md_summary).unwrap();
 
-    println!("\nEvidence files written successfully to evidence/mlx/compatibility/");
-    println!("Gate evaluation finished.");
+    tribunus_compute_core::log_info!(
+        "\nEvidence files written successfully to evidence/mlx/compatibility/"
+    );
+    tribunus_compute_core::log_info!("Gate evaluation finished.");
 }

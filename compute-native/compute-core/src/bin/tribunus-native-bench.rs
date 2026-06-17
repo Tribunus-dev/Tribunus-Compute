@@ -10,7 +10,12 @@
 use tribunus_compute_core::native_kernel;
 
 fn main() {
-    let k: usize = std::env::var("TRIBUNUS_NATIVE_K")
+    // macOS workaround: unset MallocStackLogging inherited from Xcode/LLDB
+    // to suppress "can't turn off malloc stack logging because it was not enabled"
+    // on stderr during process exit, which corrupts terminal output.
+    std::env::remove_var("MallocStackLogging");
+    std::env::remove_var("MallocStackLoggingNoCompact");
+    let k: usize = std::env::var("TRIBUNUS_NATIVE_K");
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3840);
@@ -31,7 +36,7 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(10);
 
-    eprintln!(
+    tribunus_compute_core::log_info!(
         "native-bench: M=1 K={} N={} group_size={} warmup={} iters={}",
         k, n, group_size, warmup_iters, bench_iters
     );
@@ -61,7 +66,7 @@ fn main() {
         let r = native_kernel::qmatvec_scalar(&x, &weight, &scales, &biases, k, n, group_size);
         let diff = native_kernel::max_abs_diff(&r.output, ref_out);
         if diff > 1e-5 {
-            eprintln!("WARN: scalar iter {} diverged: max_abs_diff={}", i, diff);
+            tribunus_compute_core::log_warn!("WARN: scalar iter {} diverged: max_abs_diff={}", i, diff);
         }
         scalar_us.push(r.elapsed_us);
     }
@@ -70,7 +75,7 @@ fn main() {
         let r = native_kernel::qmatvec_auto(&x, &weight, &scales, &biases, k, n, group_size);
         let diff = native_kernel::max_abs_diff(&r.output, ref_out);
         if diff > 1e-5 {
-            eprintln!("WARN: auto iter {} diverged: max_abs_diff={}", i, diff);
+            tribunus_compute_core::log_warn!("WARN: auto iter {} diverged: max_abs_diff={}", i, diff);
         }
         auto_us.push(r.elapsed_us);
     }
@@ -79,7 +84,7 @@ fn main() {
         let r = native_kernel::qmatvec_neon(&x, &weight, &scales, &biases, k, n, group_size);
         let diff = native_kernel::max_abs_diff(&r.output, ref_out);
         if diff > 1e-5 {
-            eprintln!("WARN: neon iter {} diverged: max_abs_diff={}", i, diff);
+            tribunus_compute_core::log_warn!("WARN: neon iter {} diverged: max_abs_diff={}", i, diff);
         }
         neon_us.push(r.elapsed_us);
     }
@@ -88,7 +93,7 @@ fn main() {
         let r = native_kernel::qmatvec_neon_v2(&x, &weight, &scales, &biases, k, n, group_size);
         let diff = native_kernel::max_abs_diff(&r.output, ref_out);
         if diff > 1e-5 {
-            eprintln!("WARN: neon_v2 iter {} diverged: max_abs_diff={}", i, diff);
+            tribunus_compute_core::log_warn!("WARN: neon_v2 iter {} diverged: max_abs_diff={}", i, diff);
         }
         neon2_us.push(r.elapsed_us);
     }
@@ -130,7 +135,7 @@ fn main() {
     // Speedup ratios vs scalar.
     let scalar_baseline = s_med as f64;
     if scalar_baseline > 0.0 {
-        eprintln!(
+        tribunus_compute_core::log_info!(
             "speedup vs scalar: auto={:.2}x neon={:.2}x neon_v2={:.2}x",
             scalar_baseline / a_med as f64,
             scalar_baseline / n_med as f64,
@@ -138,7 +143,7 @@ fn main() {
         );
     }
 
-    eprintln!(
+    tribunus_compute_core::log_info!(
         "done: {} iters per variant, output len={}",
         bench_iters,
         ref_out.len()

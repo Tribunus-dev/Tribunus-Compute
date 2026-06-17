@@ -5,10 +5,10 @@ use std::path::Path;
 
 use mlx_rs::{
     builder::Builder,
-    module::{Module, ModuleParameters, Param},
+    module::{Module},
     nn,
+    ops,
     ops::indexing::IndexOp,
-    ops::zeros,
     quantization::MaybeQuantized,
     transforms::eval,
     Array,
@@ -17,6 +17,7 @@ use mlx_rs::{
 use crate::config::{CodePredictorConfig, QuantizationConfig, TalkerConfig};
 use crate::error::{Error, Result};
 use crate::sampling::sample_logits;
+use crate::pretrained::*;
 use mlx_rs_core::cache::{KVCache, KeyValueCache};
 use mlx_rs_core::utils::{scaled_dot_product_attention, SdpaMask};
 
@@ -341,11 +342,11 @@ impl CodePredictor {
         code0_embed: &Array, // [1, 1, codec_dim]
     ) -> Result<Vec<u32>> {
         // Concatenate hidden + code0_embed along feature dim
-        let input = Array::concatenate(&[hidden, code0_embed], -1)?;
+        let input = ops::concatenate_axis(&[hidden, code0_embed], -1)?;
         let logits = self.forward(&input, &[None; 6], &mut self.reset_caches())?;
 
         let mut codes = Vec::with_capacity(15);
-        for (g, mut logit) in logits.into_iter().enumerate() {
+        for (_g, mut logit) in logits.into_iter().enumerate() {
             logit = logit.reshape(&[-1])?;
             eval(std::iter::once(&logit))?;
             let token = sample_logits(
@@ -364,7 +365,7 @@ impl CodePredictor {
 
     fn reset_caches(&self) -> Vec<KVCache> {
         (0..self.layers.len())
-            .map(|_| KVCache::new(1, 1, 0))
+            .map(|_| KVCache::new())
             .collect()
     }
 }
@@ -403,9 +404,9 @@ impl Talker {
         let seq_len = input_embeds.dim(1);
 
         if seq_len > 1 {
-            /reset KV caches
+            // reset KV caches
             for cache in &mut self.caches {
-                cache.reset(0);
+                cache.reset();
             }
         }
 
@@ -457,12 +458,12 @@ impl Talker {
 
     /// Build generation-step embedding: text_proj(text_embed) + codec_embed(prev_codes).
     pub fn build_generation_embedding_with_text(
-        &self,
+        &mut self,
         prev_codes: &[u32; 16],
         text_embed: &Array,
     ) -> Result<Array> {
         // Sum all codec embeddings
-        let mut sum_codec_embed = None;
+        let mut sum_codec_embed: Option<Array> = None;
         for &code in prev_codes.iter() {
             let code_arr = Array::from_slice(&[code as i32], &[1, 1]);
             let emb = self.codec_embedding.forward(&code_arr)?;
@@ -502,7 +503,7 @@ pub fn load_all_weights(model_dir: &Path) -> Result<HashMap<String, Array>> {
         let index_content = std::fs::read_to_string(&index_path)?;
         let index_data: serde_json::Value = serde_json::from_str(&index_content)?;
         if let Some(weight_map) = index_data["weight_map"].as_object() {
-            let mut shard_files: std::collections::BTreeSet<String> = weight_map
+            let shard_files: std::collections::BTreeSet<String> = weight_map
                 .values()
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect();
@@ -670,13 +671,10 @@ fn load_weights_to_talker(
             n_kv_heads,
             head_dim,
             scale: (head_dim as f32).sqrt().recip(),
-            rope: nn::Rope::from_pretrained(
-                n_kv_heads,
-                head_dim,
-                rope_theta,
-                rope_traditional,
-                weights.get(&format!("{prefix}.self_attn.rope.freqs")),
-            )?,
+            rope: {
+                let r = nn::RopeBuilder::new(head_dim).base(rope_theta).traditional(rope_traditional).build();
+                r.expect("RopeBuilder infallible")
+            },
             rope_speed_factor: 1.0,
             qkv_proj,
             q_dim,
@@ -715,7 +713,7 @@ fn load_weights_to_talker(
             )?,
         });
 
-        caches.push(KVCache::new(n_kv_heads, head_dim, 0));
+        caches.push(KVCache::new());
     }
 
     // Norm
@@ -867,13 +865,10 @@ fn load_code_predictor(
                 weights.get(&format!("{prefix}.self_attn.k_norm.weight")),
                 rms_norm_eps,
             )?,
-            rope: nn::Rope::from_pretrained(
-                n_kv_heads,
-                head_dim,
-                rope_theta,
-                true,
-                weights.get(&format!("{prefix}.self_attn.rope.freqs")),
-            )?,
+            rope: {
+                let r = nn::RopeBuilder::new(head_dim).base(rope_theta).traditional(true).build();
+                r.expect("RopeBuilder infallible")
+            },
         };
 
         layers.push(CodePredictorBlock {
@@ -933,13 +928,13 @@ pub fn load_talker(
     model_dir: &Path,
     config: &TalkerConfig,
     quant: Option<&QuantizationConfig>,
-    tts_pad_token_id: u32,
+    _tts_pad_token_id: u32,
 ) -> Result<Talker> {
     let weights = load_all_weights(model_dir)?;
     let mut talker = load_weights_to_talker(&weights, config, quant)?;
     // Ensure caches are properly sized
     talker.caches = (0..config.num_hidden_layers)
-        .map(|_| KVCache::new(config.num_key_value_heads, config.head_dim, 0))
+        .map(|_| KVCache::new())
         .collect();
     Ok(talker)
 }

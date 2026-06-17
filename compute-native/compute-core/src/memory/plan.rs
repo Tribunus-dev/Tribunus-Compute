@@ -138,17 +138,23 @@ pub fn clear_memory_plan() -> Result<(), String> {
 /// list of [`MemoryPlanSlot`] entries that the executor passes to the
 /// Metal allocator before running the module.
 ///
+/// When `compression_ratio` is `Some(r)`, the estimated KV cache byte sizes
+/// are scaled down by `r` (e.g. 4.57 for TurboQuant3: 16 bits / 3.5 bits).
+/// Pass `None` for uncompressed FP16 mode (no scaling).
+///
 /// Returns `None` if the scheduled module has no material allocations
 /// that need planning (empty or all in-place).
 pub fn plan_from_scheduled_module(
     scheduled: &crate::compiler::scheduled::ScheduledModule,
     arena: &crate::arena::Arena,
+    compression_ratio: Option<f64>,
 ) -> Option<MemoryPlan> {
     let mut plan = MemoryPlan::new();
+    let ratio = compression_ratio.unwrap_or(1.0);
 
     for region in &scheduled.regions {
-        // Each region's temporary memory gets a pre-assigned IOSurface slice.
-        if region.temp_memory_bytes == 0 {
+        let scaled = (region.temp_memory_bytes as f64 / ratio) as u64;
+        if scaled == 0 {
             continue;
         }
 
@@ -157,7 +163,7 @@ pub fn plan_from_scheduled_module(
         let slice_base = unsafe { arena.base_ptr() as *mut c_void };
         let offset = plan.slots.len() as u64 * 4096; // page-aligned offset
         let ptr = unsafe { (slice_base as *mut u8).add(offset as usize) as *mut c_void };
-        let size = region.temp_memory_bytes as usize;
+        let size = scaled as usize;
 
         plan.add_slot(ptr, size);
     }

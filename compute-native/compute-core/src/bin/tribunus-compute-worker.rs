@@ -38,6 +38,7 @@ use tribunus_compute_core::worker_protocol::{
     MessageKind, PolicySnapshotPayload, ProtocolValidator, StartGenerationPayload, TokenPayload,
     WorkerEvent, WorkerFatalPayload, MAX_FRAME_SIZE_BYTES, V1_0,
 };
+use tribunus_compute_core::{log_error, log_info, log_warn};
 
 // ── Defaults ───────────────────────────────────────────────────────────────
 
@@ -187,7 +188,7 @@ impl WorkerEventWriter {
     fn write_event(&self, event: WorkerEvent, request_id: Option<&str>, payload: Value) {
         let mut guard = self.inner.lock();
         let seq = {
-            let (_, ref mut counter) = &mut *guard;
+            let (_, counter) = &mut *guard;
             let s = *counter;
             *counter += 1;
             s
@@ -208,6 +209,11 @@ impl WorkerEventWriter {
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn main() {
+    // macOS workaround: unset MallocStackLogging inherited from Xcode/LLDB
+    // to suppress "can't turn off malloc stack logging because it was not enabled"
+    // on stderr during process exit, which corrupts terminal output.
+    std::env::remove_var("MallocStackLogging");
+    std::env::remove_var("MallocStackLoggingNoCompact");
     // ── CLI argument parsing ──────────────────────────────────────────────
     let args: Vec<String> = std::env::args().collect();
     let mut worker_id: Option<String> = None;
@@ -252,9 +258,10 @@ fn main() {
 
     let image_dir_str = image_dir.display().to_string();
     let worker_start = Instant::now();
-    eprintln!(
+    log_info!(
         "[worker {}] starting, image_dir={}",
-        worker_id, image_dir_str
+        worker_id,
+        image_dir_str
     );
 
     // ── Shared infrastructure ─────────────────────────────────────────────
@@ -304,7 +311,7 @@ fn main() {
     // command_thread exits it drops the sender, which signals the receiver.
     let _ = inf_handle.join();
     let _ = hb_handle.join();
-    eprintln!("[worker {}] exiting", worker_id);
+    log_info!("[worker {}] exiting", worker_id);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -326,7 +333,7 @@ fn command_thread(
         let frame = match read_frame(&mut stdin) {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("[worker {}] frame read error: {}", worker_id, e);
+                log_error!("[worker {}] frame read error: {}", worker_id, e);
                 shutdown.store(true, Ordering::Relaxed);
                 break;
             }
@@ -334,9 +341,10 @@ fn command_thread(
 
         // Version check
         if frame.version != V1_0 {
-            eprintln!(
+            log_error!(
                 "[worker {}] unsupported protocol version: {:?}",
-                worker_id, frame.version
+                worker_id,
+                frame.version
             );
             continue;
         }
@@ -345,9 +353,10 @@ fn command_thread(
         let cmd = match &frame.message_kind {
             MessageKind::HostCommand(c) => c,
             _ => {
-                eprintln!(
+                log_error!(
                     "[worker {}] unexpected message kind: {:?}",
-                    worker_id, frame.message_kind
+                    worker_id,
+                    frame.message_kind
                 );
                 continue;
             }
@@ -355,7 +364,7 @@ fn command_thread(
 
         // Validate every frame through the protocol validator.
         if let Err(e) = validator.validate_host_command(&frame) {
-            eprintln!("[worker {}] protocol validation error: {:?}", worker_id, e);
+            log_error!("[worker {}] protocol validation error: {:?}", worker_id, e);
             writer.write_event(
                 WorkerEvent::WorkerFatal,
                 None,
@@ -373,7 +382,7 @@ fn command_thread(
 
         match cmd {
             HostCommand::Hello => {
-                eprintln!("[worker {}] received Hello", worker_id);
+                log_info!("[worker {}] received Hello", worker_id);
                 writer.write_event(
                     WorkerEvent::HelloAck,
                     None,
@@ -382,9 +391,10 @@ fn command_thread(
             }
 
             HostCommand::LoadModel => {
-                eprintln!(
+                log_info!(
                     "[worker {}] LoadModel received, image_dir={}",
-                    worker_id, image_dir_str
+                    worker_id,
+                    image_dir_str
                 );
 
                 // Policy snapshot is required; fail if missing or malformed.
@@ -392,9 +402,10 @@ fn command_thread(
                     match serde_json::from_value::<PolicySnapshotPayload>(frame.payload.clone()) {
                         Ok(s) => s,
                         Err(e) => {
-                            eprintln!(
+                            log_error!(
                                 "[worker {}] missing or invalid policy snapshot: {}",
-                                worker_id, e
+                                worker_id,
+                                e
                             );
                             writer.write_event(
                                 WorkerEvent::WorkerFatal,
@@ -426,15 +437,16 @@ fn command_thread(
                     match serde_json::from_value(frame.payload.clone()) {
                         Ok(p) => p,
                         Err(e) => {
-                            eprintln!(
+                            log_error!(
                                 "[worker {}] malformed StartGeneration payload: {}",
-                                worker_id, e
+                                worker_id,
+                                e
                             );
                             continue;
                         }
                     };
 
-                eprintln!(
+                log_info!(
                     "[worker {}] StartGeneration request={}, tokens={}, max={}",
                     worker_id,
                     gen_req.request_id,
@@ -454,11 +466,11 @@ fn command_thread(
                 state.cancel.store(true, Ordering::Relaxed);
                 // Also poke the inference thread via channel so it checks.
                 let _ = cmd_tx.send(InferenceCommand::CancelGeneration);
-                eprintln!("[worker {}] cancellation flagged", worker_id);
+                log_info!("[worker {}] cancellation flagged", worker_id);
             }
 
             HostCommand::UnloadModel => {
-                eprintln!("[worker {}] unloading model", worker_id);
+                log_info!("[worker {}] unloading model", worker_id);
                 writer.write_event(
                     WorkerEvent::ModelUnloaded,
                     None,
@@ -492,18 +504,19 @@ fn command_thread(
             }
 
             HostCommand::Shutdown => {
-                eprintln!("[worker {}] shutdown requested", worker_id);
+                log_info!("[worker {}] shutdown requested", worker_id);
                 let _ = cmd_tx.send(InferenceCommand::Shutdown);
                 shutdown.store(true, Ordering::Relaxed);
                 break;
             }
 
             HostCommand::MemoryPressure => {
-                eprintln!("[worker {}] memory pressure signal received", worker_id);
+                log_info!("[worker {}] memory pressure signal received", worker_id);
                 let freed = tribunus_compute_core::compute_image::clear_mlx_cache();
-                eprintln!(
+                log_info!(
                     "[worker {}] cleared {} bytes from MLX cache",
-                    worker_id, freed
+                    worker_id,
+                    freed
                 );
             }
         }
@@ -544,9 +557,9 @@ fn inference_thread(
             }
 
             InferenceCommand::CancelGeneration => {
-                if let Some(ref s) = session {
+                if let Some(s) = &session {
                     s.cancellation_flag.store(true, Ordering::Relaxed);
-                    eprintln!("[worker {}] cancellation set on session", worker_id);
+                    log_info!("[worker {}] cancellation set on session", worker_id);
                 }
             }
 
@@ -556,9 +569,11 @@ fn inference_thread(
             } => {
                 // Configure MLX limits BEFORE loading the model.
                 configure_mlx_memory_limits(active_limit, cache_limit);
-                eprintln!(
+                log_info!(
                     "[worker {}] configured MLX limits: active={}, cache={}",
-                    worker_id, active_limit, cache_limit
+                    worker_id,
+                    active_limit,
+                    cache_limit
                 );
 
                 state.set_current_layer(NO_LAYER);
@@ -568,7 +583,7 @@ fn inference_thread(
 
                 match LoadedProfiledModel::new(image_dir) {
                     Ok(m) => {
-                        eprintln!("[worker {}] model loaded successfully", worker_id);
+                        log_info!("[worker {}] model loaded successfully", worker_id);
                         writer.write_event(
                             WorkerEvent::ModelLoaded,
                             None,
@@ -577,7 +592,7 @@ fn inference_thread(
                         model = Some(m);
                     }
                     Err(e) => {
-                        eprintln!("[worker {}] model load failed: {}", worker_id, e);
+                        log_error!("[worker {}] model load failed: {}", worker_id, e);
                         let err_msg = format!("{}", e);
                         writer.write_event(
                             WorkerEvent::WorkerFatal,
@@ -604,7 +619,7 @@ fn inference_thread(
             } => {
                 // Model must be loaded.
                 if model.is_none() {
-                    eprintln!(
+                    log_error!(
                         "[worker {}] StartGeneration with no model loaded",
                         worker_id
                     );
@@ -613,9 +628,10 @@ fn inference_thread(
 
                 // Model-busy: reject if a session is already active.
                 if session.is_some() {
-                    eprintln!(
+                    log_error!(
                         "[worker {}] model-busy, rejecting request {}",
-                        worker_id, request_id
+                        worker_id,
+                        request_id
                     );
                     let payload = GenerationFailedPayload {
                         request_id: request_id.clone(),
@@ -634,9 +650,10 @@ fn inference_thread(
 
                 // Check cancellation before starting.
                 if state.cancel.load(Ordering::Relaxed) {
-                    eprintln!(
+                    log_info!(
                         "[worker {}] cancelled before start, request {}",
-                        worker_id, request_id
+                        worker_id,
+                        request_id
                     );
                     writer.write_event(
                         WorkerEvent::GenerationCancelled,
@@ -796,7 +813,7 @@ fn inference_thread(
                             state.set_step(pos as i64);
 
                             if current_token == DEFAULT_EOS_TOKEN {
-                                eprintln!("[worker {}] EOS at position {}", worker_id, pos);
+                                log_info!("[worker {}] EOS at position {}", worker_id, pos);
                                 break;
                             }
                         }
@@ -841,7 +858,7 @@ fn inference_thread(
         }
     }
 
-    eprintln!("[worker {}] inference thread exiting", worker_id);
+    log_info!("[worker {}] inference thread exiting", worker_id);
 }
 
 /// Check the cancellation flag and emit GenerationCancelled if set.
@@ -932,7 +949,7 @@ fn write_frame(writer: &mut impl std::io::Write, frame: &Frame) {
     let json = match serde_json::to_vec(frame) {
         Ok(j) => j,
         Err(e) => {
-            eprintln!("[worker] serialize error: {}", e);
+            log_error!("[worker] serialize error: {}", e);
             return;
         }
     };

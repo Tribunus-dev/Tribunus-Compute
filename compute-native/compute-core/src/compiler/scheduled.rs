@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 
+use crate::config::FusedOperation;
 use crate::backend::routing::{
     BackendId, EvidenceDigest, OperationFamily, OperationId, PhysicalLayout, TensorId, TensorShape,
 };
@@ -81,6 +82,10 @@ pub struct ScheduledRegion {
     pub dependencies: Vec<RegionDependency>,
     /// Fusion candidates within this region.
     pub fusions: Vec<FusionBoundary>,
+    /// Compile-time fused operation regions within this scheduled region.
+    /// Populated during the fusion pass; each entry bundles multiple atomic
+    /// operations into one precompiled kernel launch.
+    pub fusion_regions: Vec<FusionRegion>,
     /// State effects of this region.
     pub state_effects: Vec<StateEffect>,
     /// Estimated temporary memory needed for this region (bytes).
@@ -128,6 +133,20 @@ pub struct FusionBoundary {
     pub qualified: bool,
     /// Which backend implements this fusion.
     pub backend: Option<BackendId>,
+}
+
+/// A fused operation region within a scheduled region.
+/// Multiple atomic operations bundled into one kernel launch.
+#[derive(Debug, Clone)]
+pub struct FusionRegion {
+    /// Which fusion operation this region represents.
+    pub fused_op: FusedOperation,
+    /// Input tensors consumed by the fused kernel.
+    pub input_tensors: Vec<TensorId>,
+    /// Output tensors produced by the fused kernel.
+    pub output_tensors: Vec<TensorId>,
+    /// Name of the precompiled Metal kernel.
+    pub kernel_name: String,
 }
 
 /// Side effect a region has on mutable state.
@@ -293,6 +312,7 @@ mod tests {
             outputs: vec![TensorId(3)],
             dependencies: vec![],
             fusions: vec![],
+            fusion_regions: vec![],
             state_effects: vec![],
             temp_memory_bytes: 0,
             is_fence: false,

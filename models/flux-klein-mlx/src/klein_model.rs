@@ -870,6 +870,7 @@ impl FluxKlein {
     }
 
     /// Check if array contains NaN values
+    #[allow(dead_code)]
     fn has_nan(arr: &Array) -> bool {
         let flat = match arr.reshape(&[-1]) {
             Ok(f) => f,
@@ -884,6 +885,7 @@ impl FluxKlein {
     }
 
     /// Get min/max range of array
+    #[allow(dead_code)]
     fn get_range(arr: &Array) -> (f32, f32) {
         let flat = match arr.reshape(&[-1]) {
             Ok(f) => f,
@@ -925,6 +927,8 @@ fn gate(x: &Array, gate: &Array) -> Result<Array, Exception> {
 }
 
 /// Clip values to prevent fp16-style overflow (diffusers uses ±65504)
+/// Clip values to prevent fp16-style overflow (diffusers uses ±65504)
+#[allow(dead_code)]
 fn clip_values(x: &Array) -> Result<Array, Exception> {
     let min_val = array!(-65504.0f32);
     let max_val = array!(65504.0f32);
@@ -933,6 +937,7 @@ fn clip_values(x: &Array) -> Result<Array, Exception> {
 }
 
 /// Get min/max range of array (helper for debugging)
+#[allow(dead_code)]
 fn get_range(arr: &Array) -> (f32, f32) {
     let flat = match arr.reshape(&[-1]) {
         Ok(f) => f,

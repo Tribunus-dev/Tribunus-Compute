@@ -163,8 +163,11 @@ fn main() {
                     .to_string()
             });
         let crumb_path_for_read = std::path::Path::new(&crumb_path_for_read);
-        eprintln!("DEBUG breadcrumb path: {}", crumb_path_for_read.display());
-        eprintln!(
+        tribunus_compute_core::log_info!(
+            "DEBUG breadcrumb path: {}",
+            crumb_path_for_read.display()
+        );
+        tribunus_compute_core::log_info!(
             "DEBUG breadcrumb file exists: {}",
             crumb_path_for_read.exists()
         );
@@ -239,21 +242,23 @@ fn main() {
             coreml_compiler_available: false,
         });
 
-    eprintln!("=== Decode Attribution Measurement Harness ===");
-    eprintln!("Run ID: {}", run_id);
-    eprintln!("Output: {}", base_dir.display());
-    eprintln!(
+    tribunus_compute_core::log_info!("=== Decode Attribution Measurement Harness ===");
+    tribunus_compute_core::log_info!("Run ID: {}", run_id);
+    tribunus_compute_core::log_info!("Output: {}", base_dir.display());
+    tribunus_compute_core::log_info!(
         "Core ML compiler available: {}",
         env.coreml_compiler_available
     );
-    eprintln!(
+    tribunus_compute_core::log_info!(
         "Host: {} / macOS {} / Xcode {}",
-        env.host_chip, env.macos_version, env.xcode_build_version
+        env.host_chip,
+        env.macos_version,
+        env.xcode_build_version
     );
-    eprintln!("");
+    tribunus_compute_core::log_info!("");
 
     let parent_cal = calibrate_timer_overhead(10000);
-    eprintln!(
+    tribunus_compute_core::log_info!(
         "Timer overhead: {} ns ({} iterations, method={})",
         parent_cal.timer_overhead_ns,
         parent_cal.calibration_iterations,
@@ -338,9 +343,14 @@ fn main() {
                     r.mlx_cache_hit
                 };
 
-                eprintln!(
+                tribunus_compute_core::log_info!(
                     "  [{:4}] {} / {} / {} → status={}, cache_hit={}",
-                    seq, backend_name, family.name, shape.name, r.status, cache_hit
+                    seq,
+                    backend_name,
+                    family.name,
+                    shape.name,
+                    r.status,
+                    cache_hit
                 );
 
                 receipts.push(RowEntry {
@@ -372,10 +382,10 @@ fn main() {
     sf.write_all(summary_json.as_bytes())
         .expect("write summary");
 
-    eprintln!("");
-    eprintln!("=== Narrow Catalog Complete ===");
-    eprintln!("Rows: {}", seq);
-    eprintln!("Summary: {}", summary_path.display());
+    tribunus_compute_core::log_info!("");
+    tribunus_compute_core::log_info!("=== Narrow Catalog Complete ===");
+    tribunus_compute_core::log_info!("Rows: {}", seq);
+    tribunus_compute_core::log_info!("Summary: {}", summary_path.display());
 }
 
 // ── Core ML subprocess execution ─────────────────────────────────────────

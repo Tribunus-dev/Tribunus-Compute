@@ -33,7 +33,7 @@ pub mod klein_quantized;
 pub mod layers;
 pub mod qwen3_encoder;
 pub mod sampler;
-pub mod weights;
+// pub mod weights;  // disabled — weights.rs not yet created
 
 pub use autoencoder::{AutoEncoderConfig, Decoder, Encoder};
 pub use error::{FluxError, Result};
@@ -41,4 +41,3 @@ pub use klein_model::{FluxKlein, FluxKleinParams};
 pub use klein_quantized::{QuantizedFluxKlein, load_quantized_flux_klein, quantize_and_save_flux_klein};
 pub use qwen3_encoder::{Qwen3Config, Qwen3TextEncoder, sanitize_qwen3_weights};
 pub use sampler::{FluxSampler, FluxSamplerConfig};
-pub use weights::{load_safetensors, load_sharded_safetensors, sanitize_flux2_klein_weights, sanitize_klein_model_weights, sanitize_klein_quantized_weights, sanitize_vae_weights, sanitize_vae_encoder_weights};

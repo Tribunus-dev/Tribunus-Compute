@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::arena::Arena;
+use crate::backend::flex_dispatch::FlexDispatch;
 use crate::backend::routing::*;
 use crate::backend::TensorBackend;
 use crate::backend::TensorHandle;
@@ -63,9 +64,11 @@ pub struct HeterogeneousExecutor {
     backends: Vec<Box<dyn BackendInstance + Send>>,
     allocator: Option<Arc<IosurfaceAllocator>>,
     execution_count: u64,
-    operation_registry: HashMap<OperationId, OperationDescriptor>,
+    pub(crate) operation_registry: HashMap<OperationId, OperationDescriptor>,
     /// Optional ANE program cache for Orion-routed boundaries.
     ane_cache: Option<crate::memory::ane_program_cache::AneProgramCache>,
+    /// Per-operation runtime routing table (populated by FlexDispatch).
+    pub(crate) routing_table: HashMap<OperationId, BackendId>,
 }
 
 impl HeterogeneousExecutor {
@@ -77,6 +80,7 @@ impl HeterogeneousExecutor {
             execution_count: 0,
             operation_registry: HashMap::new(),
             ane_cache: None,
+            routing_table: HashMap::new(),
         }
     }
 
@@ -113,6 +117,98 @@ impl HeterogeneousExecutor {
     /// Returns `None` if no such backend is registered or available.
     fn find_backend(&mut self, id: BackendId) -> Option<&mut Box<dyn BackendInstance + Send>> {
         self.backends.iter_mut().find(|b| b.backend_kind() == id)
+    }
+
+    /// Set a per-operation route override in the routing table.
+    pub fn set_route(&mut self, op_id: OperationId, backend: BackendId) {
+        self.routing_table.insert(op_id, backend);
+    }
+
+    /// Get the current route for an operation, if one has been set.
+    pub fn get_route(&self, op_id: &OperationId) -> Option<BackendId> {
+        self.routing_table.get(op_id).copied()
+    }
+
+    /// Execute a sealed boundary plan using per-operation flex dispatch.
+    ///
+    /// For each operation in the boundary, calls [`FlexDispatch::dispatch`]
+    /// to determine which backend runs it *right now*, overriding the
+    /// plan's static [`BackendId`].  Operations within the same boundary
+    /// may execute on different backends.
+    ///
+    /// After dispatch, each operation is executed on its selected backend
+    /// and a consolidated [`BoundaryExecutionReceipt`] is emitted for the
+    /// whole boundary batch.
+    pub fn execute_boundary_flex(
+        &mut self,
+        boundary: &SealedExecutionBoundaryPlan,
+        flex: &mut FlexDispatch,
+    ) -> Result<Vec<BoundaryExecutionReceipt>, String> {
+        let plan = &boundary.plan;
+        let boundary_start = std::time::Instant::now();
+        let mut receipts = Vec::new();
+
+        // 1. Look up operation descriptors from the registry.
+        let ops: Vec<OperationDescriptor> = plan
+            .operations
+            .iter()
+            .map(|op_id| {
+                self.operation_registry
+                    .get(op_id)
+                    .ok_or_else(|| format!("operation {} not found in registry", op_id.0))
+                    .cloned()
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        // 2. Dispatch each operation to its runtime-selected backend.
+        let mut _op_receipts: Vec<BackendExecutionReceipt> =
+            Vec::with_capacity(plan.operations.len());
+
+        for (i, op_desc) in ops.iter().enumerate() {
+            let backend_id = flex.dispatch(op_desc, plan.group_id.0 as u32);
+
+            // Cache the route so the executor's routing table stays
+            // consistent with the flex dispatcher's decisions.
+            self.routing_table.insert(op_desc.operation_id, backend_id);
+
+            let backend = self
+                .find_backend(backend_id)
+                .ok_or_else(|| format!("flex-dispatch backend {} not registered", backend_id.0))?;
+
+            let receipt = backend.execute(op_desc, &[])?;
+            _op_receipts.push(receipt);
+        }
+
+        // 3. Emit a consolidated boundary receipt.
+        let elapsed_ns = boundary_start.elapsed().as_nanos() as u64;
+        let support = policy_support(plan.backend_id, &plan.policy);
+
+        let actual_sync_count = if matches!(plan.synchronization, SynchronizationPolicy::Barrier) {
+            1
+        } else {
+            0
+        };
+
+        receipts.push(BoundaryExecutionReceipt {
+            group_id: plan.group_id,
+            planned_policy: plan.policy.clone(),
+            backend: plan.backend_id,
+            operation_count: plan.operations.len(),
+            planned_materialized_outputs: plan.materialized_outputs.len(),
+            actual_eval_calls: plan.operations.len(),
+            actual_sync_count,
+            graph_build_ns: 0,
+            submit_ns: 0,
+            execution_ns: elapsed_ns,
+            wait_ns: 0,
+            temporary_bytes: 0,
+            released_tensor_count: plan.release_after.len(),
+            unaccounted_ns: 0,
+            policy_support: support,
+        });
+
+        self.execution_count += 1;
+        Ok(receipts)
     }
 }
 

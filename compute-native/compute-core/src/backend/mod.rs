@@ -9,6 +9,7 @@ pub mod accelerate_ffi;
 pub mod coreml;
 pub mod evaluation;
 pub mod graph;
+pub mod flex_dispatch;
 pub mod heterogeneous_executor;
 pub mod routing;
 pub mod tensor_registry;

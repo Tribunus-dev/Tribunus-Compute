@@ -90,7 +90,7 @@ pub fn run_generation_loop(
     params: &GenerationLoopParams,
     seed: Option<u64>,
 ) -> Result<Vec<[u32; 16]>> {
-    let vocab_size = talker.vocab_size();
+    let _vocab_size = talker.vocab_size();
     let hidden_size = talker.hidden_size();
 
     let mut rng = match seed {

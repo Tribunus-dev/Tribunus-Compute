@@ -1,16 +1,15 @@
 //! Speech tokenizer decoder: converts 16-codebook discrete codes to 24kHz waveform.
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use mlx_rs::{
     array,
     builder::Builder,
-    module::{Module, Param},
+    module::Module,
     nn,
     ops::{
-        arange, concatenate_axis,
-        indexing::{IndexOp, NewAxis},
+        concatenate_axis,
+        indexing::IndexOp,
         zeros,
     },
     transforms::eval,
@@ -19,6 +18,7 @@ use mlx_rs::{
 
 use crate::config::DecoderConfig;
 use crate::error::{Error, Result};
+use crate::pretrained::*;
 
 // ============================================================================
 // Helper: Causal Conv1d (left-padding)
@@ -341,7 +341,7 @@ impl SpeechTokenizerDecoder {
         // First output
         let first_out = self.rvq_first_output_proj.forward(&sum_code)?;
         // Rest output (no projection for now — simplified)
-        let rest_out = self.rvq_rest_output_proj.forward(&sum_code)?;
+        let _rest_out = self.rvq_rest_output_proj.forward(&sum_code)?;
 
         // Pre-convolution
         let h = self.pre_conv.forward(&first_out)?;
@@ -399,16 +399,16 @@ pub fn load_speech_tokenizer(
     let h = config.hidden_size;
     let n_layers = config.num_hidden_layers;
     let n_heads = config.num_attention_heads;
-    let n_kv_heads = config.num_key_value_heads;
+    let _n_kv_heads = config.num_key_value_heads;
     let head_dim = config.head_dim;
     let rope_theta = config.rope_theta;
     let rms_norm_eps = config.rms_norm_eps;
     let intermediate_size = config.intermediate_size;
 
     // Codebooks
-    let sem_codebook_size = config.semantic_codebook_size;
+    let _sem_codebook_size = config.semantic_codebook_size;
     let codebook_dim = config.codebook_dim;
-    let num_quantizers = config.num_quantizers;
+    let _num_quantizers = config.num_quantizers;
     let semantic_quantizers = config.num_semantic_quantizers;
 
     // Semantic codebook (quantizers 0..semantic_quantizers summed)
@@ -478,7 +478,7 @@ pub fn load_speech_tokenizer(
         rms_norm_eps,
     )?;
 
-    let rope_traditional = true;
+    let _rope_traditional = true;
     let mut pre_transformer_layers = Vec::new();
     for i in 0..n_layers {
         let prefix = format!("pre_transformer.layers.{i}");
@@ -536,13 +536,11 @@ pub fn load_speech_tokenizer(
                 .unwrap_or_else(|| Array::from_slice(&[config.layer_scale_initial_scale], &[h])),
             n_heads,
             head_dim,
-            rope: nn::Rope::from_pretrained(
-                n_kv_heads,
-                head_dim,
-                rope_theta,
-                rope_traditional,
-                weights.get(&format!("{prefix}.rope.freqs")),
-            )?,
+            rope: nn::RopeBuilder::new(head_dim)
+                .traditional(true)
+                .base(rope_theta)
+                .build()
+                .expect("RopeBuilder::build should never fail (Infallible)"),
         };
         pre_transformer_layers.push(layer);
     }
@@ -583,10 +581,10 @@ pub fn load_speech_tokenizer(
             dwconv,
             norm_weight: weights.get(&format!("{cn_prefix}.norm.weight"))
                 .cloned()
-                .unwrap_or_else(|| Array::ones(&[out_ch])),
+                .unwrap_or_else(|| Array::ones::<f32>(&[out_ch]).expect("Array::ones failed")),
             norm_bias: weights.get(&format!("{cn_prefix}.norm.bias"))
                 .cloned()
-                .unwrap_or_else(|| Array::zeros::<f32>(&[out_ch])),
+                .unwrap_or_else(|| Array::zeros::<f32>(&[out_ch]).expect("Array::zeros failed")),
             pwconv1_weight: weights.get(&format!("{cn_prefix}.pwconv1.weight"))
                 .cloned()
                 .ok_or_else(|| Error::WeightNotFound(format!("{cn_prefix}.pwconv1.weight")))?,

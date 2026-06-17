@@ -842,11 +842,12 @@ pub fn quantize_and_save_flux_klein(
     bits: i32,
 ) -> Result<(), Exception> {
     println!("Loading bf16 weights from {:?}...", input_path);
-    let raw_weights = crate::weights::load_safetensors(input_path)
+    let raw_weights = Array::load_safetensors(input_path)
         .map_err(|e| Exception::custom(format!("Failed to load weights: {}", e)))?;
 
     println!("Sanitizing {} weight keys...", raw_weights.len());
-    let weights = crate::weights::sanitize_klein_model_weights(raw_weights);
+    // sanitize_klein_model_weights not yet implemented; raw weights used as-is
+    let weights = raw_weights;
 
     println!("Quantizing {} weights to {}bit (group_size={})...", weights.len(), bits, group_size);
     let mut quantized_tensors: HashMap<String, Array> = HashMap::new();
@@ -866,17 +867,17 @@ pub fn quantize_and_save_flux_klein(
         if is_norm_weight(key) {
             // Keep norm weights as f32
             let v32 = value.as_type::<f32>().unwrap_or_else(|_| value.clone());
-            quantized_tensors.insert(key.clone(), v32);
+            quantized_tensors.insert(key.to_string(), v32);
         } else if key.ends_with(".weight") {
             // Quantize linear weights
             let v32 = value.as_type::<f32>().unwrap_or_else(|_| value.clone());
-            let (q_weight, scales, biases) = ops::quantize(&v32, group_size, bits, None::<&str>)?;
+            let (q_weight, scales, biases) = ops::quantize(&v32, group_size, bits)?;
             q_weight.eval()?;
             scales.eval()?;
             biases.eval()?;
 
             let base = &key[..key.len() - 7]; // strip ".weight"
-            quantized_tensors.insert(key.clone(), q_weight);
+            quantized_tensors.insert(key.to_string(), q_weight);
             quantized_tensors.insert(format!("{}.scales", base), scales);
             quantized_tensors.insert(format!("{}.biases", base), biases);
         }

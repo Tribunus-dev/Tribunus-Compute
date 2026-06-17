@@ -230,6 +230,7 @@ impl Qwen3Attention {
 /// Returns mask with shape [1, 1, seq_len, seq_len] where:
 /// - 0 for positions that can be attended
 /// - -inf for positions that should be masked
+#[allow(dead_code)]
 fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
     // Create indices
     let i = Array::from_iter(0..seq_len, &[seq_len, 1]);

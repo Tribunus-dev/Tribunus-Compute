@@ -18,10 +18,14 @@ pub struct ModelManifest {
     pub config_hash: String,
     pub model_type: String,
     pub has_text_config: bool,
+    pub has_vision_config: bool,
+    pub has_audio_config: bool,
     pub has_quantization_metadata: bool,
     pub quantization_bits: Option<u32>,
     pub quantization_group_size: Option<u32>,
     pub quantization_mode: Option<String>,
+    pub vision_config: Option<VisionArchitecture>,
+    pub audio_config: Option<AudioArchitecture>,
     pub safetensors_shards: Vec<ShardManifest>,
 }
 
@@ -58,6 +62,39 @@ pub struct TextArchitecture {
     pub rope_local: RopeSpec,
     pub rope_global: Option<RopeSpec>,
     pub model_type: String,
+
+    /// Mixture-of-Experts configuration, if applicable.
+    #[serde(default)]
+    pub moe_config: Option<MoEConfig>,
+}
+
+/// Vision encoder configuration from a model's vision_config.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VisionArchitecture {
+    pub hidden_size: u32,
+    pub num_attention_heads: u32,
+    pub num_hidden_layers: u32,
+    pub intermediate_size: u32,
+    pub image_size: u32,
+    pub patch_size: u32,
+    pub num_channels: u32,
+    pub projection_dim: u32,
+}
+
+/// Audio encoder configuration from a model's audio_config.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioArchitecture {
+    pub hidden_size: u32,
+    pub num_attention_heads: u32,
+    pub num_hidden_layers: u32,
+    pub intermediate_size: u32,
+    pub sample_rate: u32,        // e.g. 16000
+    pub num_mel_bins: u32,       // e.g. 80
+    pub hop_length: u32,         // e.g. 160
+    pub max_audio_length_s: u32, // e.g. 30 (seconds)
+    pub projection_dim: u32,     // audio_features -> text hidden dim
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +125,188 @@ pub enum QuantizationMode {
     None,
     Affine,
     Symmetric,
+}
+
+/// Mixture-of-Experts (MoE) routing configuration.
+///
+/// Describes how many experts exist, how many are active per token,
+/// the intermediate (FFN) size within each expert, and whether shared
+/// experts (present in every layer) are enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MoEConfig {
+    /// Total number of experts in the MoE layer.
+    pub num_experts: u32,
+    /// Number of experts activated per token (top-K routing).
+    pub top_k_experts: u32,
+    /// FFN intermediate size within each expert.
+    pub intermediate_size: u32,
+    /// Whether shared (always-active) experts are used alongside routed experts.
+    pub shared_experts: bool,
+}
+
+/// Diffusion model configuration from the model's config.json.
+/// Used by DiffusionGemma for parallel denoising text generation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiffusionConfig {
+    /// Maximum number of diffusion tokens per batch (default 256).
+    pub max_diffusion_tokens: u32,
+    /// Default number of denoising steps (4-8 for text).
+    pub default_denoising_steps: u32,
+    /// Noise schedule type (cosine, sqrt, linear).
+    pub noise_schedule: NoiseScheduleType,
+    /// Number of tokens generated per forward pass (15-20).
+    pub parallel_token_generation: u32,
+    /// Whether the model supports image inputs natively.
+    pub supports_images: bool,
+    /// Whether the model supports video inputs natively.
+    pub supports_video: bool,
+    /// Input image size in pixels (e.g. 896).
+    pub image_size: u32,
+    /// Patch size for image/video processing.
+    pub patch_size: u32,
+    /// Maximum context length (e.g. 262144).
+    pub max_context_length: u32,
+}
+
+impl Default for DiffusionConfig {
+    fn default() -> Self {
+        Self {
+            max_diffusion_tokens: 256,
+            default_denoising_steps: 6,
+            noise_schedule: NoiseScheduleType::Cosine,
+            parallel_token_generation: 18,
+            supports_images: true,
+            supports_video: true,
+            image_size: 896,
+            patch_size: 16,
+            max_context_length: 262_144,
+        }
+    }
+}
+
+/// Noise schedule type for diffusion denoising.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum NoiseScheduleType {
+    /// Cosine schedule (cosine-based noise weighting).
+    Cosine,
+    /// Square-root schedule (sqrt-based noise weighting).
+    Sqrt,
+    /// Linear schedule (linear noise weighting).
+    Linear,
+}
+
+/// Compile-time quantization mode for the ComputeImage compiler.
+/// When set, FP16/BF16 source weights are quantized at compile time
+/// into packed triplets (packed weight + F32 scales + F32 biases).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CompileQuantMode {
+    /// 4-bit NormalFloat (NF4) block quantization.
+    Nf4 { group_size: u32 },
+    /// 8-bit affine quantization.
+    Af8 { group_size: u32 },
+}
+
+impl CompileQuantMode {
+    /// Parse a quant mode name into a CompileQuantMode.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "nf4" => Some(Self::Nf4 { group_size: 64 }),
+            "nf4-128" => Some(Self::Nf4 { group_size: 128 }),
+            "8bit" => Some(Self::Af8 { group_size: 64 }),
+            _ => None,
+        }
+    }
+
+    /// Human-readable name.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Nf4 { group_size: 64 } => "nf4",
+            Self::Nf4 { group_size: 128 } => "nf4-128",
+            Self::Af8 { .. } => "8bit",
+            _ => "nf4-64",
+        }
+    }
+}
+
+/// Target hardware for a ComputeImage compilation.
+/// Determines quantization, segment layout, and feature set.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum HardwareTarget {
+    /// Apple M1 (16GB baseline) — max compression, streaming-friendly segments
+    M1,
+    /// Apple M1 Pro/Max (32-64GB) — moderate compression
+    M1Pro,
+    /// Apple M2/M2 Pro/Max (24-96GB) — balanced
+    M2,
+    /// Apple M2 Ultra/M3 Max (96-192GB) — high precision
+    M2Ultra,
+    /// Apple M3 Ultra (256-512GB) — maximum precision, batched layout
+    M3Ultra,
+}
+
+impl HardwareTarget {
+    /// Auto-detect the current machine's target.
+    pub fn detect() -> Self {
+        let ram_mb = crate::gpu_memory::total_physical_ram_mb();
+        let cpu_count = std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(8);
+
+        match (ram_mb, cpu_count) {
+            (r, c) if r >= 393_216 && c >= 24 => Self::M3Ultra, // 384GB+ & 24+ cores
+            (r, c) if r >= 131_072 && c >= 20 => Self::M2Ultra, // 128GB+
+            (r, c) if r >= 65_536 && c >= 12 => Self::M2,       // 64GB+
+            (r, c) if r >= 32_768 => Self::M1Pro,               // 32GB+
+            _ => Self::M1,                                      // 16GB
+        }
+    }
+
+    /// Optimal quantization for this hardware.
+    pub fn recommended_quant(&self) -> &'static str {
+        match self {
+            Self::M1 => "nf4-128",
+            Self::M1Pro => "nf4-64",
+            Self::M2 => "nf4-64",
+            Self::M2Ultra => "8bit",
+            Self::M3Ultra => "none", // keep BF16/FP16
+        }
+    }
+
+    /// Whether weight streaming is beneficial (low RAM systems).
+    pub fn needs_weight_streaming(&self) -> bool {
+        matches!(self, Self::M1 | Self::M1Pro)
+    }
+
+    /// Recommended batch size for prefill+decode.
+    pub fn recommended_batch(&self) -> u32 {
+        match self {
+            Self::M1 => 4,
+            Self::M1Pro => 8,
+            Self::M2 => 12,
+            Self::M2Ultra => 20,
+            Self::M3Ultra => 32,
+        }
+    }
+
+    /// Number of ANE cores available for speculation.
+    pub fn ane_cores(&self) -> u32 {
+        match self {
+            Self::M1 | Self::M1Pro | Self::M2 => 16,
+            Self::M2Ultra | Self::M3Ultra => 32,
+        }
+    }
+
+    /// Segment layout: small + many for streaming, large + few for batched.
+    pub fn segment_target_size_mb(&self) -> u32 {
+        match self {
+            Self::M1 => 64, // small segments for streaming
+            Self::M1Pro => 128,
+            Self::M2 => 256,
+            Self::M2Ultra => 512,
+            Self::M3Ultra => 1024, // huge segments, fewer files
+        }
+    }
 }
 
 // ── Layer 3: Compiled Execution Specification ──────────────────────────────
@@ -192,6 +411,9 @@ pub struct ModelExecutionPlan {
     pub final_logit_softcapping: Option<f64>,
     pub tie_word_embeddings: bool,
     pub rms_norm_eps: f64,
+    /// Speculative decoding config when this image is a paired draft+target compile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speculative_config: Option<SpeculativeModelConfig>,
 }
 
 /// Segment ID containing the embedding table.
@@ -247,6 +469,11 @@ pub struct LayerPlan {
     /// Per-operation backend routing for heterogeneous dispatch.
     #[serde(default)]
     pub route: operation_route::OperationRoute,
+    /// Fused operations detected at compile time.
+    /// Populated by [`ModelExecutionPlan::apply_fusion_pass`] during
+    /// compute-image build.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fused_operations: Vec<FusedOperation>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -268,6 +495,120 @@ pub struct AneFusedIsland {
     pub layer_indices: Vec<u32>,
     pub compute_units: String,
     pub function_name: String,
+}
+
+/// A fused operation composed of multiple atomic operations.
+/// The corresponding Metal kernel is precompiled and stored in the
+/// model's .metallib.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FusedOperation {
+    /// rms_norm + q_proj matmul
+    FusedNormQProj,
+    /// rms_norm + k_proj matmul
+    FusedNormKProj,
+    /// rms_norm + v_proj matmul
+    FusedNormVProj,
+    /// silu(gate_proj(x)) * up_proj(x) + down_proj
+    FusedFfnActivation,
+    /// residual_add + rms_norm
+    FusedResidualNorm,
+    /// q @ k^T + softmax + @ v
+    FusedFlashAttention,
+    /// Gate -> Top-K -> Expert FFN -> Combine
+    FusedMoERoute,
+    /// Plugin-provided operation (kernel name looked up in PLUGIN_REGISTRY).
+    Custom(String),
+}
+
+impl FusedOperation {
+    /// Return the name of the precompiled Metal kernel.
+    pub fn kernel_name(&self) -> &str {
+        match self {
+            Self::FusedNormQProj => "fused_norm_q_proj",
+            Self::FusedNormKProj => "fused_norm_k_proj",
+            Self::FusedNormVProj => "fused_norm_v_proj",
+            Self::FusedFfnActivation => "fused_ffn_activation",
+            Self::FusedResidualNorm => "fused_residual_norm",
+            Self::FusedFlashAttention => "fused_flash_attention",
+            Self::FusedMoERoute => "fused_moe_route",
+            Self::Custom(name) => name.as_str(),
+        }
+    }
+}
+
+impl LayerPlan {
+    /// Return the logical operation names for this layer in execution order,
+    /// derived from which weight tensors are present.
+    ///
+    /// This is used by [`ModelExecutionPlan::apply_fusion_pass`] to detect
+    /// fusible operation patterns.
+    pub fn operation_names(&self) -> Vec<&'static str> {
+        let mut ops = Vec::with_capacity(16);
+
+        // Pre-attention: rms_norm + QKV projections
+        if self.input_layernorm_tensor_id != 0 {
+            ops.push("rms_norm");
+        }
+        if self.q_proj_tensor_id != 0 {
+            ops.push("q_proj");
+        }
+        if self.k_proj_tensor_id != 0 {
+            ops.push("k_proj");
+        }
+        if self.v_proj_tensor_id != 0 {
+            ops.push("v_proj");
+        }
+
+        // Attention core: matmul(Q, K^T), softmax, matmul(probs, V)
+        if self.q_proj_tensor_id != 0 && self.k_proj_tensor_id != 0 {
+            ops.push("matmul");
+            ops.push("softmax");
+        }
+        if self.q_proj_tensor_id != 0 && self.v_proj_tensor_id != 0 {
+            ops.push("matmul");
+        }
+
+        // Post-attention residual + norm
+        if self.o_proj_tensor_id != 0 {
+            ops.push("add");
+        }
+        if self.post_attention_layernorm_tensor_id != 0 {
+            ops.push("rms_norm");
+        }
+
+        // FFN: gate_proj, silu, multiply(up_proj, silu(gate)), add(sum)
+        if self.gate_proj_tensor_id != 0 {
+            ops.push("gate_proj");
+            ops.push("silu");
+        }
+        if self.up_proj_tensor_id != 0 {
+            ops.push("multiply");
+        }
+        if self.down_proj_tensor_id != 0 {
+            ops.push("down_proj");
+        }
+
+        ops
+    }
+}
+
+/// Check if `ops` contains the contiguous sequence of operation names in
+/// `pattern`.  Returns `true` when every element of `pattern` appears in
+/// order as a subsequence of `ops`.
+fn has_pattern(ops: &[&str], pattern: &[&str]) -> bool {
+    if pattern.is_empty() {
+        return true;
+    }
+    let mut pi = 0;
+    for &op in ops {
+        if op == pattern[pi] {
+            pi += 1;
+            if pi == pattern.len() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 impl ModelExecutionPlan {
@@ -303,6 +644,70 @@ impl ModelExecutionPlan {
             }
         }
         self.fused_ane_islands = islands;
+    }
+}
+
+/// Config for a model pair compiled for speculative decoding.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeculativeModelConfig {
+    /// Draft model architecture config
+    pub draft_architecture: TextArchitecture,
+    /// Target model architecture config
+    pub target_architecture: TextArchitecture,
+    /// Shared components
+    pub shared_embedding: bool,
+    pub shared_lm_head: bool,
+    /// Segment ordering: draft layers come first for fast startup
+    pub draft_first_segments: bool,
+    /// Maximum draft speculation length
+    pub speculation_length: u32,
+}
+
+impl ModelExecutionPlan {
+    /// Post-plan fusion pass: detect common operation patterns and
+    /// annotate layers with fused operations.
+    ///
+    /// Recognised patterns:
+    /// - `rms_norm` + `q_proj` / `k_proj` / `v_proj` → single fused kernel
+    /// - `silu(multiply)` → fused FFN activation
+    /// - `add` + `rms_norm` → fused residual+norm
+    /// - `matmul` + `softmax` + `matmul` → fused flash attention
+    ///
+    /// Called during compute-image build after the execution plan is
+    /// assembled and before `build_ane_fusion_plan`.
+    pub fn apply_fusion_pass(&mut self) {
+        let pattern_norm_q = &["rms_norm", "q_proj"];
+        let pattern_norm_k = &["rms_norm", "k_proj"];
+        let pattern_norm_v = &["rms_norm", "v_proj"];
+        let pattern_silu_mul = &["silu", "multiply"];
+        let pattern_add_norm = &["add", "rms_norm"];
+        let pattern_mm_soft_mm = &["matmul", "softmax", "matmul"];
+
+        for layer in &mut self.layers {
+            let mut fused = Vec::new();
+            let ops = layer.operation_names();
+
+            if has_pattern(&ops, pattern_norm_q) {
+                fused.push(FusedOperation::FusedNormQProj);
+            }
+            if has_pattern(&ops, pattern_norm_k) {
+                fused.push(FusedOperation::FusedNormKProj);
+            }
+            if has_pattern(&ops, pattern_norm_v) {
+                fused.push(FusedOperation::FusedNormVProj);
+            }
+            if has_pattern(&ops, pattern_silu_mul) {
+                fused.push(FusedOperation::FusedFfnActivation);
+            }
+            if has_pattern(&ops, pattern_add_norm) {
+                fused.push(FusedOperation::FusedResidualNorm);
+            }
+            if has_pattern(&ops, pattern_mm_soft_mm) {
+                fused.push(FusedOperation::FusedFlashAttention);
+            }
+
+            layer.fused_operations = fused;
+        }
     }
 
     pub fn validate(&self) -> Result<(), Vec<String>> {
@@ -476,6 +881,7 @@ pub fn build_execution_plan(
             layer_scalar_ids: Vec::new(),
             quantization_ids: Vec::new(),
             route: Default::default(),
+            fused_operations: Vec::new(),
         });
     }
 
@@ -574,7 +980,8 @@ pub fn compile(
         packed_shape: if q.is_some() {
             let gs = q.as_ref().map(|m| m.group_size).unwrap_or(64);
             let bits = q.as_ref().map(|m| m.bits).unwrap_or(16);
-            let pack = 4 / (bits / 8);
+            // U32 storage packs 32/bits logical elements per physical element
+            let pack = 32 / bits;
             let packed_in = arch.hidden_size / pack;
             let n_groups = arch.hidden_size / gs;
             Some(PackedLinearShapes {
@@ -814,7 +1221,9 @@ fn quantized_linear(
     group_size: u32,
     bits: u32,
 ) -> TensorBinding {
-    let pack = if true { 4 } else { 4 / (bits / 8) }; // FIXME: debug
+    // U32 storage packs `32 / bits` logical elements per physical element.
+    // For 8-bit: pack = 32/8 = 4.  For NF4 (4-bit): pack = 32/4 = 8.
+    let pack = 32 / bits;
     let packed_in = in_dim / pack;
     let n_groups = in_dim / group_size;
 
@@ -878,15 +1287,93 @@ pub fn resolve_namespace(tensor_names: &[String]) -> Option<NamespaceBinding> {
 struct RawConfig {
     #[serde(default)]
     model_type: Option<String>,
+    // Fallback fields for flat configs (no nested text_config)
+    #[serde(default)]
+    hidden_size: Option<u32>,
+    #[serde(default)]
+    intermediate_size: Option<u32>,
+    #[serde(default)]
+    num_attention_heads: Option<u32>,
+    #[serde(default)]
+    num_key_value_heads: Option<u32>,
+    #[serde(default)]
+    head_dim: Option<u32>,
+    #[serde(default)]
+    global_head_dim: Option<u32>,
+    #[serde(default)]
+    num_global_key_value_heads: Option<u32>,
+    #[serde(default)]
+    num_hidden_layers: Option<u32>,
+    #[serde(default)]
+    vocab_size: Option<u32>,
+    #[serde(default)]
+    sliding_window: Option<u32>,
+    #[serde(default)]
+    rms_norm_eps: Option<f64>,
+    #[serde(default)]
+    tie_word_embeddings: Option<bool>,
+    #[serde(default)]
+    attention_k_eq_v: Option<bool>,
+    #[serde(default)]
+    final_logit_softcapping: Option<f64>,
+    #[serde(default)]
+    hidden_size_per_layer_input: Option<u32>,
+    #[serde(default)]
+    layer_types: Option<Vec<String>>,
+    #[serde(default)]
+    hidden_activation: Option<String>,
+    #[serde(default)]
+    enable_moe_block: Option<bool>,
+    #[serde(default)]
+    moe_intermediate_size: Option<u32>,
+    #[serde(default)]
+    num_experts: Option<u32>,
+    #[serde(default)]
+    top_k_experts: Option<u32>,
+    #[serde(default)]
+    num_kv_shared_layers: Option<u32>,
     text_config: Option<RawTextConfig>,
+    #[serde(default)]
+    vision_config: Option<VisionArchitecture>,
+    #[serde(default)]
+    audio_config: Option<AudioArchitecture>,
     #[serde(default)]
     #[serde(alias = "quantization_config")]
     quantization: Option<RawQuantization>,
     #[serde(default)]
     max_position_embeddings: Option<u32>,
+    #[serde(default)]
+    dtype: Option<String>,
+}
+impl RawConfig {
+    fn to_text_config_fallback(&self) -> RawTextConfig {
+        RawTextConfig {
+            hidden_size: self.hidden_size.unwrap_or(2048),
+            intermediate_size: self.intermediate_size.unwrap_or(8192),
+            num_attention_heads: self.num_attention_heads.unwrap_or(16),
+            num_key_value_heads: self.num_key_value_heads.unwrap_or(4),
+            head_dim: self.head_dim.unwrap_or_else(|| {
+                self.hidden_size.unwrap_or(2048) / self.num_attention_heads.unwrap_or(16)
+            }),
+            global_head_dim: self.global_head_dim,
+            num_global_key_value_heads: self.num_global_key_value_heads,
+            num_hidden_layers: self.num_hidden_layers.unwrap_or(24),
+            vocab_size: self.vocab_size.unwrap_or(32768),
+            sliding_window: self.sliding_window.unwrap_or(32768),
+            max_position_embeddings: self.max_position_embeddings,
+            rms_norm_eps: self.rms_norm_eps.unwrap_or(1e-6),
+            tie_word_embeddings: self.tie_word_embeddings,
+            attention_k_eq_v: self.attention_k_eq_v,
+            final_logit_softcapping: self.final_logit_softcapping,
+            hidden_size_per_layer_input: self.hidden_size_per_layer_input,
+            layer_types: self.layer_types.clone().unwrap_or_default(),
+            rope_parameters: None,
+            model_type: self.model_type.clone(),
+        }
+    }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct RawTextConfig {
     hidden_size: u32,
     intermediate_size: u32,
@@ -909,20 +1396,20 @@ struct RawTextConfig {
     model_type: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct RawRopeParams {
     sliding_attention: Option<RawRopeSpec>,
     full_attention: Option<RawRopeSpec>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct RawRopeSpec {
     rope_theta: f64,
     rope_type: Option<String>,
     partial_rotary_factor: Option<f64>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct RawQuantization {
     group_size: Option<u32>,
     bits: Option<u32>,
@@ -946,15 +1433,15 @@ pub fn parse_config(
 
     let text = raw
         .text_config
-        .as_ref()
-        .ok_or_else(|| crate::Error::from_reason("Missing text_config in model config"))?;
+        .clone()
+        .unwrap_or_else(|| raw.to_text_config_fallback());
 
     let max_pos = text
         .max_position_embeddings
         .or(raw.max_position_embeddings)
         .unwrap_or(131072);
 
-    let layer_types: Vec<AttentionKind> = text
+    let mut layer_types: Vec<AttentionKind> = text
         .layer_types
         .iter()
         .map(|s| match s.as_str() {
@@ -963,7 +1450,12 @@ pub fn parse_config(
         })
         .collect();
 
-    if layer_types.len() != text.num_hidden_layers as usize {
+    // If layer_types is empty (flat configs like Qwen, Llama), default to all sliding.
+    if layer_types.is_empty() {
+        for _ in 0..text.num_hidden_layers {
+            layer_types.push(AttentionKind::SlidingAttention);
+        }
+    } else if layer_types.len() != text.num_hidden_layers as usize {
         return Err(crate::Error::from_reason(format!(
             "layer_types count ({}) != num_hidden_layers ({})",
             layer_types.len(),
@@ -999,6 +1491,27 @@ pub fn parse_config(
             partial_rotary_factor: s.partial_rotary_factor,
         });
 
+    let moe_config = if raw.enable_moe_block.unwrap_or(false) {
+        let num_experts = raw.num_experts.unwrap_or(0);
+        let top_k = raw.top_k_experts.unwrap_or(1);
+        let inter_size = raw
+            .moe_intermediate_size
+            .or_else(|| Some(text.intermediate_size))
+            .unwrap_or(0);
+        if num_experts > 0 && top_k > 0 {
+            Some(MoEConfig {
+                num_experts,
+                top_k_experts: top_k,
+                intermediate_size: inter_size,
+                shared_experts: false,
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let arch = TextArchitecture {
         hidden_size: text.hidden_size,
         intermediate_size: text.intermediate_size,
@@ -1023,11 +1536,13 @@ pub fn parse_config(
             .model_type
             .clone()
             .unwrap_or_else(|| "gemma4_unified_text".into()),
+        moe_config,
     };
 
     let q_bits = raw.quantization.as_ref().and_then(|q| q.bits);
     let q_group_size = raw.quantization.as_ref().and_then(|q| q.group_size);
-    let quant = raw.quantization.map(|q| QuantizationMeta {
+    let has_explicit_quant = raw.quantization.is_some();
+    let explicit_quant = raw.quantization.map(|q| QuantizationMeta {
         bits: q.bits.unwrap_or(16),
         group_size: q.group_size.unwrap_or(64),
         mode: match q.mode.as_deref() {
@@ -1037,15 +1552,42 @@ pub fn parse_config(
         overrides: HashMap::new(),
     });
 
+    // For models with a nested text_config (e.g. Gemma4 Unified), the
+    // conversion process may not have written an explicit quantization
+    // section into config.json.  Detect this case by checking whether
+    // the top-level model_type contains known unified/conversion patterns
+    // and default to 8-bit block quantization if no explicit metadata.
+    let quant = explicit_quant.or_else(|| {
+        if raw.text_config.is_some() {
+            let mt = raw.model_type.as_deref().unwrap_or("");
+            if mt.contains("unified") || mt.starts_with("gemma4") {
+                Some(QuantizationMeta {
+                    bits: 8,
+                    group_size: 64,
+                    mode: QuantizationMode::Affine,
+                    overrides: HashMap::new(),
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    });
+
     let manifest = ModelManifest {
         config_path: config_path.into(),
         config_hash,
         model_type: raw.model_type.unwrap_or_default(),
         has_text_config: true, // we already checked text_config exists
-        has_quantization_metadata: quant.is_some(),
+        has_vision_config: raw.vision_config.is_some(),
+        has_audio_config: raw.audio_config.is_some(),
+        has_quantization_metadata: has_explicit_quant,
         quantization_bits: q_bits,
         quantization_group_size: q_group_size,
         quantization_mode: quant.as_ref().map(|q| format!("{:?}", q.mode)),
+        vision_config: raw.vision_config.clone(),
+        audio_config: raw.audio_config.clone(),
         safetensors_shards: Vec::new(),
     };
 
@@ -1286,5 +1828,308 @@ mod tests {
                 errs
             );
         }
+    }
+}
+
+/// Unified server configuration loaded from config.toml, environment
+/// variables, and CLI arguments (in ascending priority order).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServerConfig {
+    pub server: ServerConfigSection,
+    pub model: ModelConfigSection,
+    pub cache: CacheConfigSection,
+    pub speculation: SpecConfigSection,
+    pub cluster: ClusterConfigSection,
+}
+
+/// Server networking and runtime settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServerConfigSection {
+    pub port: u16,
+    pub host: String,
+    pub max_concurrent: u32,
+    pub rate_limit_per_min: u32,
+    pub log_level: String,
+}
+
+/// Model loading and download policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelConfigSection {
+    pub model_path: Option<String>,
+    pub auto_download: bool,
+    pub max_model_cache_gb: f64,
+}
+
+/// KV cache topology and compression.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CacheConfigSection {
+    pub kv_cache_tiers: u32,
+    pub compression_ratio: f64,
+    pub evolkv_enabled: bool,
+}
+
+/// Speculative decoding parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SpecConfigSection {
+    pub draft_count: u32,
+    pub draft_length: u32,
+    pub spechub_enabled: bool,
+}
+
+/// EXO cluster membership and autoscaling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClusterConfigSection {
+    pub exo_enabled: bool,
+    pub exo_port: u16,
+    pub autoscale_min: u32,
+    pub autoscale_max: u32,
+}
+
+impl Default for ServerConfigSection {
+    fn default() -> Self {
+        Self {
+            port: 11434,
+            host: "0.0.0.0".into(),
+            max_concurrent: 64,
+            rate_limit_per_min: 60,
+            log_level: "info".into(),
+        }
+    }
+}
+
+impl Default for ModelConfigSection {
+    fn default() -> Self {
+        Self {
+            model_path: None,
+            auto_download: false,
+            max_model_cache_gb: 16.0,
+        }
+    }
+}
+
+impl Default for CacheConfigSection {
+    fn default() -> Self {
+        Self {
+            kv_cache_tiers: 3,
+            compression_ratio: 0.5,
+            evolkv_enabled: true,
+        }
+    }
+}
+
+impl Default for SpecConfigSection {
+    fn default() -> Self {
+        Self {
+            draft_count: 4,
+            draft_length: 16,
+            spechub_enabled: true,
+        }
+    }
+}
+
+impl Default for ClusterConfigSection {
+    fn default() -> Self {
+        Self {
+            exo_enabled: false,
+            exo_port: 52415,
+            autoscale_min: 1,
+            autoscale_max: 8,
+        }
+    }
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            server: ServerConfigSection::default(),
+            model: ModelConfigSection::default(),
+            cache: CacheConfigSection::default(),
+            speculation: SpecConfigSection::default(),
+            cluster: ClusterConfigSection::default(),
+        }
+    }
+}
+
+impl ServerConfig {
+    /// Load from config file, then environment variables.
+    /// Config file path: $HOME/.tribunus/config.toml
+    /// (override with TRIBUNUS_CONFIG_PATH env var).
+    pub fn load() -> Self {
+        let mut config = Self::default();
+        let config_path = std::env::var("TRIBUNUS_CONFIG_PATH").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            format!("{}/.tribunus/config.toml", home)
+        });
+        if let Ok(file_config) = Self::load_config_toml(&config_path) {
+            config.merge(file_config);
+        }
+        config.load_env_overrides();
+        config
+    }
+
+    /// Parse a TOML config file into a ServerConfig.
+    pub fn load_config_toml(path: &str) -> Result<Self, String> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("Cannot read config file '{}': {}", path, e))?;
+        toml::from_str(&content).map_err(|e| format!("Invalid config file '{}': {}", path, e))
+    }
+
+    /// Override fields from environment variables.
+    pub fn load_env_overrides(&mut self) {
+        if let Ok(v) = std::env::var("TRIBUNUS_PORT") {
+            if let Ok(n) = v.parse::<u16>() {
+                self.server.port = n;
+            }
+        }
+        if let Ok(v) = std::env::var("TRIBUNUS_HOST") {
+            self.server.host = v;
+        }
+        if let Ok(v) = std::env::var("TRIBUNUS_MAX_CONCURRENT") {
+            if let Ok(n) = v.parse::<u32>() {
+                self.server.max_concurrent = n;
+            }
+        }
+        if let Ok(v) = std::env::var("TRIBUNUS_RATE_LIMIT") {
+            if let Ok(n) = v.parse::<u32>() {
+                self.server.rate_limit_per_min = n;
+            }
+        }
+        if let Ok(v) = std::env::var("TRIBUNUS_LOG_LEVEL") {
+            self.server.log_level = v;
+        }
+        if let Ok(v) = std::env::var("TRIBUNUS_MODEL_PATH") {
+            self.model.model_path = Some(v);
+        }
+        if let Ok(v) = std::env::var("TRIBUNUS_AUTO_DOWNLOAD") {
+            self.model.auto_download = v.eq_ignore_ascii_case("true") || v == "1";
+        }
+        if let Ok(v) = std::env::var("TRIBUNUS_MAX_MODEL_CACHE_GB") {
+            if let Ok(f) = v.parse::<f64>() {
+                self.model.max_model_cache_gb = f;
+            }
+        }
+        if let Ok(v) = std::env::var("TRIBUNUS_KV_CACHE_TIERS") {
+            if let Ok(n) = v.parse::<u32>() {
+                if n >= 2 && n <= 4 {
+                    self.cache.kv_cache_tiers = n;
+                }
+            }
+        }
+        if let Ok(v) = std::env::var("TRIBUNUS_COMPRESSION_RATIO") {
+            if let Ok(f) = v.parse::<f64>() {
+                self.cache.compression_ratio = f;
+            }
+        }
+        if let Ok(v) = std::env::var("TRIBUNUS_EVOLKV_ENABLED") {
+            self.cache.evolkv_enabled = v.eq_ignore_ascii_case("true") || v == "1";
+        }
+        if let Ok(v) = std::env::var("TRIBUNUS_DRAFT_COUNT") {
+            if let Ok(n) = v.parse::<u32>() {
+                self.speculation.draft_count = n;
+            }
+        }
+        if let Ok(v) = std::env::var("TRIBUNUS_DRAFT_LENGTH") {
+            if let Ok(n) = v.parse::<u32>() {
+                self.speculation.draft_length = n;
+            }
+        }
+        if let Ok(v) = std::env::var("TRIBUNUS_SPECHUB_ENABLED") {
+            self.speculation.spechub_enabled = v.eq_ignore_ascii_case("true") || v == "1";
+        }
+        if let Ok(v) = std::env::var("TRIBUNUS_EXO_ENABLED") {
+            self.cluster.exo_enabled = v.eq_ignore_ascii_case("true") || v == "1";
+        }
+        if let Ok(v) = std::env::var("TRIBUNUS_EXO_PORT") {
+            if let Ok(n) = v.parse::<u16>() {
+                self.cluster.exo_port = n;
+            }
+        }
+        if let Ok(v) = std::env::var("TRIBUNUS_AUTOSCALE_MIN") {
+            if let Ok(n) = v.parse::<u32>() {
+                self.cluster.autoscale_min = n;
+            }
+        }
+        if let Ok(v) = std::env::var("TRIBUNUS_AUTOSCALE_MAX") {
+            if let Ok(n) = v.parse::<u32>() {
+                self.cluster.autoscale_max = n;
+            }
+        }
+    }
+
+    /// Override fields from CLI arguments.
+    /// Must be called after load() so CLI args take highest priority.
+    pub fn apply_cli_args(&mut self, args: &[String]) {
+        let mut i = 1;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--port" => {
+                    i += 1;
+                    if i < args.len() {
+                        if let Ok(n) = args[i].parse::<u16>() {
+                            self.server.port = n;
+                        }
+                    }
+                }
+                "--host" => {
+                    i += 1;
+                    if i < args.len() {
+                        self.server.host = args[i].clone();
+                    }
+                }
+                "--model" | "--model-path" => {
+                    i += 1;
+                    if i < args.len() {
+                        self.model.model_path = Some(args[i].clone());
+                    }
+                }
+                "--exo" => {
+                    self.cluster.exo_enabled = true;
+                }
+                "--exo-port" => {
+                    i += 1;
+                    if i < args.len() {
+                        if let Ok(n) = args[i].parse::<u16>() {
+                            self.cluster.exo_port = n;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+
+    /// Merge another config's non-default fields into self.
+    fn merge(&mut self, other: ServerConfig) {
+        self.server.port = other.server.port;
+        self.server.host = other.server.host;
+        self.server.max_concurrent = other.server.max_concurrent;
+        self.server.rate_limit_per_min = other.server.rate_limit_per_min;
+        self.server.log_level = other.server.log_level;
+
+        if other.model.model_path.is_some() {
+            self.model.model_path = other.model.model_path;
+        }
+        self.model.auto_download = other.model.auto_download;
+        self.model.max_model_cache_gb = other.model.max_model_cache_gb;
+
+        self.cache.kv_cache_tiers = other.cache.kv_cache_tiers;
+        self.cache.compression_ratio = other.cache.compression_ratio;
+        self.cache.evolkv_enabled = other.cache.evolkv_enabled;
+
+        self.speculation.draft_count = other.speculation.draft_count;
+        self.speculation.draft_length = other.speculation.draft_length;
+        self.speculation.spechub_enabled = other.speculation.spechub_enabled;
+
+        self.cluster.exo_enabled = other.cluster.exo_enabled;
+        self.cluster.exo_port = other.cluster.exo_port;
+        self.cluster.autoscale_min = other.cluster.autoscale_min;
+        self.cluster.autoscale_max = other.cluster.autoscale_max;
     }
 }

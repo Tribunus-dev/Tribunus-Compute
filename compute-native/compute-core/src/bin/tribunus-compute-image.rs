@@ -8,6 +8,7 @@ use std::fs;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rayon::prelude::*;
@@ -16,6 +17,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use tribunus_compute_core::compute_image;
+use tribunus_compute_core::config::CompileQuantMode;
+use tribunus_compute_core::config::HardwareTarget;
 use tribunus_compute_core::kv_cache::KvCache;
 use tribunus_compute_core::profiled_executor::{LoadedProfiledModel, ProfiledInferenceSession};
 
@@ -28,6 +31,12 @@ fn main() {
     if args.len() < 2 {
         eprintln!("Usage:");
         eprintln!("  tribunus-compute-image build --source <dir> --output <dir>");
+        eprintln!("       source can be a local path or hf:org/model[@revision]");
+        eprintln!("       [--draft-model <dir>] [--diagnostic] [--quantize <mode>]");
+        eprintln!("       [--diff <manifest.json>]");
+        eprintln!("       [--target <target>]");
+        eprintln!("    quantize modes: nf4, nf4-128, 8bit");
+        eprintln!("    targets: m1, m1pro, m2, m2ultra, m3ultra (default: auto-detect)");
         eprintln!(
             "  tribunus-compute-image verify --image <dir> [--expected-hash <hash>] [--full]"
         );
@@ -46,13 +55,13 @@ fn main() {
         "emit-v0" => cmd_emit_v0(&args[2..]),
         "verify-v0" => cmd_verify_v0(&args[2..]),
         other => {
-            eprintln!("unknown command: {other}");
+            tribunus_compute_core::log_error!("unknown command: {other}");
             std::process::exit(1);
         }
     };
 
     if let Err(e) = result {
-        eprintln!("error: {e}");
+        tribunus_compute_core::log_error!("error: {e}");
         std::process::exit(1);
     }
 }
@@ -79,11 +88,37 @@ fn has_flag(args: &[String], flag: &str) -> bool {
 
 // ═══════════════════════════════════════════════════════════════════════════
 // build command
-// ═══════════════════════════════════════════════════════════════════════════
+/// ═══════════════════════════════════════════════════════════════════════════
 
 fn cmd_build(args: &[String]) -> Result<(), String> {
     let source = get_opt(args, "--source").ok_or_else(|| "--source is required".to_string())?;
     let output = get_opt(args, "--output").ok_or_else(|| "--output is required".to_string())?;
+    let diff_manifest = get_opt(args, "--diff");
+    let draft_model = get_opt(args, "--draft-model");
+    let diagnostic = has_flag(args, "--diagnostic");
+    let quantize_mode = get_opt(args, "--quantize")
+        .map(|q| match q {
+            "nf4" => Ok(CompileQuantMode::Nf4 { group_size: 64 }),
+            "nf4-128" => Ok(CompileQuantMode::Nf4 { group_size: 128 }),
+            "8bit" => Ok(CompileQuantMode::Af8 { group_size: 64 }),
+            other => Err(format!(
+                "unknown quantize mode: '{other}'. Expected nf4, nf4-128, or 8bit"
+            )),
+        })
+        .transpose()?;
+
+    let target = get_opt(args, "--target")
+        .map(|t| match t.to_lowercase().as_str() {
+            "m1" => Ok(HardwareTarget::M1),
+            "m1pro" => Ok(HardwareTarget::M1Pro),
+            "m2" => Ok(HardwareTarget::M2),
+            "m2ultra" => Ok(HardwareTarget::M2Ultra),
+            "m3ultra" => Ok(HardwareTarget::M3Ultra),
+            other => Err(format!(
+                "unknown target: '{other}'. Expected m1, m1pro, m2, m2ultra, or m3ultra"
+            )),
+        })
+        .transpose()?;
 
     let output_path = Path::new(output);
 
@@ -107,13 +142,66 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
 
     // Compile into staging.
     let compile_start = Instant::now();
-    let compiled = compute_image::compile_with_authority(
-        source,
-        &staging,
-        compute_image::CompilationAuthority::SealedComputeImage,
-        false,
-    )
-    .map_err(|e| format!("compilation failed: {e}"))?;
+    // Resolve source: if --source starts with "hf:", stream from HuggingFace.
+    let (_hf_download_dir, compile_source, seal_source) =
+        if let Some(hf_source) = source.strip_prefix("hf:") {
+            let parts: Vec<&str> = hf_source.splitn(2, '@').collect();
+            let hub_id = parts[0];
+            let revision = parts.get(1).copied().unwrap_or("main");
+
+            tribunus_compute_core::log_info!(
+                "[build] streaming from HuggingFace: hub={hub_id}, revision={revision}"
+            );
+
+            let download_dir =
+                tempfile::tempdir().map_err(|e| format!("create HF download dir: {e}"))?;
+            let download_path: PathBuf = download_dir.path().to_path_buf();
+
+            compute_image::download_hf_model(hub_id, revision, &download_path)
+                .map_err(|e| format!("HF download failed: {e}"))?;
+
+            let compile_source = download_path
+                .to_str()
+                .ok_or_else(|| "invalid download path".to_string())?
+                .to_string();
+            let seal_source = source.to_string();
+            (Some(download_dir), compile_source, seal_source)
+        } else {
+            let compile_source = source.to_string();
+            let seal_source = source.to_string();
+            (None, compile_source, seal_source)
+        };
+
+    let compiled = if let Some(draft) = draft_model {
+        tribunus_compute_core::log_info!(
+            "[build] speculative compile: target={} draft={}",
+            compile_source,
+            draft
+        );
+        compute_image::compile_with_authority_speculative(
+            &compile_source,
+            draft,
+            &staging,
+            compute_image::CompilationAuthority::SealedComputeImage,
+            quantize_mode,
+            target,
+        )
+        .map_err(|e| format!("speculative compilation failed: {e}"))?
+    } else if let Some(prev) = diff_manifest {
+        tribunus_compute_core::log_info!("[build] differential compile against {}", prev);
+        compute_image::compile_differential(&compile_source, &staging, prev)
+            .map_err(|e| format!("differential compilation failed: {e}"))?
+    } else {
+        compute_image::compile_with_authority(
+            &compile_source,
+            &staging,
+            compute_image::CompilationAuthority::SealedComputeImage,
+            false,
+            quantize_mode,
+            target,
+        )
+        .map_err(|e| format!("compilation failed: {e}"))?
+    };
     let compile_ns = compile_start.elapsed().as_nanos() as u64;
     let compile_duration_s = compile_ns as f64 / 1_000_000_000.0;
 
@@ -163,7 +251,7 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
         format!("{:x}", hasher.finalize())
     };
     // Compute artifact root hash from all segment files (parallel with rayon)
-    eprintln!(
+    tribunus_compute_core::log_info!(
         "[build] computing artifact root hash (parallel, {} segments)...",
         compiled.manifest.segments.len()
     );
@@ -181,7 +269,7 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
         root_hasher.update(bytes);
     }
     let artifact_root_hash = format!("{:x}", root_hasher.finalize());
-    eprintln!(
+    tribunus_compute_core::log_info!(
         "[build] artifact_root_hash: {}...",
         &artifact_root_hash[..16]
     );
@@ -204,7 +292,7 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
         "compile_duration_s": compile_duration_s,
         "storage_abi": storage_abi,
         "runtime_abi": runtime_abi,
-        "source_dir": source,
+        "source_dir": &seal_source,
         "compiler_commit": compiler_commit,
         "sealed_at": sealed_at,
     });
@@ -233,6 +321,52 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
         "runtime_abi": runtime_abi,
     });
     println!("{}", serde_json::to_string(&out).unwrap());
+
+    // Run compile-time diagnostics if requested.
+    if diagnostic {
+        tribunus_compute_core::log_info!("Running compile-time diagnostic verification...");
+        match compute_image::run_diagnostics(output_path) {
+            Ok(diag_report) => {
+                // Write diagnostic.json to the output directory.
+                let diag_json = serde_json::to_string_pretty(&diag_report)
+                    .map_err(|e| format!("serialize diagnostic.json: {e}"))?;
+                let diag_path = output_path.join("diagnostic.json");
+                fs::write(&diag_path, &diag_json)
+                    .map_err(|e| format!("write diagnostic.json: {e}"))?;
+
+                let passed_str = if diag_report.passed {
+                    "PASSED"
+                } else {
+                    "FAILED"
+                };
+                tribunus_compute_core::log_info!("=== Compile-time Diagnostics ===");
+                tribunus_compute_core::log_info!(
+                    "Layers: {}/{} checked",
+                    diag_report.layers.len(),
+                    diag_report.global.total_layers
+                );
+                tribunus_compute_core::log_info!("NaN layers: {}", diag_report.global.nan_layers);
+                tribunus_compute_core::log_info!("Inf layers: {}", diag_report.global.inf_layers);
+                tribunus_compute_core::log_info!("Issues: {}", diag_report.issues.len());
+                tribunus_compute_core::log_info!(
+                    "Max activation norm: {:.3}",
+                    diag_report
+                        .layers
+                        .iter()
+                        .map(|l| l.hidden_norm)
+                        .fold(0.0_f64, f64::max)
+                );
+                tribunus_compute_core::log_info!(
+                    "Max layer runtime: {} ms",
+                    diag_report.global.max_runtime_ms
+                );
+                tribunus_compute_core::log_info!("Total: {passed_str}");
+            }
+            Err(e) => {
+                tribunus_compute_core::log_warn!("warning: diagnostics failed: {e}");
+            }
+        }
+    }
 
     Ok(())
 }
@@ -268,7 +402,9 @@ fn cmd_verify(args: &[String]) -> Result<(), String> {
     // If --expected-hash provided, compare.
     if let Some(expected) = expected_hash {
         if expected != stored_hash {
-            eprintln!("hash mismatch: expected={expected} stored={stored_hash}");
+            tribunus_compute_core::log_error!(
+                "hash mismatch: expected={expected} stored={stored_hash}"
+            );
             return Err("image hash mismatch".to_string());
         }
     }
@@ -295,7 +431,7 @@ fn cmd_verify(args: &[String]) -> Result<(), String> {
     // If --full: verify every segment SHA-256 against manifest (parallel),
     // then verify artifact root hash against seal.json.
     if full {
-        eprintln!(
+        tribunus_compute_core::log_info!(
             "[verify] full: hashing {} segments in parallel...",
             reader.manifest.segments.len()
         );
@@ -332,7 +468,7 @@ fn cmd_verify(args: &[String]) -> Result<(), String> {
                 mismatches.join("\n")
             ));
         }
-        eprintln!(
+        tribunus_compute_core::log_info!(
             "[verify] segments: {}/{} verified",
             verified,
             reader.manifest.segments.len()
@@ -351,7 +487,7 @@ fn cmd_verify(args: &[String]) -> Result<(), String> {
                 &recomputed_root[..16]
             ));
         }
-        eprintln!("[verify] artifact root hash: match");
+        tribunus_compute_core::log_info!("[verify] artifact root hash: match");
     }
 
     let segment_count = reader.manifest.segments.len();
@@ -420,7 +556,7 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (y, m, d)
 }
 fn cmd_decode_one(args: &[String]) -> Result<(), String> {
-    eprintln!(
+    tribunus_compute_core::log_info!(
         "[experimental diagnostic] Running compute-native decode-one diagnostic verification"
     );
 
@@ -483,8 +619,8 @@ fn cmd_decode_one(args: &[String]) -> Result<(), String> {
         vec![2, 42, 100, 500] // default fallback
     };
 
-    eprintln!("Opening sealed image: {}", image_dir);
-    let reader = compute_image::read(&image_dir).map_err(|e| format!("read: {e}"))?;
+    tribunus_compute_core::log_info!("Opening sealed image: {}", image_dir);
+    let reader = compute_image::read(&image_dir).map_err(|e| format!("read image: {e}"))?;
     let plan = &reader.manifest.execution_plan;
 
     // Build KV caches (one per layer) using parsed capacities
@@ -515,27 +651,29 @@ fn cmd_decode_one(args: &[String]) -> Result<(), String> {
     let mut session = ProfiledInferenceSession::new("decode-one".into(), kv_caches);
 
     // Prefill with prompt
-    eprintln!("Prefill with {} tokens...", prompt.len());
+    tribunus_compute_core::log_info!("Prefill with {} tokens...", prompt.len());
     let t0 = std::time::Instant::now();
     let prefill_token = session
         .prefill(&prompt, &model)
         .map_err(|e| format!("prefill: {e}"))?;
     let prefill_elapsed = t0.elapsed().as_secs_f64();
-    eprintln!(
+    tribunus_compute_core::log_info!(
         "GATE: prefill_token={} elapsed={:.2}s",
-        prefill_token, prefill_elapsed
+        prefill_token,
+        prefill_elapsed
     );
 
     // Decode one token
-    eprintln!("Decode one...");
+    tribunus_compute_core::log_info!("Decode one...");
     let t0 = std::time::Instant::now();
     let decode_token = session
         .decode_one(prefill_token, &model)
         .map_err(|e| format!("decode: {e}"))?;
     let decode_elapsed = t0.elapsed().as_secs_f64();
-    eprintln!(
+    tribunus_compute_core::log_info!(
         "GATE: decode_token={} elapsed={:.2}s",
-        decode_token, decode_elapsed
+        decode_token,
+        decode_elapsed
     );
 
     // Verify KV caches are committed correctly
@@ -543,9 +681,11 @@ fn cmd_decode_one(args: &[String]) -> Result<(), String> {
     for (l, kvc) in session.kv_caches.iter().enumerate() {
         let committed = kvc.committed_len;
         if committed != expected_committed {
-            eprintln!(
+            tribunus_compute_core::log_warn!(
                 "WARN: layer {} has {} committed positions (expected {})",
-                l, committed, expected_committed
+                l,
+                committed,
+                expected_committed
             );
         }
     }
@@ -593,8 +733,8 @@ fn cmd_infer(args: &[String]) -> Result<(), String> {
         return Err("not a ComputeImage directory (missing manifest.json)".into());
     }
 
-    eprintln!("Opening sealed image: {}", image_dir);
-    let reader = compute_image::read(&image_dir).map_err(|e| format!("read image: {e}"))?;
+    tribunus_compute_core::log_info!("Opening sealed image: {}", image_dir);
+    let reader = compute_image::read(&image_dir).map_err(|e| format!("read: {e}"))?;
 
     let plan = &reader.manifest.execution_plan;
     let plan_errors = plan.validate();
@@ -607,7 +747,7 @@ fn cmd_infer(args: &[String]) -> Result<(), String> {
         .open_runtime(compute_image::StorageBackend::Copied)
         .map_err(|e| format!("open runtime: {e}"))?;
 
-    eprintln!("Running 48-layer forward pass...");
+    tribunus_compute_core::log_info!("Running 48-layer forward pass...");
     let token = runtime
         .run_full_model(&[2i32])
         .map_err(|e| format!("run_full_model: {e}"))?;
@@ -623,7 +763,7 @@ fn cmd_infer(args: &[String]) -> Result<(), String> {
     });
     println!("{}", serde_json::to_string(&out).unwrap());
 
-    eprintln!("GATE PASSED: token={} elapsed={:.1}s", token, elapsed_s);
+    tribunus_compute_core::log_info!("GATE PASSED: token={} elapsed={:.1}s", token, elapsed_s);
     Ok(())
 }
 
@@ -657,7 +797,7 @@ fn cmd_emit_v0(args: &[String]) -> Result<(), String> {
     fs::write(&json_path, json_str).map_err(|e| format!("write json: {}", e))?;
     fs::write(&md_path, md).map_err(|e| format!("write md: {}", e))?;
 
-    println!("Emitted compute_image_v0.json and .md to {}", output_dir);
+    tribunus_compute_core::log_info!("Emitted compute_image_v0.json and .md to {}", output_dir);
     Ok(())
 }
 
@@ -680,7 +820,7 @@ fn cmd_verify_v0(args: &[String]) -> Result<(), String> {
 
     match tribunus_compute_core::compute_image_v0::verifier::verify_v0_image(&image, options) {
         Ok(_) => {
-            println!("ComputeImageV0 validation passed.");
+            tribunus_compute_core::log_info!("ComputeImageV0 validation passed.");
             Ok(())
         }
         Err(errors) => Err(format!(

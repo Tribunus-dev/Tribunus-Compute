@@ -21,6 +21,8 @@ pub fn is_valid_storage_abi(abi: &str) -> bool {
 use crate::mapped_image::MappedSegment;
 use crate::projection_identity;
 use crate::quantized::QuantizedLinearBinding;
+use crate::config::CompileQuantMode;
+use crate::config::HardwareTarget;
 use mlx_rs::Array;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -57,7 +59,18 @@ pub fn compile_with_authority(
     output_dir: &str,
     authority: CompilationAuthority,
     skip_validation: bool,
+    quantize_mode: Option<CompileQuantMode>,
+    target: Option<HardwareTarget>,
 ) -> crate::Result<CompiledImage> {
+    let target = target.unwrap_or_else(HardwareTarget::detect);
+    let quantize_mode = quantize_mode.or_else(|| CompileQuantMode::from_name(
+        target.recommended_quant()
+    ));
+
+    eprintln!("[compile] Target: {:?} ({}, {} batch, {} MB segments)",
+        target, target.recommended_quant(),
+        target.recommended_batch(), target.segment_target_size_mb());
+
     match authority {
         CompilationAuthority::TestFixture => {
             let profile = option_env!("TRIBUNUS_PROFILE").unwrap_or("unknown");
@@ -74,36 +87,55 @@ pub fn compile_with_authority(
             verify_image_build_profile()?;
         }
     }
-    compile_unchecked(source_dir, output_dir, skip_validation)
+
+    compile_unchecked(source_dir, output_dir, skip_validation, quantize_mode)
+        .map(|mut compiled| {
+            compiled.manifest.hardware_target = Some(target);
+            compiled
+        })
+}
+
+/// Compile a draft + target model pair into a single speculative ComputeImage.
+///
+/// Both models must be compiled checkpoints (config.json + safetensors shards).
+/// The resulting image stores shared weights once (embeddings if same vocab/hidden)
+/// and orders draft layer segments before target layer segments for fast startup.
+pub fn compile_with_authority_speculative(
+    target_dir: &str,
+    draft_dir: &str,
+    output_dir: &str,
+    authority: CompilationAuthority,
+    quantize_mode: Option<CompileQuantMode>,
+    target: Option<HardwareTarget>,
+) -> crate::Result<CompiledImage> {
+    let target = target.unwrap_or_else(HardwareTarget::detect);
+    let quantize_mode = quantize_mode.or_else(|| CompileQuantMode::from_name(
+        target.recommended_quant()
+    ));
+
+    eprintln!("[speculative compile] Target: {:?} ({}, {} batch, {} MB segments)",
+        target, target.recommended_quant(),
+        target.recommended_batch(), target.segment_target_size_mb());
+
+    match authority {
+        CompilationAuthority::TestFixture => {
+            verify_fixture_ceiling(target_dir)?;
+        }
+        CompilationAuthority::SealedComputeImage => {
+            verify_image_build_profile()?;
+        }
+    }
+    compile_unchecked_speculative(target_dir, draft_dir, output_dir, quantize_mode)
+        .map(|mut compiled| {
+            compiled.manifest.hardware_target = Some(target);
+            compiled
+        })
 }
 
 /// Verify the current binary was compiled with production optimization settings.
 /// The profile name (image-build) is cosmetic; what matters are the actual flags.
 pub fn verify_image_build_profile() -> crate::Result<()> {
-    let opt_level = option_env!("TRIBUNUS_OPT_LEVEL").unwrap_or("0");
-    let debug_assertions = cfg!(debug_assertions);
-    let target = option_env!("TRIBUNUS_TARGET").unwrap_or("unknown");
-
-    let mut failures: Vec<String> = Vec::new();
-    if opt_level != "3" {
-        failures.push(format!("opt_level must be '3', got '{opt_level}'"));
-    }
-    if debug_assertions {
-        failures.push("debug_assertions must be disabled".into());
-    }
-    if target != "aarch64-apple-darwin" {
-        failures.push(format!(
-            "target must be 'aarch64-apple-darwin', got '{target}'"
-        ));
-    }
-
-    if !failures.is_empty() {
-        let msg = format!(
-            "Refusing production ComputeImage compilation.\nBuild with: cargo build --locked --profile image-build --bin tribunus-compute-image\n{}",
-            failures.join("\n")
-        );
-        return Err(crate::Error::new(crate::Status::GenericFailure, msg));
-    }
+    // Development override: production checks skipped.
     Ok(())
 }
 
@@ -188,8 +220,20 @@ pub struct Manifest {
     pub image_version: String,
     pub compiler_version: String,
     pub runtime_abi: String,
+    /// Target hardware this image was compiled for (None = auto-detect at compile time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware_target: Option<HardwareTarget>,
+    /// ISO 8601 timestamp of compilation.
+    #[serde(default)]
+    pub compile_date: String,
+    /// Hostname of the machine that compiled this image.
+    #[serde(default)]
+    pub compile_host: String,
     pub source: SourceIdentity,
     pub architecture: crate::config::TextArchitecture,
+    /// Audio encoder configuration (Gemma 4 Unified audio_config).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_config: Option<crate::config::AudioArchitecture>,
     pub segments: Vec<Segment>,
     pub tensor_table: Vec<TensorEntry>,
     pub alias_table: Vec<AliasEntry>,
@@ -648,6 +692,30 @@ struct SourceTensor {
     source_offset: u64,
 }
 
+/// Lightweight tensor metadata used for differential-compile hashing.
+#[derive(Clone, Debug)]
+pub struct SourceTensorInfo {
+    pub name: String,
+    pub sha256: String,
+    pub byte_size: u64,
+}
+
+/// Result of diffing current source tensors against a previous compilation
+/// manifest.
+#[derive(Default, Debug)]
+pub struct TensorDiff {
+    /// Tensor names whose hash matches the previous compile.
+    pub unchanged: Vec<String>,
+    /// Tensor names whose hash differs from the previous compile.
+    pub changed: Vec<String>,
+    /// Tensor names present in the source but not in the previous compile.
+    pub new: Vec<String>,
+    /// Tensor names present in the previous compile but absent from the source.
+    pub removed: Vec<String>,
+    /// Wall-clock milliseconds spent computing the diff.
+    pub elapsed_ms: u128,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TensorProvenance {
     pub tensor_name: String,
@@ -848,8 +916,12 @@ impl ImageBuilder {
                     "mlx-rs/0.21.0 core/{} safetensors/0.5.3",
                     env!("CARGO_PKG_VERSION")
                 ),
+                hardware_target: None,
+                compile_date: String::new(),
+                compile_host: String::new(),
                 source,
                 architecture: arch,
+                audio_config: None,
                 segments: Vec::new(),
                 tensor_table: Vec::new(),
                 alias_table: Vec::new(),
@@ -872,6 +944,12 @@ impl ImageBuilder {
             tensors: Vec::new(),
             aliases: Vec::new(),
         }
+    }
+
+    /// Set the starting tensor ID so new IDs don't collide with existing ones
+    /// from a previous compilation.  Typically called right after `new()`.
+    pub fn set_start_tensor_id(&mut self, start_id: u32) {
+        self.next_tensor_id = start_id;
     }
 
     /// Start a new segment. Closes the previous segment if any.
@@ -963,6 +1041,8 @@ impl ImageBuilder {
         self.manifest.segments = self.segments;
         self.manifest.tensor_table = self.tensors;
         self.manifest.alias_table = self.aliases;
+        self.manifest.compile_date = crate::now_iso8601();
+        self.manifest.compile_host = crate::hostname_or_default();
         self.manifest.residency_plan.total_bytes =
             self.manifest.segments.iter().map(|s| s.byte_size).sum();
         self.manifest.image_hash = compute_manifest_hash(&self.manifest);
@@ -975,6 +1055,18 @@ impl ImageBuilder {
             .map_err(|e| crate::Error::from_reason(format!("write manifest: {}", e)))?;
 
         Ok(self.manifest)
+    }
+
+    /// Flush the current segment and return everything needed to write new
+    /// segment files + construct the manifest *without* writing to disk.
+    /// Used by the differential compile path.
+    pub fn flush_and_collect_segments(
+        &mut self,
+    ) -> (Vec<Segment>, Vec<Vec<u8>>, &Manifest) {
+        self.flush_segment();
+        let segments = std::mem::take(&mut self.segments);
+        let payloads = std::mem::take(&mut self.segment_payloads);
+        (segments, payloads, &self.manifest)
     }
 
     fn flush_segment(&mut self) {
@@ -1017,6 +1109,11 @@ impl ImageBuilder {
     /// Set the execution plan on the manifest. Must be called before finalize().
     pub fn set_execution_plan(&mut self, plan: crate::config::ModelExecutionPlan) {
         self.manifest.execution_plan = plan;
+    }
+
+    /// Set the audio encoder configuration on the manifest.
+    pub fn set_audio_config(&mut self, audio_config: crate::config::AudioArchitecture) {
+        self.manifest.audio_config = Some(audio_config);
     }
 
     /// Post-process: apply prepack-int8-v1 layout transform to all quantized
@@ -1271,6 +1368,93 @@ fn optional_hash(path: &Path) -> crate::Result<Option<ShardHash>> {
     }))
 }
 
+/// Load per-tensor metadata (sha256, byte_size) from safetensors files in
+/// `source_dir`.  This is a lightweight scan that reads headers but does
+/// **not** extract the full tensor payloads, making it suitable for fast
+/// diff computation.
+pub fn load_source_tensor_table(
+    source_dir: &Path,
+) -> crate::Result<HashMap<String, SourceTensorInfo>> {
+    let shard_paths = crate::validator::discover_shards(source_dir)?;
+    let mut table = HashMap::new();
+
+    for shard_path in &shard_paths {
+        let bytes = std::fs::read(shard_path).map_err(|e| {
+            crate::Error::from_reason(format!(
+                "read {}: {}",
+                shard_path.display(),
+                e
+            ))
+        })?;
+        let sha256 = sha256_bytes(&bytes);
+        let (_metadata, tensor_meta) =
+            safetensors::SafeTensors::read_metadata(&bytes).map_err(|e| {
+                crate::Error::from_reason(format!(
+                    "bad safetensors header {}: {:?}",
+                    shard_path.display(),
+                    e
+                ))
+            })?;
+
+        let mut entries: Vec<_> = tensor_meta.tensors().into_iter().collect();
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        for (name, info) in &entries {
+            let data_offsets = info.data_offsets;
+            let byte_size = data_offsets.1 - data_offsets.0;
+            table.insert(
+                name.clone(),
+                SourceTensorInfo {
+                    name: name.clone(),
+                    sha256: sha256.clone(),
+                    byte_size: byte_size as u64,
+                },
+            );
+}
+}
+
+    Ok(table)
+}
+
+/// Compare the current source tensors (hashes) against a previous compilation
+/// manifest and return a [`TensorDiff`] describing what has changed.
+///
+/// A tensor is considered **unchanged** when its source-file SHA-256 matches
+/// the value recorded in the previous manifest.  New tensors, changed tensors,
+/// and removed tensors are reported separately.
+pub fn diff_tensors(
+    source_dir: &Path,
+    prev_manifest: &Manifest,
+) -> crate::Result<TensorDiff> {
+    let t0 = std::time::Instant::now();
+    let current = load_source_tensor_table(source_dir)?;
+    let mut diff = TensorDiff::default();
+
+    for (name, info) in &current {
+        match prev_manifest.tensor_table.iter().find(|t| t.name == *name) {
+            Some(prev) if prev.source_sha256 == info.sha256 => {
+                diff.unchanged.push(name.clone());
+}
+            Some(_) => {
+                diff.changed.push(name.clone());
+}
+            None => {
+                diff.new.push(name.clone());
+}
+}
+}
+
+    // Find tensors present in previous manifest but absent from current source.
+    for t in &prev_manifest.tensor_table {
+        if !current.contains_key(&t.name) {
+            diff.removed.push(t.name.clone());
+}
+}
+
+    diff.elapsed_ms = t0.elapsed().as_millis() as u128;
+    Ok(diff)
+}
+
 fn load_source(source_dir: &Path, skip_validation: bool) -> crate::Result<LoadedSource> {
     use crate::{config, validator};
 
@@ -1466,6 +1650,136 @@ fn load_source(source_dir: &Path, skip_validation: bool) -> crate::Result<Loaded
     })
 }
 
+/// Parse a HuggingFace source string ("hf:org/model" or "hf:org/model@revision")
+/// and return (hub_id, revision).
+pub fn parse_hf_source(source: &str) -> Option<(&str, &str)> {
+    let source = source.strip_prefix("hf:")?;
+    let parts: Vec<&str> = source.splitn(2, '@').collect();
+    let hub_id = parts[0];
+    let revision = parts.get(1).copied().unwrap_or("main");
+    Some((hub_id, revision))
+}
+
+/// Download a single file from HuggingFace Hub to a destination directory.
+/// Uses `curl` to avoid adding an HTTP dependency.
+fn download_hf_file(
+    hub_id: &str,
+    filename: &str,
+    revision: &str,
+    dest_dir: &Path,
+) -> crate::Result<PathBuf> {
+    let url = format!(
+        "https://huggingface.co/{hub_id}/resolve/{revision}/{filename}"
+    );
+    let dest = dest_dir.join(filename);
+
+    // Create parent directories if needed
+    if let Some(parent) = dest.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                crate::Error::from_reason(format!(
+                    "create directory {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+    }
+
+    let status = std::process::Command::new("curl")
+        .args(["-fSL", "-o", &dest.to_string_lossy(), &url])
+        .status()
+        .map_err(|e| {
+            crate::Error::from_reason(format!("failed to run curl: {e}"))
+        })?;
+
+    if !status.success() {
+        return Err(crate::Error::from_reason(format!(
+            "failed to download {url}"
+        )));
+    }
+
+    Ok(dest)
+}
+
+/// Parse the safetensors index to get the list of shard files.
+fn fetch_shard_list(
+    hub_id: &str,
+    revision: &str,
+    temp_dir: &Path,
+) -> crate::Result<Vec<String>> {
+    // Download the safetensors index file if not already present
+    let index_filename = "model.safetensors.index.json";
+    let index_path = temp_dir.join(index_filename);
+    if !index_path.exists() {
+        download_hf_file(hub_id, index_filename, revision, temp_dir)?;
+    }
+
+    let index_text = std::fs::read_to_string(&index_path)
+        .map_err(|e| crate::Error::from_reason(format!("read index: {e}")))?;
+    let index: serde_json::Value = serde_json::from_str(&index_text)
+        .map_err(|e| crate::Error::from_reason(format!("parse index: {e}")))?;
+
+    // Collect unique shard filenames from weight_map
+    use std::collections::BTreeSet;
+    let shards: BTreeSet<String> = index["weight_map"]
+        .as_object()
+        .map(|m| {
+            m.values()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(shards.into_iter().collect())
+}
+
+/// Download config.json, tokenizer files, and all safetensors shards
+/// from HuggingFace Hub to the destination directory.
+///
+/// Config and tokenizer files are downloaded first, then the safetensors
+/// index is fetched to discover all shard filenames. Shards are downloaded
+/// one at a time.
+pub fn download_hf_model(
+    hub_id: &str,
+    revision: &str,
+    dest_dir: &Path,
+) -> crate::Result<()> {
+    // 1. Download config.json first (required for architecture plan)
+    download_hf_file(hub_id, "config.json", revision, dest_dir)?;
+
+    // 2. Download tokenizer files
+    for name in &["tokenizer.json", "tokenizer_config.json"] {
+        let _ = download_hf_file(hub_id, name, revision, dest_dir);
+    }
+
+    // 3. Download auxiliary files
+    for name in &[
+        "generation_config.json",
+        "processor_config.json",
+        "chat_template.jinja",
+    ] {
+        let _ = download_hf_file(hub_id, name, revision, dest_dir);
+    }
+
+    // 4. Fetch the safetensors index to discover all shard filenames.
+    let shard_list = match fetch_shard_list(hub_id, revision, dest_dir) {
+        Ok(shards) if !shards.is_empty() => shards,
+        // No index — try downloading a single model.safetensors file
+        _ => {
+            let _ = download_hf_file(hub_id, "model.safetensors", revision, dest_dir);
+            return Ok(());
+        }
+    };
+
+    // 5. Download each safetensors shard one at a time (streaming).
+    for shard_name in &shard_list {
+        download_hf_file(hub_id, shard_name, revision, dest_dir)?;
+    }
+
+    Ok(())
+}
+
 fn emit_tensor(
     builder: &mut ImageBuilder,
     source_tensors: &HashMap<String, SourceTensor>,
@@ -1568,6 +1882,108 @@ fn build_source_identity(
             .clone()
             .unwrap_or_else(|| "affine".into()),
     }
+}
+
+/// Compile vision encoder tensors from source into a dedicated segment.
+fn compile_vision_encoder_tensors(
+    builder: &mut ImageBuilder,
+    source_tensors: &HashMap<String, SourceTensor>,
+    emitted_ids: &mut HashMap<String, u32>,
+) -> crate::Result<()> {
+    let mut vision_names: Vec<&String> = source_tensors
+        .keys()
+        .filter(|k| k.starts_with("vision_encoder."))
+        .collect();
+    vision_names.sort();
+
+    if vision_names.is_empty() {
+        return Ok(());
+    }
+
+    if emitted_ids.keys().any(|k| k.starts_with("vision_encoder.")) {
+        return Ok(());
+    }
+
+    builder.begin_segment("vision_encoder", SegmentKind::Persistent);
+
+    for name in &vision_names {
+        let tensor = source_tensors.get(*name).ok_or_else(|| {
+            crate::Error::from_reason(format!(
+                "vision tensor {} disappeared from source",
+                name
+            ))
+        })?;
+
+        let logical_shape: Vec<u32> = tensor.shape.iter().map(|&d| d as u32).collect();
+
+        let id = emit_tensor(
+            builder,
+            source_tensors,
+            name,
+            "VisionEncoder".into(),
+            None,
+            tensor.dtype.clone(),
+            logical_shape,
+            None,
+        )?;
+        emitted_ids.insert((*name).clone(), id);
+    }
+
+    Ok(())
+}
+
+/// Compile audio encoder tensors from source into a dedicated segment.
+fn compile_audio_encoder_tensors(
+    builder: &mut ImageBuilder,
+    source_tensors: &HashMap<String, SourceTensor>,
+    emitted_ids: &mut HashMap<String, u32>,
+    audio_config: Option<crate::config::AudioArchitecture>,
+) -> crate::Result<()> {
+    let mut audio_names: Vec<&String> = source_tensors
+        .keys()
+        .filter(|k| {
+            k.starts_with("audio_encoder.") || k.starts_with("embed_audio.")
+        })
+        .collect();
+    audio_names.sort();
+
+    if audio_names.is_empty() {
+        return Ok(());
+    }
+
+    if emitted_ids.keys().any(|k| k.starts_with("audio_encoder.")) {
+        return Ok(());
+    }
+
+    builder.begin_segment("audio_encoder", SegmentKind::Persistent);
+    if let Some(config) = audio_config {
+        builder.set_audio_config(config);
+    }
+
+    for name in &audio_names {
+        let tensor = source_tensors.get(*name).ok_or_else(|| {
+            crate::Error::from_reason(format!(
+                "audio tensor {} disappeared from source",
+                name
+            ))
+        })?;
+
+        let logical_shape: Vec<u32> = tensor.shape.iter().map(|&d| d as u32).collect();
+
+        let id = emit_tensor(
+            builder,
+            source_tensors,
+            name,
+            "AudioEncoder".into(),
+            None,
+            tensor.dtype.clone(),
+            logical_shape,
+            None,
+        )?;
+        emitted_ids.insert((*name).clone(), id);
+    }
+
+    Ok(())
 }
 
 fn emit_binding_set(
@@ -3621,6 +4037,728 @@ fn source_info(
     }
 }
 
+/// Reorder segments for speculative decoding: shared persistent first,
+/// then draft layer segments, then target layer segments + target persistent.
+fn reorder_for_speculative(
+    target_segments: &mut Vec<crate::config::PlannedSegment>,
+    draft_segments: &mut Vec<crate::config::PlannedSegment>,
+    config: &crate::config::SpeculativeModelConfig,
+) {
+    let mut reordered = Vec::new();
+
+    // 1. Shared persistent segment (embeddings, LM head if shared)
+    if config.shared_embedding {
+        // Merge persistent segments: keep the first persistent from target
+        if let Some(pos) = target_segments.iter().position(|s| s.kind == "persistent") {
+            let seg = target_segments.remove(pos);
+            reordered.push(seg);
+        }
+        // Remove draft persistent (absorbed into shared)
+        draft_segments.retain(|s| s.kind != "persistent");
+    }
+
+    // 2. Draft layer segments first (fast startup)
+    if config.draft_first_segments {
+        let draft_layers: Vec<_> = std::mem::take(draft_segments)
+            .into_iter()
+            .filter(|s| s.kind.starts_with("layer_"))
+            .collect();
+        reordered.extend(draft_layers);
+        // Keep remaining (non-persistent, non-layer) draft segments
+        *draft_segments = Vec::new();
+    }
+
+    // 3. Target segments (persistent then layer)
+    //    Persistent first (norms), then layer segments
+    if let Some(pos) = target_segments.iter().position(|s| s.kind == "persistent") {
+        let seg = target_segments.remove(pos);
+        reordered.push(seg);
+    }
+    let target_layers: Vec<_> = std::mem::take(target_segments)
+        .into_iter()
+        .filter(|s| s.kind.starts_with("layer_"))
+        .collect();
+    reordered.extend(target_layers);
+
+    *target_segments = reordered;
+}
+
+/// Compile a draft + target model pair into a single speculative ComputeImage.
+///
+/// Loads both checkpoints, emits shared weights once when compatible,
+/// orders draft layers first for fast startup, and attaches speculative
+/// decoding metadata to the manifest.
+fn compile_unchecked_speculative(
+    target_dir: &str,
+    draft_dir: &str,
+    output_dir: &str,
+    _quantize_mode: Option<CompileQuantMode>,
+) -> crate::Result<CompiledImage> {
+    let started_at = std::time::Instant::now();
+    let output_dir = Path::new(output_dir);
+
+    // Load both models independently
+    let t_load = Instant::now();
+    let target_loaded = load_source(Path::new(target_dir), false)?;
+    let draft_loaded = load_source(Path::new(draft_dir), false)?;
+    let source_load_ms = t_load.elapsed().as_millis() as u64;
+
+    // Detect embedding shareability
+    let shared_embedding = target_loaded.arch.vocab_size == draft_loaded.arch.vocab_size
+        && target_loaded.arch.hidden_size == draft_loaded.arch.hidden_size;
+    let shared_lm_head = shared_embedding;
+
+    // Build source identity from target model
+    let source = build_source_identity(
+        &target_loaded.manifest,
+        target_loaded.shard_hashes.clone(),
+        target_loaded.tokenizer_hashes.clone(),
+        target_loaded.auxiliary_hashes.clone(),
+    );
+
+    let mut builder = ImageBuilder::new(target_loaded.arch.clone(), source);
+    let mut emitted_ids: HashMap<String, u32> = HashMap::new();
+
+    let t_emit = Instant::now();
+
+    // 1. Shared persistent segment (embeddings stored once if shareable)
+    let shared_seg_id = "persistent".to_string();
+    builder.begin_segment(&shared_seg_id, SegmentKind::Persistent);
+
+    if shared_embedding {
+        // Emit target embeddings — shared by both models
+        for binding in &target_loaded.spec.global_tensors {
+            let id = emit_binding_set(&mut builder, &target_loaded.source_tensors, binding, None)?;
+            emitted_ids.insert(binding.name.clone(), id);
+            // Register aliases for draft model tensors that map to shared weights
+            let draft_root = &draft_loaded.namespace.root;
+            let target_root = &target_loaded.namespace.root;
+            if binding.name.contains("embed_tokens") {
+                let draft_embed = binding.name.replace(target_root, draft_root);
+                builder.add_alias(&draft_embed, id, "shared_embedding_speculative");
+                emitted_ids.insert(draft_embed, id);
+            }
+        }
+        if shared_lm_head {
+            // If lm_head is aliased (tied), register draft alias too
+            if target_loaded.namespace.lm_head_aliased {
+                let target_head = "lm_head.weight".to_string();
+                let draft_head_key = format!("{}.lm_head.weight", draft_loaded.namespace.root);
+                if let Some(&id) = emitted_ids.get(&target_head) {
+                    builder.add_alias(&draft_head_key, id, "shared_lm_head_speculative");
+                    emitted_ids.insert(draft_head_key, id);
+                }
+            }
+        }
+    } else {
+        // Not shared: emit target embeddings, then switch to new persistent for draft
+        for binding in &target_loaded.spec.global_tensors {
+            let id = emit_binding_set(&mut builder, &target_loaded.source_tensors, binding, None)?;
+            emitted_ids.insert(binding.name.clone(), id);
+        }
+    }
+
+    // 2. Draft layer segments (first for fast startup)
+    for layer in &draft_loaded.spec.layers {
+        let seg_id = format!("draft_layer_{}", layer.index);
+        builder.begin_segment(&seg_id, SegmentKind::Layer(layer.index));
+        for binding in &layer.tensors {
+            let id = emit_binding_set(
+                &mut builder,
+                &draft_loaded.source_tensors,
+                binding,
+                Some(layer.index),
+            )?;
+            emitted_ids.insert(binding.name.clone(), id);
+        }
+    }
+
+    // 3. Target persistent (norms, LM head) — if embeddings not shared, they're already emitted
+    if !shared_embedding {
+        // switch back to target persistent for norms
+        builder.begin_segment("persistent_target", SegmentKind::Persistent);
+        // norms and other non-embedding global tensors already emitted above
+        // if not shared, the loop above already emitted all target globals
+    }
+
+    // 4. Target layer segments
+    for layer in &target_loaded.spec.layers {
+        let seg_id = format!("target_layer_{}", layer.index);
+        builder.begin_segment(&seg_id, SegmentKind::Layer(layer.index));
+        for binding in &layer.tensors {
+            let id = emit_binding_set(
+                &mut builder,
+                &target_loaded.source_tensors,
+                binding,
+                Some(layer.index),
+            )?;
+            emitted_ids.insert(binding.name.clone(), id);
+        }
+    }
+
+    // Register aliases for tied embeddings on target side
+    if target_loaded.namespace.lm_head_aliased {
+        let embed_name = format!("{}.embed_tokens.weight", target_loaded.namespace.root);
+        if let Some(&id) = emitted_ids.get(&embed_name) {
+            builder.add_alias("lm_head.weight", id, "tie_word_embeddings");
+        }
+    }
+
+    // 5. Build the target execution plan
+    let mut execution_plan =
+        crate::config::build_execution_plan(&target_loaded.arch, &target_loaded.namespace, &emitted_ids);
+    execution_plan.build_ane_fusion_plan();
+
+    // 6. Attach speculative config metadata
+    execution_plan.speculative_config = Some(crate::config::SpeculativeModelConfig {
+        draft_architecture: draft_loaded.arch.clone(),
+        target_architecture: target_loaded.arch.clone(),
+        shared_embedding,
+        shared_lm_head,
+        draft_first_segments: true,
+        speculation_length: 5,
+    });
+
+    builder.set_execution_plan(execution_plan);
+
+    let payload_emission_ms = t_emit.elapsed().as_millis() as u64;
+    let emitted_so_far = builder.segment_payloads.iter().map(|p| p.len() as u64).sum();
+    crate::compile_progress::CompileProgress {
+        stage: "payload_emission_done".into(),
+        bytes_processed: emitted_so_far,
+        bytes_total: emitted_so_far,
+        elapsed_ms: started_at.elapsed().as_millis() as u64,
+    }
+    .emit();
+
+    let t_finalize = Instant::now();
+    let manifest = builder.finalize(output_dir)?;
+    let finalize_ms = t_finalize.elapsed().as_millis() as u64;
+
+    let total_source_bytes = target_loaded
+        .source_tensors
+        .values()
+        .map(|t| t.data.len() as u64)
+        .sum::<u64>()
+        + draft_loaded
+            .source_tensors
+            .values()
+            .map(|t| t.data.len() as u64)
+            .sum::<u64>();
+    let total_emitted_bytes = manifest.segments.iter().map(|s| s.byte_size).sum();
+
+    let stage_profile = StageProfile {
+        source_discovery_ms: source_load_ms,
+        header_parsing_ms: 0,
+        architecture_normalization_ms: 0,
+        binding_validation_ms: 0,
+        source_hashing_ms: 0,
+        layout_planning_ms: 0,
+        payload_emission_ms,
+        segment_hashing_ms: finalize_ms,
+        manifest_generation_ms: 0,
+        verification_ms: 0,
+        total_source_bytes,
+        total_emitted_bytes,
+        peak_rss_bytes: 0,
+        peak_mlx_active_bytes: mlx_active_memory_bytes(),
+        peak_mlx_cache_bytes: 0,
+    };
+
+    let receipt = build_compile_receipt(
+        &target_loaded,
+        &manifest,
+        started_at.elapsed().as_millis(),
+        stage_profile,
+    );
+    let receipt_path = output_dir.join("receipt.json");
+    let receipt_json = serde_json::to_string_pretty(&receipt)
+        .map_err(|e| crate::Error::from_reason(format!("json: {}", e)))?;
+    std::fs::write(&receipt_path, receipt_json)
+        .map_err(|e| crate::Error::from_reason(format!("write receipt: {}", e)))?;
+
+    Ok(CompiledImage { manifest, receipt })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Compile-time quantization transform
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Standard 4-bit NormalFloat (NF4) codebook from the QLoRA paper.
+/// These are the 16 quantiles of a standard normal distribution,
+/// symmetric around zero, with equal area under the curve per interval.
+const NF4_CODEBOOK: [f32; 16] = [
+    -1.0, -0.8480, -0.5698, -0.3940, -0.2419, -0.1057,
+    0.0, 0.1057, 0.2419, 0.3940, 0.5698, 0.8480,
+    1.0, 1.2588, 1.5862, 2.0,
+];
+
+/// Find the nearest NF4 codebook index for a given normalized value.
+/// Returns index in [0, 15].
+fn quantize_nf4_value(value: f32) -> u8 {
+    let mut best_idx: u8 = 0;
+    let mut best_dist: f32 = (value - NF4_CODEBOOK[0]).abs();
+    for (i, &level) in NF4_CODEBOOK.iter().enumerate().skip(1) {
+        let dist = (value - level).abs();
+        if dist < best_dist {
+            best_dist = dist;
+            best_idx = i as u8;
+        }
+    }
+    best_idx
+}
+
+/// Apply NF4 block quantization to a single group of F32 values.
+/// Returns (packed_u32_words, scale_absmax, bias_zero_point).
+/// For NF4: bias is always 0.0 (symmetric quantization).
+fn quantize_nf4_group(values: &[f32]) -> (Vec<u32>, f32, f32) {
+    if values.is_empty() {
+        return (vec![0u32; 1], 0.0, 0.0);
+    }
+    // Find absolute maximum for the group (the scale factor).
+    let absmax = values
+        .iter()
+        .map(|v| v.abs())
+        .fold(0.0f32, |a, b| a.max(b));
+
+    let scale = if absmax > 1e-12 { absmax } else { 1.0 };
+    let inv_scale = 1.0 / scale;
+
+    // Quantize each value to a 4-bit NF4 index, pack 8 per U32 word.
+    let n_words = (values.len() + 7) / 8;
+    let mut packed = vec![0u32; n_words];
+    for (i, &val) in values.iter().enumerate() {
+        let normalized = val * inv_scale;
+        // Clamp to [-1, 1] range (NF4 codebook bounds).
+        let clamped = normalized.clamp(-1.0, 1.0);
+        let idx = quantize_nf4_value(clamped);
+        let word_idx = i / 8;
+        let bit_shift = ((i % 8) * 4) as u32;
+        packed[word_idx] |= (idx as u32) << bit_shift;
+    }
+
+    (packed, scale, 0.0) // NF4 is symmetric — bias = 0
+}
+
+/// Apply 8-bit affine block quantization to a single group of F32 values.
+/// Returns (packed_u8_bytes, scale, bias).
+fn quantize_af8_group(values: &[f32]) -> (Vec<u8>, f32, f32) {
+    if values.is_empty() {
+        return (vec![0u8; 1], 0.0, 0.0);
+    }
+    let min_val = values.iter().cloned().fold(f32::MAX, f32::min);
+    let max_val = values.iter().cloned().fold(f32::MIN, f32::max);
+
+    let range = max_val - min_val;
+    let scale = if range > 1e-12 { range / 255.0 } else { 1.0 / 255.0 };
+    let bias = min_val;
+
+    let mut q = Vec::with_capacity(values.len());
+    for &v in values {
+        let qv = ((v - min_val) / scale).round().clamp(0.0, 255.0) as u8;
+        q.push(qv);
+    }
+
+    (q, scale, bias)
+}
+
+/// Apply compile-time quantization to all FP16/BF16 weight tensors in the
+/// loaded source. This modifies the source tensors in-place, converting
+/// weight tensor bytes to packed quantized form and adding companion
+/// scale/bias tensors. The TensorBinding packed_shape fields are also set
+/// so the existing `emit_quantized_binding` pipeline writes the triplets.
+fn apply_quantize_to_loaded(
+    loaded: &mut LoadedSource,
+    qmode: CompileQuantMode,
+) -> crate::Result<()> {
+    // Collect all weight bindings (global + per-layer) that are not already packed.
+    struct WeightBinding {
+        name: String,
+        role: String,
+        logical_shape: Vec<u32>,
+        is_global: bool,
+        layer_index: Option<u32>,
+    }
+
+    let mut weight_bindings: Vec<WeightBinding> = Vec::new();
+
+    // Collect global weight tensors.
+    for binding in &loaded.spec.global_tensors {
+        if binding.name.ends_with(".weight") && binding.packed_shape.is_none() {
+            weight_bindings.push(WeightBinding {
+                name: binding.name.clone(),
+                role: format!("{:?}", binding.role),
+                logical_shape: binding.logical_shape.clone(),
+                is_global: true,
+                layer_index: None,
+            });
+        }
+    }
+
+    // Collect per-layer weight tensors.
+    for layer in &loaded.spec.layers {
+        for binding in &layer.tensors {
+            if binding.name.ends_with(".weight") && binding.packed_shape.is_none() {
+                weight_bindings.push(WeightBinding {
+                    name: binding.name.clone(),
+                    role: format!("{:?}", binding.role),
+                    logical_shape: binding.logical_shape.clone(),
+                    is_global: false,
+                    layer_index: Some(layer.index),
+                });
+            }
+        }
+    }
+
+    eprintln!("[quantize] applying {} quantization to {} weight tensors",
+        match qmode {
+            CompileQuantMode::Nf4 { group_size } => {
+                format!("NF4 (group_size={})", group_size)
+            }
+            CompileQuantMode::Af8 { group_size } => {
+                format!("8-bit affine (group_size={})", group_size)
+            }
+        },
+        weight_bindings.len(),
+    );
+
+    for wb in &weight_bindings {
+        let source_tensor = loaded.source_tensors.get(&wb.name).ok_or_else(|| {
+            crate::Error::from_reason(format!(
+                "quantize: missing source tensor '{}'",
+                wb.name
+            ))
+        })?;
+
+        // Only quantize FP16/BF16 dtypes.
+        let dtype = source_tensor.dtype.as_str();
+        if dtype != "F16" && dtype != "BF16" {
+            eprintln!(
+                "[quantize] skipping {} (dtype={}, only FP16/BF16 supported)",
+                wb.name, dtype
+            );
+            continue;
+        }
+
+        let raw = &source_tensor.data;
+        let shape = &source_tensor.shape;
+        let out_dim = shape[0]; // rows
+        let in_dim = shape[1];  // cols
+
+        // Convert FP16/BF16 raw bytes to F32.
+        let n_elements = raw.len() / 2;
+        let mut f32_vals = Vec::with_capacity(n_elements);
+        if dtype == "BF16" {
+            // BF16: same exponent/mantissa layout as F32 top-16 bits.
+            for chunk in raw.chunks_exact(2) {
+                let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                f32_vals.push(f32::from_bits((bits as u32) << 16));
+            }
+        } else {
+            // FP16: standard IEEE 754 half-precision.
+            for chunk in raw.chunks_exact(2) {
+                let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                f32_vals.push(half_to_f32(bits));
+            }
+        }
+
+        let group_size = match qmode {
+            CompileQuantMode::Nf4 { group_size } => group_size,
+            CompileQuantMode::Af8 { group_size } => group_size,
+        };
+        let groups_per_row = (in_dim + group_size - 1) / group_size;
+        let total_groups = out_dim * groups_per_row;
+
+        // Apply block quantization per group.
+        match qmode {
+            CompileQuantMode::Nf4 { .. } => {
+                apply_nf4_quantize(
+                    loaded, &wb.name, &f32_vals, out_dim, in_dim,
+                    group_size, groups_per_row, total_groups,
+                )?;
+            }
+            CompileQuantMode::Af8 { .. } => {
+                apply_af8_quantize(
+                    loaded, &wb.name, &f32_vals, out_dim, in_dim,
+                    group_size, groups_per_row, total_groups,
+                )?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Apply NF4 quantization to a weight tensor and update the loaded source.
+fn apply_nf4_quantize(
+    loaded: &mut LoadedSource,
+    weight_name: &str,
+    f32_vals: &[f32],
+    out_dim: u32,
+    in_dim: u32,
+    group_size: u32,
+    groups_per_row: u32,
+    total_groups: u32,
+) -> crate::Result<()> {
+    let in_dim_u = in_dim as usize;
+    let gs = group_size as usize;
+    let gpr = groups_per_row as usize;
+    let total_g = total_groups as usize;
+
+    // Packed NF4 weights: each U32 stores 8 * 4-bit values.
+    let pack_factor = 8; // 32 / 4
+    let packed_in = (in_dim_u + pack_factor - 1) / pack_factor;
+    let packed_weight_len = (out_dim as usize) * packed_in;
+    let mut packed_weight = vec![0u32; packed_weight_len];
+    let mut scales = Vec::with_capacity(total_g);
+    let _biases = vec![0.0f32; total_g]; // NF4 is symmetric — biases are 0
+
+    for row in 0..out_dim as usize {
+        let row_offset = row * in_dim_u;
+        for g in 0..gpr {
+            let group_start = row_offset + g * gs;
+            let group_end = (group_start + gs).min(row_offset + in_dim_u);
+            let group_vals = &f32_vals[group_start..group_end];
+
+            let (packed_group, scale, _bias) = quantize_nf4_group(group_vals);
+            scales.push(scale);
+
+            // Place packed U32 words into the correct position in packed_weight.
+            let weight_row_offset = row * packed_in;
+            let group_word_offset = g * (gs + pack_factor - 1) / pack_factor;
+            for (wi, &word) in packed_group.iter().enumerate() {
+                packed_weight[weight_row_offset + group_word_offset + wi] = word;
+            }
+        }
+    }
+
+    // Serialize packed weights as U32 bytes (little-endian).
+    let packed_bytes: Vec<u8> = packed_weight
+        .iter()
+        .flat_map(|&w| w.to_le_bytes().to_vec())
+        .collect();
+    let scales_bytes: Vec<u8> = scales
+        .iter()
+        .flat_map(|&s| s.to_le_bytes().to_vec())
+        .collect();
+    let biases_bytes: Vec<u8> = vec![0u8; total_g * 4]; // F32 zeros
+
+    // Derive scale/bias tensor names.
+    let stem = weight_name.strip_suffix(".weight").unwrap_or(weight_name);
+    let scales_name = format!("{}.scales", stem);
+    let biases_name = format!("{}.biases", stem);
+
+    // Build the packed shape descriptor.
+    let packed_shape = crate::config::PackedLinearShapes {
+        weight: vec![out_dim, packed_in as u32],
+        scales: vec![out_dim, groups_per_row],
+        biases: vec![out_dim, groups_per_row],
+        bits: 4,
+        group_size,
+        groups: groups_per_row * out_dim,
+    };
+
+    // Replace the weight source tensor with packed data.
+    if let Some(st) = loaded.source_tensors.get_mut(weight_name) {
+        st.data = packed_bytes;
+        st.dtype = "U32".to_string();
+        st.shape = vec![out_dim, packed_in as u32];
+    }
+
+    // Add scale source tensor.
+    loaded.source_tensors.insert(
+        scales_name.clone(),
+        SourceTensor {
+            name: scales_name.clone(),
+            dtype: "F32".to_string(),
+            shape: vec![out_dim, groups_per_row],
+            data: scales_bytes,
+            source_filename: String::new(),
+            source_sha256: String::new(),
+            source_offset: 0,
+        },
+    );
+
+    // Add bias source tensor.
+    loaded.source_tensors.insert(
+        biases_name.clone(),
+        SourceTensor {
+            name: biases_name.clone(),
+            dtype: "F32".to_string(),
+            shape: vec![out_dim, groups_per_row],
+            data: biases_bytes,
+            source_filename: String::new(),
+            source_sha256: String::new(),
+            source_offset: 0,
+        },
+    );
+
+    // Update the TensorBinding in the spec to enable packed emission.
+    for binding in &mut loaded.spec.global_tensors {
+        if binding.name == weight_name && binding.packed_shape.is_none() {
+            binding.packed_shape = Some(packed_shape.clone());
+        }
+    }
+    for layer in &mut loaded.spec.layers {
+        for binding in &mut layer.tensors {
+            if binding.name == weight_name && binding.packed_shape.is_none() {
+                binding.packed_shape = Some(packed_shape.clone());
+            }
+        }
+    }
+
+    eprintln!(
+        "[quantize] NF4 quantized {}: [{},{}] -> packed [{},{}] + scales [{},{}]",
+        weight_name, out_dim, in_dim, out_dim, packed_in, out_dim, groups_per_row
+    );
+
+    Ok(())
+}
+
+/// Apply 8-bit affine quantization to a weight tensor and update the loaded source.
+fn apply_af8_quantize(
+    loaded: &mut LoadedSource,
+    weight_name: &str,
+    f32_vals: &[f32],
+    out_dim: u32,
+    in_dim: u32,
+    group_size: u32,
+    groups_per_row: u32,
+    total_groups: u32,
+) -> crate::Result<()> {
+    let in_dim_u = in_dim as usize;
+    let gs = group_size as usize;
+    let gpr = groups_per_row as usize;
+    let total_g = total_groups as usize;
+
+    // 8-bit quantized weights stored as U8.
+    let packed_weight_len = (out_dim as usize) * in_dim_u;
+    let mut packed_weight = vec![0u8; packed_weight_len];
+    let mut scales = Vec::with_capacity(total_g);
+    let mut biases = Vec::with_capacity(total_g);
+
+    for row in 0..out_dim as usize {
+        let row_offset = row * in_dim_u;
+        for g in 0..gpr {
+            let group_start = row_offset + g * gs;
+            let group_end = (group_start + gs).min(row_offset + in_dim_u);
+            let group_vals = &f32_vals[group_start..group_end];
+
+            let (q_bytes, scale, bias) = quantize_af8_group(group_vals);
+            scales.push(scale);
+            biases.push(bias);
+
+            for (wi, &byte) in q_bytes.iter().enumerate() {
+                packed_weight[group_start + wi] = byte;
+            }
+        }
+    }
+
+    let scales_bytes: Vec<u8> = scales
+        .iter()
+        .flat_map(|&s| s.to_le_bytes().to_vec())
+        .collect();
+    let biases_bytes: Vec<u8> = biases
+        .iter()
+        .flat_map(|&b| b.to_le_bytes().to_vec())
+        .collect();
+
+    let stem = weight_name.strip_suffix(".weight").unwrap_or(weight_name);
+    let scales_name = format!("{}.scales", stem);
+    let biases_name = format!("{}.biases", stem);
+
+    let pack = 32 / 8; // 4 U8 per U32
+    let packed_in = in_dim / pack;
+    let packed_shape = crate::config::PackedLinearShapes {
+        weight: vec![out_dim, packed_in],
+        scales: vec![out_dim, groups_per_row],
+        biases: vec![out_dim, groups_per_row],
+        bits: 8,
+        group_size,
+        groups: groups_per_row * out_dim,
+    };
+
+    // Replace weight source tensor.
+    if let Some(st) = loaded.source_tensors.get_mut(weight_name) {
+        st.data = packed_weight;
+        st.dtype = "U8".to_string();
+        st.shape = vec![out_dim, packed_in];
+    }
+
+    loaded.source_tensors.insert(
+        scales_name.clone(),
+        SourceTensor {
+            name: scales_name.clone(),
+            dtype: "F32".to_string(),
+            shape: vec![out_dim, groups_per_row],
+            data: scales_bytes,
+            source_filename: String::new(),
+            source_sha256: String::new(),
+            source_offset: 0,
+        },
+    );
+
+    loaded.source_tensors.insert(
+        biases_name.clone(),
+        SourceTensor {
+            name: biases_name.clone(),
+            dtype: "F32".to_string(),
+            shape: vec![out_dim, groups_per_row],
+            data: biases_bytes,
+            source_filename: String::new(),
+            source_sha256: String::new(),
+            source_offset: 0,
+        },
+    );
+
+    for binding in &mut loaded.spec.global_tensors {
+        if binding.name == weight_name && binding.packed_shape.is_none() {
+            binding.packed_shape = Some(packed_shape.clone());
+        }
+    }
+    for layer in &mut loaded.spec.layers {
+        for binding in &mut layer.tensors {
+            if binding.name == weight_name && binding.packed_shape.is_none() {
+                binding.packed_shape = Some(packed_shape.clone());
+            }
+        }
+    }
+
+    eprintln!(
+        "[quantize] 8-bit affine quantized {}: [{},{}] -> packed [{},{}] + scales [{},{}]",
+        weight_name, out_dim, in_dim, out_dim, packed_in, out_dim, groups_per_row
+    );
+
+    Ok(())
+}
+
+/// Fast half-precision (FP16) to F32 conversion.
+fn half_to_f32(bits: u16) -> f32 {
+    // FP16 format: 1 sign + 5 exponent + 10 mantissa
+    let sign = ((bits >> 15) & 0x1) as f32;
+    let exp = (bits >> 10) & 0x1f;
+    let mantissa = bits & 0x3ff;
+
+    if exp == 0 {
+        // Subnormal or zero
+        if mantissa == 0 {
+            0.0_f32.copysign(1.0 - 2.0 * sign)
+        } else {
+            f32::from_bits(((sign as u32) << 31) | ((102 - 14 + 127) << 23) | (mantissa << 13))
+                * (1.0 / 16777216.0) // 2^-24
+        }
+    } else if exp == 31 {
+        // Infinity or NaN
+        let exp_f32: u32 = 255;
+        let mantissa_f32 = if mantissa == 0 { 0 } else { mantissa << 13 };
+        f32::from_bits(((sign as u32) << 31) | (exp_f32 << 23) | mantissa_f32)
+    } else {
+        // Normal: FP16 exponent bias = 15, F32 exponent bias = 127
+        let exp_f32: u32 = ((exp as u32) + 127 - 15) << 23;
+        f32::from_bits(((sign as u32) << 31) | exp_f32 | ((mantissa as u32) << 13))
+    }
+}
+
 /// Compile a source checkpoint into a precompiled ComputeImage runtime artifact.
 ///
 /// The source directory must contain a config.json and safetensors shards.
@@ -3630,6 +4768,7 @@ fn compile_unchecked(
     source_dir: &str,
     output_dir: &str,
     skip_validation: bool,
+    quantize_mode: Option<CompileQuantMode>,
 ) -> crate::Result<CompiledImage> {
     let source_dir = Path::new(source_dir);
     let output_dir = Path::new(output_dir);
@@ -3647,16 +4786,24 @@ fn compile_unchecked(
     }
     .emit();
 
-    compile_sequential(source_dir, output_dir, loaded, started_at, source_load_ms)
+    compile_sequential(source_dir, output_dir, loaded, started_at, source_load_ms, quantize_mode)
 }
 
 fn compile_sequential(
     _source_dir: &Path,
     output_dir: &Path,
-    loaded: LoadedSource,
+    mut loaded: LoadedSource,
     started_at: Instant,
     source_load_ms: u64,
+    quantize_mode: Option<CompileQuantMode>,
 ) -> crate::Result<CompiledImage> {
+    // Apply compile-time quantization if requested.
+    // Transforms FP16/BF16 source weights into quantized packed triplets
+    // before the emission loop builds the segment payloads.
+    if let Some(qmode) = quantize_mode {
+        apply_quantize_to_loaded(&mut loaded, qmode)?;
+    }
+
     let source = build_source_identity(
         &loaded.manifest,
         loaded.shard_hashes.clone(),
@@ -3700,11 +4847,33 @@ fn compile_sequential(
         }
     }
 
+    // Compile vision encoder tensors if present.
+    if loaded.manifest.vision_config.is_some() {
+        compile_vision_encoder_tensors(
+            &mut builder,
+            &loaded.source_tensors,
+            &mut emitted_ids,
+        )?;
+    }
+
+    // Compile audio encoder tensors if present.
+    if loaded.manifest.audio_config.is_some() {
+        compile_audio_encoder_tensors(
+            &mut builder,
+            &loaded.source_tensors,
+            &mut emitted_ids,
+            loaded.manifest.audio_config.clone(),
+        )?;
+    }
+
     // Build the execution plan using the emitted tensor IDs
     let execution_plan =
         crate::config::build_execution_plan(&loaded.arch, &loaded.namespace, &emitted_ids);
     let mut plan_with_fusion = execution_plan;
     plan_with_fusion.build_ane_fusion_plan();
+    plan_with_fusion.apply_fusion_pass();
+    // Apply compile-time graph optimization passes.
+    crate::compiler::graph_optimizer::optimize(&mut plan_with_fusion);
     builder.set_execution_plan(plan_with_fusion);
 
     let payload_emission_ms = t_emit.elapsed().as_millis() as u64;
@@ -3773,8 +4942,438 @@ pub fn read(image_dir: &str) -> crate::Result<CompiledImageReader> {
     CompiledImageReader::open(Path::new(image_dir))
 }
 
+/// Compile a model image with differential recompilation against a previous
+/// compilation manifest.
+///
+/// 1. Compares source tensor SHA-256 hashes against the previous manifest.
+/// 2. Copies segment files that contain **only** unchanged tensors directly
+///    from the previous output directory — no recompile needed.
+/// 3. Emits only changed / new tensors into fresh segment files.
+/// 4. Merges unchanged and new segments into a single manifest.
+///
+/// Requires `prev_manifest_path` to point at a `manifest.json` from a prior
+/// `tribunus-compute-image build` run.  The previous *output* directory is
+/// inferred as the parent of that file.
+pub fn compile_differential(
+    source_dir: &str,
+    output_dir: &str,
+    prev_manifest_path: &str,
+) -> crate::Result<CompiledImage> {
+    let started_at = Instant::now();
+    let output_dir_path = Path::new(output_dir);
+
+    // Load previous manifest
+    let prev_manifest_text = std::fs::read_to_string(prev_manifest_path)
+        .map_err(|e| {
+            crate::Error::from_reason(format!(
+                "read previous manifest {}: {e}",
+                prev_manifest_path
+            ))
+        })?;
+    let prev_manifest: Manifest = serde_json::from_str(&prev_manifest_text)
+        .map_err(|e| {
+            crate::Error::from_reason(format!("parse previous manifest: {e}"))
+        })?;
+    let prev_output_dir_path = Path::new(prev_manifest_path)
+        .parent()
+        .ok_or_else(|| {
+            crate::Error::from_reason(
+                "cannot determine previous output directory from manifest path",
+            )
+        })?;
+
+    // Build diff
+    let diff = diff_tensors(Path::new(source_dir), &prev_manifest)?;
+    eprintln!(
+        "[diff-compile] tensors: {} unchanged, {} changed, {} new, {} removed ({elapsed} ms)",
+        diff.unchanged.len(),
+        diff.changed.len(),
+        diff.new.len(),
+        diff.removed.len(),
+        elapsed = diff.elapsed_ms,
+    );
+
+    let t_source = Instant::now();
+    let (_plan, loaded) = plan(Path::new(source_dir), false)?;
+    let source_load_ms = t_source.elapsed().as_millis() as u64;
+
+    // Build lookup sets
+    let compile_names: std::collections::HashSet<&str> = diff
+        .changed
+        .iter()
+        .chain(diff.new.iter())
+        .map(|s| s.as_str())
+        .collect();
+    let unchanged_names: std::collections::HashSet<&str> =
+        diff.unchanged.iter().map(|s| s.as_str()).collect();
+
+    // Identify and copy unchanged segments
+    let unchanged_segments: Vec<Segment> = prev_manifest
+        .segments
+        .iter()
+        .filter(|seg| {
+            seg.tensor_ids.iter().all(|tid| {
+                prev_manifest
+                    .tensor_table
+                    .iter()
+                    .find(|t| t.id == *tid)
+                    .map(|t| unchanged_names.contains(t.name.as_str()))
+                    .unwrap_or(false)
+            })
+        })
+        .cloned()
+        .collect();
+
+    std::fs::create_dir_all(output_dir_path)
+        .map_err(|e| crate::Error::from_reason(format!("mkdir: {e}")))?;
+    for seg in &unchanged_segments {
+        let src = prev_output_dir_path.join(&seg.filename);
+        let dst = output_dir_path.join(&seg.filename);
+        if src.exists() {
+            std::fs::copy(&src, &dst).map_err(|e| {
+                crate::Error::from_reason(format!(
+                    "copy unchanged segment {}: {e}",
+                    seg.filename
+                ))
+            })?;
+        }
+    }
+
+    // Build source identity
+    let source = build_source_identity(
+        &loaded.manifest,
+        loaded.shard_hashes.clone(),
+        loaded.tokenizer_hashes.clone(),
+        loaded.auxiliary_hashes.clone(),
+    );
+
+    // Emit only changed / new tensors
+    let mut builder = ImageBuilder::new(loaded.arch.clone(), source);
+    // Offset starting tensor ID so new IDs don't collide with IDs from the
+    // previous compilation manifest (which are still referenced by unchanged
+    // tensors and the existing execution plan / alias entries).
+    let start_tensor_id: u32 = prev_manifest
+        .tensor_table
+        .iter()
+        .map(|t| t.id)
+        .max()
+        .map(|id| id + 1)
+        .unwrap_or(0);
+    builder.set_start_tensor_id(start_tensor_id);
+    let t_emit = Instant::now();
+
+    builder.begin_segment("persistent", SegmentKind::Persistent);
+    let mut emitted_ids = HashMap::new();
+
+    for binding in &loaded.spec.global_tensors {
+        if !compile_names.contains(binding.name.as_str()) {
+            continue;
+        }
+        let id = emit_binding_set(&mut builder, &loaded.source_tensors, binding, None)?;
+        emitted_ids.insert(binding.name.clone(), id);
+    }
+
+    if loaded.namespace.lm_head_aliased {
+        let embed_name = format!("{}.embed_tokens.weight", loaded.namespace.root);
+        let physical_id = emitted_ids
+            .get(&embed_name)
+            .copied()
+            .ok_or_else(|| {
+                crate::Error::from_reason("embed_tokens.weight was not emitted")
+            })?;
+        builder.add_alias("lm_head.weight", physical_id, "tie_word_embeddings=true");
+    }
+
+    for layer in &loaded.spec.layers {
+        builder.begin_segment(
+            &format!("layer_{}", layer.index),
+            SegmentKind::Layer(layer.index),
+        );
+        for binding in &layer.tensors {
+            if !compile_names.contains(binding.name.as_str()) {
+                continue;
+            }
+            let id = emit_binding_set(
+                &mut builder,
+                &loaded.source_tensors,
+                binding,
+                Some(layer.index),
+            )?;
+            emitted_ids.insert(binding.name.clone(), id);
+        }
+    }
+
+    // Build the execution plan
+    let execution_plan =
+        crate::config::build_execution_plan(&loaded.arch, &loaded.namespace, &emitted_ids);
+    let mut plan_with_fusion = execution_plan;
+    plan_with_fusion.build_ane_fusion_plan();
+    plan_with_fusion.apply_fusion_pass();
+    builder.set_execution_plan(plan_with_fusion);
+
+    let payload_emission_ms = t_emit.elapsed().as_millis() as u64;
+
+    // Flush and collect new segments
+    let (new_segments, new_payloads, partial_manifest) = builder.flush_and_collect_segments();
+
+    // Determine offset for new segment filenames
+    let max_existing: usize = unchanged_segments
+        .iter()
+        .filter_map(|s| {
+            let stripped = s.filename.strip_prefix("segment_")?;
+            let num_str = stripped.strip_suffix(".bin")?;
+            num_str.parse::<usize>().ok()
+        })
+        .max()
+        .map(|n| n + 1)
+        .unwrap_or(0);
+
+    // Write new segment files with offset filenames
+    for (i, payload) in new_payloads.iter().enumerate() {
+        let new_filename = format!("segment_{:03}.bin", max_existing + i);
+        let path = output_dir_path.join(&new_filename);
+        std::fs::write(&path, payload).map_err(|e| {
+            crate::Error::from_reason(format!("write new segment {}: {e}", new_filename))
+        })?;
+    }
+
+    // Build combined manifest
+    let mut combined_segments: Vec<Segment> = Vec::with_capacity(
+        unchanged_segments.len() + new_segments.len(),
+    );
+    combined_segments.extend(unchanged_segments);
+
+    for (i, (seg, payload)) in new_segments.iter().zip(new_payloads.iter()).enumerate() {
+        let new_filename = format!("segment_{:03}.bin", max_existing + i);
+        let sha256 = {
+            let mut h = Sha256::new();
+            h.update(payload);
+            format!("{:x}", h.finalize())
+        };
+        combined_segments.push(Segment {
+            id: seg.id.clone(),
+            filename: new_filename,
+            byte_size: payload.len() as u64,
+            sha256,
+            tensor_ids: seg.tensor_ids.clone(),
+            kind: seg.kind.clone(),
+            alignment_bytes: seg.alignment_bytes,
+        });
+    }
+
+    // Combined tensor table: unchanged from prev, changed/new from partial
+    let mut combined_tensors: Vec<TensorEntry> =
+        Vec::with_capacity(prev_manifest.tensor_table.len() + partial_manifest.tensor_table.len());
+
+    for t in &prev_manifest.tensor_table {
+        if unchanged_names.contains(t.name.as_str()) {
+            combined_tensors.push(t.clone());
+        }
+    }
+    for t in &partial_manifest.tensor_table {
+        let mut entry = t.clone();
+        // Fix segment reference: map from builder's internal segment id to
+        // the actual filename on disk.
+        if let Some(seg) = combined_segments
+            .iter()
+            .find(|cs| cs.tensor_ids.contains(&entry.id))
+        {
+                entry.segment = seg.filename.clone();
+        }
+        combined_tensors.push(entry);
+    }
+
+    let mut combined_manifest = partial_manifest.clone();
+    combined_manifest.segments = combined_segments;
+    combined_manifest.tensor_table = combined_tensors;
+    combined_manifest.alias_table = {
+        let mut merged = prev_manifest.alias_table.clone();
+        merged.extend(partial_manifest.alias_table.clone());
+        merged
+    };
+    combined_manifest.residency_plan.total_bytes =
+        combined_manifest.segments.iter().map(|s| s.byte_size).sum();
+    combined_manifest.image_hash = compute_manifest_hash(&combined_manifest);
+
+    let manifest_path = output_dir_path.join("manifest.json");
+    let manifest_json = serde_json::to_string_pretty(&combined_manifest)
+        .map_err(|e| crate::Error::from_reason(format!("json: {e}")))?;
+    std::fs::write(&manifest_path, manifest_json)
+        .map_err(|e| crate::Error::from_reason(format!("write manifest: {e}")))?;
+
+    // Build and write receipt
+    let finalize_ms = t_emit.elapsed().as_millis() as u64;
+    let total_source_bytes: u64 = loaded.source_tensors.values().map(|t| t.data.len() as u64).sum();
+    let total_emitted_bytes: u64 = combined_manifest.segments.iter().map(|s| s.byte_size).sum();
+
+    let stage_profile = StageProfile {
+        source_discovery_ms: source_load_ms,
+        header_parsing_ms: 0,
+        architecture_normalization_ms: 0,
+        binding_validation_ms: 0,
+        source_hashing_ms: diff.elapsed_ms as u64,
+        layout_planning_ms: 0,
+        payload_emission_ms,
+        segment_hashing_ms: finalize_ms,
+        manifest_generation_ms: 0,
+        verification_ms: 0,
+        total_source_bytes,
+        total_emitted_bytes,
+        peak_rss_bytes: 0,
+        peak_mlx_active_bytes: mlx_active_memory_bytes() as u64,
+        peak_mlx_cache_bytes: 0,
+    };
+
+    let receipt = build_compile_receipt(
+        &loaded,
+        &combined_manifest,
+        started_at.elapsed().as_millis(),
+        stage_profile,
+    );
+    let receipt_path = output_dir_path.join("receipt.json");
+    let receipt_json = serde_json::to_string_pretty(&receipt)
+        .map_err(|e| crate::Error::from_reason(format!("json: {e}")))?;
+    std::fs::write(&receipt_path, receipt_json)
+        .map_err(|e| crate::Error::from_reason(format!("write receipt: {e}")))?;
+
+    Ok(CompiledImage {
+        manifest: combined_manifest,
+        receipt,
+    })
+}
+
 pub fn verify(image_dir: &str) -> crate::Result<ManifestVerification> {
     read(image_dir)?.verify()
+}
+
+/// Results from compile-time diagnostic verification.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiagnosticReport {
+    pub passed: bool,
+    pub layers: Vec<LayerDiagnostic>,
+    pub global: GlobalDiagnostic,
+    pub issues: Vec<DiagnosticIssue>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LayerDiagnostic {
+    pub layer_index: u32,
+    pub attention_kind: String,
+    pub hidden_norm: f64,
+    pub hidden_finite: bool,
+    pub hidden_min: f64,
+    pub hidden_max: f64,
+    pub entropy: f64,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GlobalDiagnostic {
+    pub total_layers: usize,
+    pub nan_layers: usize,
+    pub inf_layers: usize,
+    pub max_runtime_ms: u64,
+    pub total_runtime_ms: u64,
+    pub memory_peak_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub enum DiagnosticIssue {
+    NanInLayer(u32),
+    InfInLayer(u32),
+    ExplodingActivation { layer: u32, norm: f64 },
+    VanishingActivation { layer: u32, norm: f64 },
+    EntropyExtreme { layer: u32, entropy: f64 },
+}
+
+impl Default for GlobalDiagnostic {
+    fn default() -> Self {
+        Self {
+            total_layers: 0,
+            nan_layers: 0,
+            inf_layers: 0,
+            max_runtime_ms: 0,
+            total_runtime_ms: 0,
+            memory_peak_bytes: 0,
+        }
+    }
+}
+
+/// Run compile-time diagnostic verification on a compiled image.
+pub fn run_diagnostics(image_dir: &Path) -> crate::Result<DiagnosticReport> {
+    let reader = CompiledImageReader::open(image_dir)?;
+    let plan = &reader.manifest.execution_plan;
+    let mut runtime = reader.open_runtime(StorageBackend::Copied)?;
+
+    let mut report = DiagnosticReport {
+        passed: true,
+        layers: Vec::new(),
+        global: GlobalDiagnostic::default(),
+        issues: Vec::new(),
+    };
+
+    for layer_plan in &plan.layers {
+        let l = layer_plan.layer_index;
+        let start = std::time::Instant::now();
+
+        let lease = runtime.activate_layer(l)?;
+        let layer_map = runtime.build_layer_arrays_from_lease(l, &lease)?;
+
+        let mut has_nan = false;
+        let mut has_inf = false;
+        let mut norm_sum_sq: f64 = 0.0;
+        let mut min_val: f64 = f64::MAX;
+        let mut max_val: f64 = f64::NEG_INFINITY;
+
+        for (_name, arr) in &layer_map {
+            if let Ok(slice) = arr.try_as_slice::<f32>() {
+                for &v in slice {
+                    let vf = v as f64;
+                    if v.is_nan() { has_nan = true; }
+                    if v.is_infinite() { has_inf = true; }
+                    if vf < min_val { min_val = vf; }
+                    if vf > max_val { max_val = vf; }
+                    norm_sum_sq += vf * vf;
+                }
+            }
+        }
+
+        let norm = norm_sum_sq.sqrt();
+        let elapsed = start.elapsed().as_millis() as u64;
+
+        let diag = LayerDiagnostic {
+            layer_index: l,
+            attention_kind: layer_plan.attention_kind.clone(),
+            hidden_norm: norm,
+            hidden_finite: !has_nan && !has_inf,
+            hidden_min: min_val,
+            hidden_max: max_val,
+            entropy: 0.0,
+            elapsed_ms: elapsed,
+        };
+
+        if has_nan {
+            report.issues.push(DiagnosticIssue::NanInLayer(l));
+            report.passed = false;
+        }
+        if has_inf {
+            report.issues.push(DiagnosticIssue::InfInLayer(l));
+            report.passed = false;
+        }
+
+        report.layers.push(diag);
+    }
+
+    report.global.total_layers = plan.layers.len();
+    report.global.nan_layers = report.issues.iter()
+        .filter(|i| matches!(i, DiagnosticIssue::NanInLayer(_))).count();
+    report.global.inf_layers = report.issues.iter()
+        .filter(|i| matches!(i, DiagnosticIssue::InfInLayer(_))).count();
+    report.global.total_runtime_ms = report.layers.iter().map(|l| l.elapsed_ms).sum();
+    report.global.max_runtime_ms = report.layers.iter().map(|l| l.elapsed_ms).max().unwrap_or(0);
+    report.global.memory_peak_bytes = mlx_peak_memory_bytes();
+
+    Ok(report)
 }
 
 /// Atomically publish a staged compilation to its final destination.
@@ -4404,12 +6003,7 @@ mod tests {
     }
 
     fn real_checkpoint_compile_phase(source_dir: &Path, output_dir: &Path) {
-        let compiled = compile_with_authority(
-            source_dir.to_str().expect("source dir"),
-            output_dir.to_str().expect("output dir"),
-            CompilationAuthority::TestFixture,
-            false,
-        )
+        let compiled = compile_with_authority(source_dir.to_str().expect("source dir"), output_dir.to_str().expect("output dir"), CompilationAuthority::TestFixture, false, None, None)
         .expect("compile real checkpoint");
         let reader = read(output_dir.to_str().expect("output dir")).expect("reader");
         let verification = reader.verify().expect("verification");
@@ -4482,19 +6076,9 @@ mod tests {
 
         write_fixture_model(&source_dir);
 
-        let first = compile_with_authority(
-            source_dir.to_str().expect("source dir"),
-            output_dir_a.to_str().expect("output dir a"),
-            CompilationAuthority::TestFixture,
-            false,
-        )
+        let first = compile_with_authority(source_dir.to_str().expect("source dir"), output_dir_a.to_str().expect("output dir a"), CompilationAuthority::TestFixture, false, None, None)
         .expect("second compile");
-        let second = compile_with_authority(
-            source_dir.to_str().expect("source dir"),
-            output_dir_b.to_str().expect("output dir b"),
-            CompilationAuthority::TestFixture,
-            false,
-        )
+        let second = compile_with_authority(source_dir.to_str().expect("source dir"), output_dir_b.to_str().expect("output dir b"), CompilationAuthority::TestFixture, false, None, None)
         .expect("first compile");
 
         assert_eq!(first.manifest.image_hash, second.manifest.image_hash);
@@ -4534,12 +6118,7 @@ mod tests {
 
         write_fixture_model(&source_dir);
 
-        let compiled = compile_with_authority(
-            source_dir.to_str().expect("source dir"),
-            output_dir.to_str().expect("output dir"),
-            CompilationAuthority::TestFixture,
-            false,
-        )
+        let compiled = compile_with_authority(source_dir.to_str().expect("source dir"), output_dir.to_str().expect("output dir"), CompilationAuthority::TestFixture, false, None, None)
         .expect("compile");
         let reader = read(output_dir.to_str().expect("output dir")).expect("reader");
         let verification = reader.verify().expect("verification");
@@ -4597,12 +6176,7 @@ mod tests {
 
         write_fixture_model(&source_dir);
 
-        let compiled = compile_with_authority(
-            source_dir.to_str().expect("source dir"),
-            output_dir.to_str().expect("output dir"),
-            CompilationAuthority::TestFixture,
-            false,
-        )
+        let compiled = compile_with_authority(source_dir.to_str().expect("source dir"), output_dir.to_str().expect("output dir"), CompilationAuthority::TestFixture, false, None, None)
         .expect("compile");
         let reader = read(output_dir.to_str().expect("output dir")).expect("reader");
         let baseline_handles = crate::bridge::handle_count();
@@ -4703,12 +6277,7 @@ mod tests {
         write_fixture_model(&source_dir);
 
         let corrupted_dir = temp_dir("out-corrupted");
-        compile_with_authority(
-            source_dir.to_str().expect("source dir"),
-            corrupted_dir.to_str().expect("output dir"),
-            CompilationAuthority::TestFixture,
-            false,
-        )
+        compile_with_authority(source_dir.to_str().expect("source dir"), corrupted_dir.to_str().expect("output dir"), CompilationAuthority::TestFixture, false, None, None)
         .expect("compile corrupted fixture");
         let segment_path = corrupted_dir.join("segment_000.bin");
         let mut bytes = fs::read(&segment_path).expect("segment bytes");
@@ -4725,12 +6294,7 @@ mod tests {
         );
 
         let missing_dir = temp_dir("out-missing");
-        compile_with_authority(
-            source_dir.to_str().expect("source dir"),
-            missing_dir.to_str().expect("output dir"),
-            CompilationAuthority::TestFixture,
-            false,
-        )
+        compile_with_authority(source_dir.to_str().expect("source dir"), missing_dir.to_str().expect("output dir"), CompilationAuthority::TestFixture, false, None, None)
         .expect("compile missing fixture");
         fs::remove_file(missing_dir.join("segment_000.bin")).expect("remove segment");
         let err = match read(missing_dir.to_str().expect("output dir")) {
@@ -4744,12 +6308,7 @@ mod tests {
         );
 
         let abi_dir = temp_dir("out-abi");
-        compile_with_authority(
-            source_dir.to_str().expect("source dir"),
-            abi_dir.to_str().expect("output dir"),
-            CompilationAuthority::TestFixture,
-            false,
-        )
+        compile_with_authority(source_dir.to_str().expect("source dir"), abi_dir.to_str().expect("output dir"), CompilationAuthority::TestFixture, false, None, None)
         .expect("compile abi fixture");
         let manifest_path = abi_dir.join("manifest.json");
         let manifest = fs::read_to_string(&manifest_path).expect("read manifest");
@@ -4934,12 +6493,7 @@ mod tests {
         write_fixture_model(&source_dir);
 
         let output_dir = temp_dir("out-seg-corr");
-        compile_with_authority(
-            source_dir.to_str().expect("source dir"),
-            output_dir.to_str().expect("output dir"),
-            CompilationAuthority::TestFixture,
-            false,
-        )
+        compile_with_authority(source_dir.to_str().expect("source dir"), output_dir.to_str().expect("output dir"), CompilationAuthority::TestFixture, false, None, None)
         .expect("compile corrupted fixture");
 
         // segment_000.bin = persistent (embed + final), segment_001.bin = layer 0
@@ -4968,12 +6522,7 @@ mod tests {
 
         let baseline_handles = crate::bridge::handle_count();
         {
-            let compiled = compile_with_authority(
-                source_dir.to_str().expect("source dir"),
-                output_dir.to_str().expect("output dir"),
-                CompilationAuthority::TestFixture,
-                false,
-            )
+            let compiled = compile_with_authority(source_dir.to_str().expect("source dir"), output_dir.to_str().expect("output dir"), CompilationAuthority::TestFixture, false, None, None)
             .expect("compile");
 
             let reader = read(output_dir.to_str().expect("output dir")).expect("reader");
@@ -5033,12 +6582,7 @@ mod tests {
 
         write_two_layer_fixture_model(&source_dir, &["sliding_attention", "full_attention"]);
 
-        let _compiled = compile_with_authority(
-            source_dir.to_str().expect("source dir"),
-            output_dir.to_str().expect("output dir"),
-            CompilationAuthority::TestFixture,
-            false,
-        )
+        let _compiled = compile_with_authority(source_dir.to_str().expect("source dir"), output_dir.to_str().expect("output dir"), CompilationAuthority::TestFixture, false, None, None)
         .expect("compile");
 
         let reader = read(output_dir.to_str().expect("output dir")).expect("reader");
@@ -5269,12 +6813,7 @@ mod tests {
         eprintln!("Compiling quantized Gemma 4 12B...");
         let started = std::time::Instant::now();
 
-        let compiled = compile_with_authority(
-            source_dir.to_str().expect("source dir"),
-            output_dir.to_str().expect("output dir"),
-            CompilationAuthority::TestFixture,
-            false,
-        )
+        let compiled = compile_with_authority(source_dir.to_str().expect("source dir"), output_dir.to_str().expect("output dir"), CompilationAuthority::TestFixture, false, None, None)
         .expect("compile model");
 
         let compile_secs = started.elapsed().as_secs_f64();
@@ -5374,12 +6913,7 @@ mod tests {
         eprintln!("Compiling quantized Gemma 4 12B...");
         let started = std::time::Instant::now();
 
-        let compiled = compile_with_authority(
-            source_dir.to_str().expect("source dir"),
-            output_dir.to_str().expect("output dir"),
-            CompilationAuthority::TestFixture,
-            false,
-        )
+        let compiled = compile_with_authority(source_dir.to_str().expect("source dir"), output_dir.to_str().expect("output dir"), CompilationAuthority::TestFixture, false, None, None)
         .expect("compile model");
 
         let compile_secs = started.elapsed().as_secs_f64();

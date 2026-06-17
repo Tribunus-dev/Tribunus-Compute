@@ -11,6 +11,9 @@ compile_error!(
 extern crate self as tribunus_compute_core;
 
 pub mod analysis;
+pub mod audio;
+pub mod autopsy;
+pub mod ane;
 pub mod ane_bridge;
 pub mod arena;
 pub mod arena_info;
@@ -48,8 +51,11 @@ pub mod errors;
 pub mod executor;
 pub mod experiment;
 pub mod external_array;
+pub mod generation;
 pub mod fusion_region;
 pub mod gemma;
+pub mod grammar;
+pub mod gpu_memory;
 pub mod gguf;
 pub mod gpu_worker;
 pub mod heterogeneous;
@@ -59,16 +65,21 @@ pub mod kv_cache;
 pub mod layout_compiler;
 pub mod layout_transform;
 pub mod loader;
+pub mod logging;
+pub mod lora;
 pub mod mapped_image;
 pub mod memory;
+pub mod metrics;
 pub mod metal_capture;
 pub mod mil_builder;
 pub mod mlpackage;
+pub mod plugin;
 pub mod mlx_api_compat;
 pub mod mlx_executor;
 pub mod mlx_inventory;
 pub mod mlx_patch_register;
 pub mod mlx_runtime_probe;
+pub mod model_cache;
 pub mod model;
 pub mod model_runtime;
 pub mod model_store;
@@ -96,6 +107,8 @@ pub mod runtime_trace;
 pub mod scheduling;
 #[cfg(feature = "server")]
 pub mod server;
+pub mod editing;
+pub mod exo;
 pub mod session;
 pub mod sidecar;
 pub mod speculative;
@@ -105,9 +118,12 @@ pub mod storage_adapters;
 pub mod storage_kernel;
 pub mod streaming;
 pub mod toolchain_attest;
+pub mod tools;
 pub mod transform_recipe;
 pub mod treatment;
 pub mod validator;
+pub mod video;
+pub mod vision;
 pub mod worker_memory;
 pub mod worker_protocol;
 pub mod worker_supervisor;
@@ -157,3 +173,44 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Current timestamp as ISO 8601 UTC string.
+pub fn now_iso8601() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // Format as ISO 8601 (simple: YYYY-MM-DDTHH:MM:SSZ)
+    let days = (secs / 86400) as i64;
+    let time_secs = secs % 86400;
+    let (year, month, day) = civil_from_days(days);
+    let hour = time_secs / 3600;
+    let min = (time_secs % 3600) / 60;
+    let sec = time_secs % 60;
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", year, month, day, hour, min, sec)
+}
+
+/// Hostname or "unknown" if unavailable.
+pub fn hostname_or_default() -> String {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("HOST"))
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// Convert a days-from-epoch value to (year, month, day) in the Gregorian
+/// civil calendar.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    // Algorithm from Howard Hinnant
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m as i64, d as i64)
+}

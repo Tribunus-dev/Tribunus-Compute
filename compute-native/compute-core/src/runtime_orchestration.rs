@@ -53,7 +53,7 @@ pub trait CoordinationFabric {
     async fn dead_letter(&mut self, work_id: &str) -> crate::Result<RuntimeOrchestrationRecord>;
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct InMemoryCoordinationFabric {
     records: HashMap<String, RuntimeOrchestrationRecord>,
     heartbeats: HashSet<String>,

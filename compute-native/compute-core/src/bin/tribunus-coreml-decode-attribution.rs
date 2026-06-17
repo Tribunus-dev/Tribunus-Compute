@@ -77,18 +77,21 @@ fn main() {
         tolerance: DEFAULT_TOLERANCE,
     };
 
-    eprintln!("=== Decode Attribution Data Collection Gate ===");
-    eprintln!("Run ID: {}", run_id);
-    eprintln!("Output: {}", output_dir);
-    eprintln!(
+    tribunus_compute_core::log_info!("=== Decode Attribution Data Collection Gate ===");
+    tribunus_compute_core::log_info!("Run ID: {}", run_id);
+    tribunus_compute_core::log_info!("Output: {}", output_dir);
+    tribunus_compute_core::log_info!(
         "Dirty tree: global={} compute={} dep={}",
-        repo_dirty, compute_dirty, dep_dirty
+        repo_dirty,
+        compute_dirty,
+        dep_dirty
     );
-    eprintln!(
+    tribunus_compute_core::log_info!(
         "Warmup: {} iters, Steady: {} iters",
-        DEFAULT_WARMUP, DEFAULT_STEADY
+        DEFAULT_WARMUP,
+        DEFAULT_STEADY
     );
-    eprintln!("");
+    tribunus_compute_core::log_info!("");
 
     if let Some(path) = validate_coverage_lattice {
         validate_coverage_lattice_file(&path, authority_mode);
@@ -97,17 +100,17 @@ fn main() {
 
     // ── Full Catalog Lattice Run (if requested) ──
     if full_catalog {
-        eprintln!("=== Full Catalog Lattice Run ===");
+        tribunus_compute_core::log_info!("=== Full Catalog Lattice Run ===");
         let lattice = run_matrix_lattice(&config);
-        eprintln!("  {} total rows", lattice.len());
+        tribunus_compute_core::log_info!("  {} total rows", lattice.len());
 
         // Validate row count expectation: 48 Core ML + 24 MLX + 24 Accelerate = 96
         let coreml_count = lattice.iter().filter(|r| r.backend == "coreml").count();
         let mlx_count = lattice.iter().filter(|r| r.backend == "mlx").count();
         let accel_count = lattice.iter().filter(|r| r.backend == "accelerate").count();
-        eprintln!("  Core ML: {} rows", coreml_count);
-        eprintln!("  MLX: {} rows", mlx_count);
-        eprintln!("  Accelerate: {} rows", accel_count);
+        tribunus_compute_core::log_info!("  Core ML: {} rows", coreml_count);
+        tribunus_compute_core::log_info!("  MLX: {} rows", mlx_count);
+        tribunus_compute_core::log_info!("  Accelerate: {} rows", accel_count);
 
         // Write lattice rows as JSONL
         write_jsonl(&output_dir, "matrix_lattice", &lattice);
@@ -127,28 +130,28 @@ fn main() {
         let mut cf = fs::File::create(&coverage_path).expect("create coverage file");
         cf.write_all(coverage_json.as_bytes())
             .expect("write coverage");
-        eprintln!("  Coverage JSON: {}", coverage_path);
+        tribunus_compute_core::log_info!("  Coverage JSON: {}", coverage_path);
 
         let (coverage, validation) = validate_coverage_lattice_file(&coverage_path, authority_mode);
 
         // Print human-readable coverage table
-        eprintln!("");
-        eprintln!("Coverage Table:");
+        tribunus_compute_core::log_info!("");
+        tribunus_compute_core::log_info!("Coverage Table:");
         let table = generate_coverage_table(&coverage);
-        eprintln!("{}", table);
+        tribunus_compute_core::log_info!("{}", table);
 
         // Do not run standard matrices when --full-catalog is specified.
-        eprintln!("");
-        eprintln!("=== Coverage Lattice Gate Complete ===");
-        eprintln!("Rows: {}", lattice.len());
-        eprintln!("Coverage: {}", coverage_path);
+        tribunus_compute_core::log_info!("");
+        tribunus_compute_core::log_info!("=== Coverage Lattice Gate Complete ===");
+        tribunus_compute_core::log_info!("Rows: {}", lattice.len());
+        tribunus_compute_core::log_info!("Coverage: {}", coverage_path);
         return;
     }
 
     // ── Matrix 1: Compute Unit × Graph Family ──
-    eprintln!("--- Matrix 1: Compute Unit × Graph Family ---");
+    tribunus_compute_core::log_info!("--- Matrix 1: Compute Unit × Graph Family ---");
     let m1 = run_matrix1(&config);
-    eprintln!(
+    tribunus_compute_core::log_info!(
         "  {} runs ({} pass, {} fail)",
         m1.len(),
         m1.iter().filter(|r| r.status == "pass").count(),
@@ -156,10 +159,10 @@ fn main() {
     );
     write_jsonl(&output_dir, "matrix1", &m1);
 
-    // ── Matrix 2: Shape × Graph Family (CPU-only) ──
-    eprintln!("--- Matrix 2: Shape × Graph Family (CPU-only) ---");
+    // Matrix 2: Shape x Graph Family (CPU-only)
+    tribunus_compute_core::log_info!("--- Matrix 2: Shape × Graph Family (CPU-only) ---");
     let m2 = run_matrix2(&config);
-    eprintln!(
+    tribunus_compute_core::log_info!(
         "  {} runs ({} pass, {} fail)",
         m2.len(),
         m2.iter().filter(|r| r.status == "pass").count(),
@@ -167,16 +170,16 @@ fn main() {
     );
     write_jsonl(&output_dir, "matrix2", &m2);
 
-    // ── Negative evidence ──
-    eprintln!("--- Negative Evidence Fixture ---");
+    // Negative evidence
+    tribunus_compute_core::log_info!("--- Negative Evidence Fixture ---");
     let neg = run_negative_evidence_fixture(&config);
-    eprintln!("  status: {}", neg.status);
+    tribunus_compute_core::log_info!("  status: {}", neg.status);
     write_jsonl(&output_dir, "negative_evidence", &[neg.clone()]);
 
-    // ── Matrix A: Three-way matmul baseline ──
-    eprintln!("--- Matrix A: Three-way matmul baseline ---");
+    // Matrix A: Three-way matmul baseline
+    tribunus_compute_core::log_info!("--- Matrix A: Three-way matmul baseline ---");
     let ma = run_matrix_a(&config);
-    eprintln!(
+    tribunus_compute_core::log_info!(
         "  {} runs ({} pass, {} fail)",
         ma.len(),
         ma.iter().filter(|r| r.status == "pass").count(),
@@ -187,9 +190,9 @@ fn main() {
     // ── Matrix 2b: Shape × Graph Family (GPU, optional) ──
     let mut m2b = Vec::new();
     if include_gpu {
-        eprintln!("--- Matrix 2b: Shape × Graph Family (GPU) ---");
+        tribunus_compute_core::log_info!("--- Matrix 2b: Shape × Graph Family (GPU) ---");
         m2b = run_matrix2b(&config);
-        eprintln!(
+        tribunus_compute_core::log_info!(
             "  {} runs ({} pass, {} fail)",
             m2b.len(),
             m2b.iter().filter(|r| r.status == "pass").count(),
@@ -197,11 +200,13 @@ fn main() {
         );
         write_jsonl(&output_dir, "matrix2b", &m2b);
     } else {
-        eprintln!("--- Matrix 2b: SKIPPED (pass --include-gpu-shape-matrix to enable) ---");
+        tribunus_compute_core::log_info!(
+            "--- Matrix 2b: SKIPPED (pass --include-gpu-shape-matrix to enable) ---"
+        );
     }
 
-    // ── Report ──
-    eprintln!("--- Generating Report ---");
+    // Report
+    tribunus_compute_core::log_info!("--- Generating Report ---");
     let mut all_matrices = vec![
         ("matrix_a", ma),
         ("matrix1_compute_units", m1),
@@ -225,12 +230,12 @@ fn main() {
     let report_json = serde_json::to_string_pretty(&report).expect("serialize report");
     let mut f = fs::File::create(&report_path).expect("create report file");
     f.write_all(report_json.as_bytes()).expect("write report");
-    eprintln!("  Report: {}", report_path);
+    tribunus_compute_core::log_info!("  Report: {}", report_path);
 
-    eprintln!("");
-    eprintln!("=== Decode Attribution Gate Complete ===");
-    eprintln!("Receipts: {}/", output_dir);
-    eprintln!("Report:  {}", report_path);
+    tribunus_compute_core::log_info!("");
+    tribunus_compute_core::log_info!("=== Decode Attribution Gate Complete ===");
+    tribunus_compute_core::log_info!("Receipts: {}/", output_dir);
+    tribunus_compute_core::log_info!("Report:  {}", report_path);
 }
 
 fn write_jsonl(
@@ -244,7 +249,7 @@ fn write_jsonl(
         let line = serde_json::to_string(r).expect("serialize receipt");
         writeln!(f, "{}", line).expect("write jsonl line");
     }
-    eprintln!("  JSONL: {}", path);
+    tribunus_compute_core::log_info!("  JSONL: {}", path);
 }
 
 /// Check provenance across three scopes.
@@ -287,7 +292,9 @@ fn check_provenance() -> (bool, bool, bool, Vec<String>) {
     }
 
     if compute_err || dep_err {
-        eprintln!("  [warn] could not check scoped git status; assuming dirty");
+        tribunus_compute_core::log_warn!(
+            "  [warn] could not check scoped git status; assuming dirty"
+        );
         return (true, true, true, sample);
     }
 
@@ -324,14 +331,14 @@ fn validate_coverage_lattice_file(
             != validation.aggregate_input_summary.excluded_rows
         || embedded.aggregate_exclusions.len() != validation.aggregate_exclusions.len()
     {
-        eprintln!("coverage lattice validation FAILED: embedded validation receipt does not match serialized coverage rows");
+        tribunus_compute_core::log_error!("coverage lattice validation FAILED: embedded validation receipt does not match serialized coverage rows");
         if authority_mode {
             std::process::exit(2);
         }
     }
 
     if validation.passed {
-        eprintln!(
+        tribunus_compute_core::log_info!(
             "coverage lattice validation passed: schema={} expected={} observed={} unique={} missing={} duplicates={} invalid={} aggregate_exclusions={}",
             coverage.schema_version,
             validation.expected_cell_count,
@@ -343,7 +350,7 @@ fn validate_coverage_lattice_file(
             validation.aggregate_exclusions.len(),
         );
     } else {
-        eprintln!(
+        tribunus_compute_core::log_error!(
             "coverage lattice validation FAILED: schema={} expected={} observed={} unique={} missing={} duplicates={} invalid={}",
             coverage.schema_version,
             validation.expected_cell_count,
@@ -354,7 +361,7 @@ fn validate_coverage_lattice_file(
             validation.invalid_cells.len(),
         );
         for i in &validation.invalid_cells {
-            eprintln!("  [row {}] {}: {}", i.row_index, i.reason, i.detail);
+            tribunus_compute_core::log_error!("  [row {}] {}: {}", i.row_index, i.reason, i.detail);
         }
         if authority_mode {
             std::process::exit(2);

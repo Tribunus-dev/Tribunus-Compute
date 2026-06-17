@@ -54,7 +54,7 @@ fn write_frame(writer: &mut impl Write, frame: &Frame) {
     let json = match serde_json::to_vec(frame) {
         Ok(j) => j,
         Err(e) => {
-            eprintln!("[fake-worker] serialize error: {}", e);
+            tribunus_compute_core::log_error!("[fake-worker] serialize error: {}", e);
             return;
         }
     };
@@ -244,7 +244,7 @@ fn do_shutdown<R: Read, W: Write>(
         is_host_command(&frame, HostCommand::Shutdown),
         "expected Shutdown"
     );
-    eprintln!("[fake-worker] {} complete, exiting", _mode);
+    tribunus_compute_core::log_info!("[fake-worker] {} complete, exiting", _mode);
     std::process::exit(0);
 }
 
@@ -285,7 +285,9 @@ fn run_identity_mismatch<R: Read, W: Write>(reader: &mut R, writer: &mut W, _wor
             json!({"version":{"major":1,"minor":0},"worker_id":wrong_id}),
         ),
     );
-    eprintln!("[fake-worker] identity-mismatch: sent HelloAck with wrong id, hanging");
+    tribunus_compute_core::log_info!(
+        "[fake-worker] identity-mismatch: sent HelloAck with wrong id, hanging"
+    );
     loop {
         thread::sleep(Duration::from_secs(60));
     }
@@ -293,7 +295,7 @@ fn run_identity_mismatch<R: Read, W: Write>(reader: &mut R, writer: &mut W, _wor
 
 /// **no-handshake**: Never respond to Hello.
 fn run_no_handshake<R: Read, W: Write>(_reader: &mut R, _writer: &mut W, _worker_id: &str) {
-    eprintln!("[fake-worker] no-handshake: ignoring Hello, waiting");
+    tribunus_compute_core::log_info!("[fake-worker] no-handshake: ignoring Hello, waiting");
     loop {
         thread::sleep(Duration::from_secs(60));
     }
@@ -304,7 +306,9 @@ fn run_model_load_hang<R: Read, W: Write>(reader: &mut R, writer: &mut W, worker
     let mut seq: u64 = 0;
     do_handshake(reader, writer, worker_id, &mut seq);
     let _ = read_frame(reader).expect("read LoadModel");
-    eprintln!("[fake-worker] model-load-hang: received LoadModel, not responding");
+    tribunus_compute_core::log_info!(
+        "[fake-worker] model-load-hang: received LoadModel, not responding"
+    );
     loop {
         thread::sleep(Duration::from_secs(60));
     }
@@ -318,7 +322,9 @@ fn run_slow_prefill<R: Read, W: Write>(reader: &mut R, writer: &mut W, worker_id
     do_handshake(reader, writer, worker_id, &mut seq);
     do_load_model(reader, writer, worker_id, &mut seq);
     let req_id = do_start_generation(reader, writer, worker_id, &mut seq);
-    eprintln!("[fake-worker] slow-prefill: sleeping 10s before prefill completion");
+    tribunus_compute_core::log_info!(
+        "[fake-worker] slow-prefill: sleeping 10s before prefill completion"
+    );
     thread::sleep(Duration::from_secs(10));
     do_emit_tokens(writer, worker_id, &mut seq, &req_id, 3, 42);
     do_generation_completed(writer, worker_id, &mut seq, &req_id, 3, 10050, 10100);
@@ -403,7 +409,10 @@ fn run_ignored_cancel(worker_id: &str) {
                     }
                 }
                 Err(e) => {
-                    eprintln!("[fake-worker] ignored-cancel reader error: {}", e);
+                    tribunus_compute_core::log_error!(
+                        "[fake-worker] ignored-cancel reader error: {}",
+                        e
+                    );
                     break;
                 }
             }
@@ -420,7 +429,7 @@ fn run_ignored_cancel(worker_id: &str) {
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(f) => {
                     if is_host_command(&f, HostCommand::CancelGeneration) {
-                        eprintln!(
+                        tribunus_compute_core::log_info!(
                             "[fake-worker] ignored-cancel: received CancelGeneration, ignoring"
                         );
                         cancelled = true;
@@ -428,7 +437,9 @@ fn run_ignored_cancel(worker_id: &str) {
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => break,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    eprintln!("[fake-worker] ignored-cancel: reader disconnected");
+                    tribunus_compute_core::log_warn!(
+                        "[fake-worker] ignored-cancel: reader disconnected"
+                    );
                     break;
                 }
             }
@@ -499,16 +510,22 @@ fn run_ignored_cancel(worker_id: &str) {
                         ),
                     );
                 } else if is_host_command(&f, HostCommand::Shutdown) {
-                    eprintln!("[fake-worker] ignored-cancel complete, exiting");
+                    tribunus_compute_core::log_info!(
+                        "[fake-worker] ignored-cancel complete, exiting"
+                    );
                     std::process::exit(0);
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                eprintln!("[fake-worker] ignored-cancel: timeout waiting for shutdown");
+                tribunus_compute_core::log_warn!(
+                    "[fake-worker] ignored-cancel: timeout waiting for shutdown"
+                );
                 std::process::exit(0);
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                eprintln!("[fake-worker] ignored-cancel: stdin disconnected");
+                tribunus_compute_core::log_warn!(
+                    "[fake-worker] ignored-cancel: stdin disconnected"
+                );
                 std::process::exit(0);
             }
         }
@@ -533,7 +550,7 @@ fn run_heartbeat_loss<R: Read, W: Write>(reader: &mut R, writer: &mut W, worker_
 fn run_malformed_frames<R: Read, W: Write>(reader: &mut R, writer: &mut W, worker_id: &str) {
     let mut seq: u64 = 0;
     do_handshake(reader, writer, worker_id, &mut seq);
-    eprintln!("[fake-worker] malformed-frames: writing non-JSON to stdout");
+    tribunus_compute_core::log_info!("[fake-worker] malformed-frames: writing non-JSON to stdout");
     let _ = writer.write_all(b"NOT JSON\n");
     let _ = writer.flush();
     do_load_model(reader, writer, worker_id, &mut seq);
@@ -565,7 +582,9 @@ fn run_duplicate_terminal<R: Read, W: Write>(reader: &mut R, writer: &mut W, wor
     let req_id = do_start_generation(reader, writer, worker_id, &mut seq);
     do_emit_tokens(writer, worker_id, &mut seq, &req_id, 3, 42);
     do_generation_completed(writer, worker_id, &mut seq, &req_id, 3, 50, 150);
-    eprintln!("[fake-worker] duplicate-terminal: emitting second GenerationCompleted");
+    tribunus_compute_core::log_info!(
+        "[fake-worker] duplicate-terminal: emitting second GenerationCompleted"
+    );
     do_generation_completed(writer, worker_id, &mut seq, &req_id, 3, 50, 150);
     do_unload_model(reader, writer, worker_id, &mut seq);
     do_shutdown(reader, writer, worker_id, &mut seq, "duplicate-terminal");
@@ -577,7 +596,7 @@ fn run_crash<R: Read, W: Write>(reader: &mut R, writer: &mut W, worker_id: &str)
     do_handshake(reader, writer, worker_id, &mut seq);
     do_load_model(reader, writer, worker_id, &mut seq);
     let _ = read_frame(reader).expect("read StartGeneration");
-    eprintln!("[fake-worker] crash: exiting with code 1");
+    tribunus_compute_core::log_info!("[fake-worker] crash: exiting with code 1");
     std::process::exit(1);
 }
 
@@ -587,7 +606,7 @@ fn run_memory_alloc<R: Read, W: Write>(reader: &mut R, writer: &mut W, worker_id
     do_handshake(reader, writer, worker_id, &mut seq);
     do_load_model(reader, writer, worker_id, &mut seq);
     let req_id = do_start_generation(reader, writer, worker_id, &mut seq);
-    eprintln!("[fake-worker] memory-alloc: allocating 100MB buffer");
+    tribunus_compute_core::log_info!("[fake-worker] memory-alloc: allocating 100MB buffer");
     let _big_alloc: Vec<u8> = vec![0u8; 100 * 1024 * 1024];
     do_emit_tokens(writer, worker_id, &mut seq, &req_id, 3, 42);
     do_generation_completed(writer, worker_id, &mut seq, &req_id, 3, 50, 150);
@@ -623,7 +642,7 @@ fn main() {
                 mode = args.get(i).cloned().unwrap_or_else(|| "normal".into());
             }
             _ => {
-                eprintln!("[fake-worker] unknown argument: {}", args[i]);
+                tribunus_compute_core::log_error!("[fake-worker] unknown argument: {}", args[i]);
                 std::process::exit(1);
             }
         }
@@ -631,13 +650,17 @@ fn main() {
     }
 
     if worker_id.is_empty() {
-        eprintln!("[fake-worker] missing required argument: --worker-instance-id <uuid>");
+        tribunus_compute_core::log_error!(
+            "[fake-worker] missing required argument: --worker-instance-id <uuid>"
+        );
         std::process::exit(1);
     }
 
-    eprintln!(
+    tribunus_compute_core::log_info!(
         "[fake-worker] starting — worker_id={}, image_dir={}, mode={}",
-        worker_id, _image_dir, mode
+        worker_id,
+        _image_dir,
+        mode
     );
 
     // ignored-cancel owns its own stdin/stdout handles (needs a reader thread),
@@ -665,7 +688,7 @@ fn main() {
         "crash" => run_crash(&mut reader, &mut writer, &worker_id),
         "memory-alloc" => run_memory_alloc(&mut reader, &mut writer, &worker_id),
         _ => {
-            eprintln!("[fake-worker] unknown mode: {}", mode);
+            tribunus_compute_core::log_error!("[fake-worker] unknown mode: {}", mode);
             std::process::exit(1);
         }
     }

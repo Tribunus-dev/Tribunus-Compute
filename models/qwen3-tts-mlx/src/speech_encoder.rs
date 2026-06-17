@@ -14,13 +14,12 @@
 use std::collections::HashMap;
 
 use mlx_rs::{array, Array};
-use mlx_rs::module::{Module, Param};
+use mlx_rs::module::Module;
 use mlx_rs::nn;
 use mlx_rs::ops;
 use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::transforms::eval;
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 
 // ============================================================================
 // Conv helpers (reusing patterns from speech_tokenizer decoder)
@@ -299,4 +298,28 @@ fn normalize_codebook(embed_sum: &Array, cluster_usage: &Array) -> Result<Array>
 }
 
 
-// ... (remaining RVQ, downsample, and full encoder follow)
+/// Speech encoder stub for ICL voice cloning.
+/// The full encoder (SEANet + Transformer + RVQ) is not yet implemented.
+/// This stub allows the crate to compile while ICL voice cloning is WIP.
+pub struct SpeechEncoder {
+    _private: (),
+}
+
+impl SpeechEncoder {
+    pub fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// Check if the weight map contains speech encoder weights.
+pub fn has_encoder_weights(weights: &HashMap<String, Array>) -> bool {
+    weights.contains_key("encoder.encoder.layers.0.conv.weight")
+}
+
+/// Load a SpeechEncoder from weight map.
+/// Currently returns a stub; the full encoder implementation is in progress.
+pub fn load_speech_encoder(weights: &HashMap<String, Array>) -> Result<SpeechEncoder> {
+    let _ = weights; // suppress unused warning
+    tracing::warn!("Speech encoder loading is stubbed - ICL voice cloning not yet functional");
+    Ok(SpeechEncoder::new())
+}

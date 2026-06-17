@@ -6,6 +6,7 @@
 
 pub mod artifacts;
 pub mod fusion;
+pub mod kv_decompress_program;
 pub mod legality;
 pub mod rules;
 

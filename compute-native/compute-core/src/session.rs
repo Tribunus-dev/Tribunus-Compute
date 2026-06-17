@@ -17,6 +17,8 @@
 
 use crate::kv_cache::KvCache;
 
+use crate::grammar::{GrammarFSM, GrammarTokenizer};
+
 /// Host-side session state machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ControlSessionState {
@@ -323,6 +325,11 @@ pub struct SamplerConfig {
     /// Token IDs at which generation should stop (in addition to `eos_token_id`).
     /// Default: empty.
     pub stop_token_ids: Vec<u32>,
+    /// Grammar-guided generation FSM. When set, tokens that don't match
+    /// a valid continuation from the current grammar state are masked out.
+    pub grammar: Option<GrammarFSM>,
+    /// Tokenizer for grammar masking.
+    pub grammar_tokenizer: Option<GrammarTokenizer>,
 }
 
 impl Default for SamplerConfig {
@@ -334,6 +341,8 @@ impl Default for SamplerConfig {
             repetition_penalty: None,
             seed: None,
             stop_token_ids: Vec::new(),
+            grammar: None,
+            grammar_tokenizer: None,
         }
     }
 }
@@ -342,6 +351,44 @@ impl SamplerConfig {
     /// Returns `true` when the config selects greedy (argmax) decoding.
     pub fn is_greedy(&self) -> bool {
         self.top_k == Some(1) || self.temperature == Some(0.0) || self.temperature == None
+    }
+
+    /// Apply grammar mask to logits in-place, setting forbidden token
+    /// logits to f32::NEG_INFINITY.
+    ///
+    /// Returns true if the mask was applied, false if no grammar is set.
+    pub fn apply_grammar_mask(&self, logits: &mut [f32]) -> bool {
+        match (&self.grammar, &self.grammar_tokenizer) {
+            (Some(grammar), Some(tokenizer)) => {
+                grammar.apply_mask_to_logits(logits, tokenizer);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Advance the grammar FSM state after selecting a token.
+    /// Returns true if the grammar was advanced, false if no grammar is set.
+    pub fn advance_grammar(&mut self, token_text: &str) -> Result<bool, String> {
+        match &mut self.grammar {
+            Some(grammar) => {
+                grammar.advance(token_text)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Reset the grammar FSM to its start state.
+    pub fn reset_grammar(&mut self) {
+        if let Some(grammar) = &mut self.grammar {
+            grammar.reset();
+        }
+    }
+
+    /// Returns true if the grammar FSM is in an accept (terminal) state.
+    pub fn grammar_is_accepting(&self) -> bool {
+        self.grammar.as_ref().map_or(false, |g| g.is_accepting())
     }
 }
 

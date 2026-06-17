@@ -21,6 +21,7 @@ use tribunus_compute_core::decode_attribution::coreml_minimal_repro::{
 };
 use tribunus_compute_core::mil_builder::MilBuilder;
 use tribunus_compute_core::mlpackage::{self, ModelMeta};
+use tribunus_compute_core::{log_error, log_info};
 
 struct RunConfig {
     run_id: String,
@@ -340,18 +341,19 @@ fn copy_dir(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()>
 fn main() {
     let config = parse_args();
 
-    eprintln!(
+    log_info!(
         "Core ML Minimal Reproducer — run_id={}, track={}",
-        config.run_id, config.track
+        config.run_id,
+        config.track
     );
 
     let contracts = graphs_for_track(&config.track);
-    eprintln!("Running {} diagnostic graphs...", contracts.len());
+    log_info!("Running {} diagnostic graphs...", contracts.len());
 
     let mut outcomes: Vec<GraphOutcome> = Vec::new();
 
     for contract in contracts {
-        eprint!("  {}... ", contract.name);
+        log_info!("Running graph: {}", contract.name);
         let outcome = run_graph(&config, contract);
         let phase = &outcome.terminal_phase;
         let compile = if outcome.compile_invoked {
@@ -359,9 +361,11 @@ fn main() {
         } else {
             "no_compile".to_string()
         };
-        eprintln!(
+        log_info!(
             "structural={}, {}, phase={}",
-            outcome.structural_status, compile, phase
+            outcome.structural_status,
+            compile,
+            phase
         );
         outcomes.push(outcome);
     }
@@ -371,7 +375,7 @@ fn main() {
     let _ = fs::create_dir_all(&config.base_dir);
     let report_json = serde_json::to_string_pretty(&outcomes).unwrap_or_else(|_| "[]".to_string());
     fs::write(&report_path, &report_json)
-        .unwrap_or_else(|e| eprintln!("Warning: failed to write report: {e}"));
+        .unwrap_or_else(|e| log_error!("Warning: failed to write report: {e}"));
 
     // Summary.
     let pass = outcomes
@@ -382,11 +386,11 @@ fn main() {
         .iter()
         .filter(|o| o.compile_status == "fail")
         .count();
-    eprintln!(
+    log_info!(
         "\nSummary: {} pass, {} fail, {} total",
         pass,
         fail,
         outcomes.len()
     );
-    eprintln!("Report: {:?}", report_path);
+    log_info!("Report: {:?}", report_path);
 }

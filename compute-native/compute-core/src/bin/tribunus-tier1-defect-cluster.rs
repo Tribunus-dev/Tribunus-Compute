@@ -63,7 +63,7 @@ fn main() {
     }
 
     let run_dir = run_dir.unwrap_or_else(|| {
-        eprintln!("Error: --run-dir is required");
+        tribunus_compute_core::log_error!("Error: --run-dir is required");
         std::process::exit(1);
     });
 
@@ -73,46 +73,44 @@ fn main() {
     });
 
     if !run_dir.is_dir() {
-        eprintln!("Error: run directory not found: {:?}", run_dir);
+        tribunus_compute_core::log_error!("Error: run directory not found: {:?}", run_dir);
         std::process::exit(1);
     }
 
     // Ensure output directory exists
     std::fs::create_dir_all(&output_dir).unwrap_or_else(|e| {
-        eprintln!("Error creating output directory {:?}: {e}", output_dir);
+        tribunus_compute_core::log_error!("Error creating output directory {:?}: {e}", output_dir);
         std::process::exit(1);
     });
 
-    eprintln!("Reading receipts from {:?}...", run_dir);
+    tribunus_compute_core::log_info!("Reading receipts from {:?}...", run_dir);
 
     // ── Load receipts ─────────────────────────────────────────────────────────
     let receipts = match load_receipts_from_run(&run_dir) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Error loading receipts: {e}");
+            tribunus_compute_core::log_error!("Error loading receipts: {e}");
             std::process::exit(1);
         }
     };
 
-    eprintln!("  Loaded {} receipts", receipts.len());
+    tribunus_compute_core::log_info!("  Loaded {} receipts", receipts.len());
 
     // ── Cluster ───────────────────────────────────────────────────────────────
     let (observations, clusters, correlations, pass_tier0, pass_tier1, total_tier0, total_tier1) =
         cluster_defects(&receipts);
 
-    eprintln!();
-    eprintln!("=== Clustering results ===");
-    eprintln!("  Tier 0:    {pass_tier0}/{total_tier0} pass");
-    eprintln!(
+    tribunus_compute_core::log_info!("=== Clustering results ===");
+    tribunus_compute_core::log_info!("  Tier 0:    {pass_tier0}/{total_tier0} pass");
+    tribunus_compute_core::log_info!(
         "  Tier 1:    {pass_tier1}/{total_tier1} pass ({} non-pass)",
         observations.len()
     );
-    eprintln!("  Clusters:  {}", clusters.len());
-    eprintln!("  Correlations: {}", correlations.len());
-    eprintln!();
+    tribunus_compute_core::log_info!("  Clusters:  {}", clusters.len());
+    tribunus_compute_core::log_info!("  Correlations: {}", correlations.len());
 
     for cluster in &clusters {
-        eprintln!(
+        tribunus_compute_core::log_info!(
             "  {:45} {:25} {:8} {:5} rows",
             cluster.cluster_id,
             cluster.cluster_kind.as_str(),
@@ -122,10 +120,9 @@ fn main() {
     }
 
     if !correlations.is_empty() {
-        eprintln!();
-        eprintln!("Cross-backend correlations:");
+        tribunus_compute_core::log_info!("Cross-backend correlations:");
         for corr in &correlations {
-            eprintln!(
+            tribunus_compute_core::log_info!(
                 "  {}: contract '{}' fails on {} backends ({})",
                 corr.correlation_id,
                 corr.semantic_contract_id,
@@ -146,24 +143,24 @@ fn main() {
     let mut had_error = false;
 
     if let Err(e) = write_observations_json(&observations, &obs_path) {
-        eprintln!("Error writing observations: {e}");
+        tribunus_compute_core::log_error!("Error writing observations: {e}");
         had_error = true;
     } else {
-        eprintln!("  Wrote {:?}", obs_path);
+        tribunus_compute_core::log_info!("  Wrote {:?}", obs_path);
     }
 
     if let Err(e) = write_clusters_json(&clusters, &clusters_path) {
-        eprintln!("Error writing clusters: {e}");
+        tribunus_compute_core::log_error!("Error writing clusters: {e}");
         had_error = true;
     } else {
-        eprintln!("  Wrote {:?}", clusters_path);
+        tribunus_compute_core::log_info!("  Wrote {:?}", clusters_path);
     }
 
     if let Err(e) = write_correlations_json(&correlations, &corr_path) {
-        eprintln!("Error writing correlations: {e}");
+        tribunus_compute_core::log_error!("Error writing correlations: {e}");
         had_error = true;
     } else {
-        eprintln!("  Wrote {:?}", corr_path);
+        tribunus_compute_core::log_info!("  Wrote {:?}", corr_path);
     }
 
     if let Err(e) = write_summary_md(
@@ -176,36 +173,35 @@ fn main() {
         total_tier1,
         &summary_path,
     ) {
-        eprintln!("Error writing summary: {e}");
+        tribunus_compute_core::log_error!("Error writing summary: {e}");
         had_error = true;
     } else {
-        eprintln!("  Wrote {:?}", summary_path);
+        tribunus_compute_core::log_info!("  Wrote {:?}", summary_path);
     }
 
     if let Err(e) = write_tier2_blockers_json(&clusters, &blockers_path) {
-        eprintln!("Error writing blockers: {e}");
+        tribunus_compute_core::log_error!("Error writing blockers: {e}");
         had_error = true;
     } else {
-        eprintln!("  Wrote {:?}", blockers_path);
+        tribunus_compute_core::log_info!("  Wrote {:?}", blockers_path);
     }
 
     if let Err(e) = write_next_fix_gates_json(&clusters, &fix_gates_path) {
-        eprintln!("Error writing fix gates: {e}");
+        tribunus_compute_core::log_error!("Error writing fix gates: {e}");
         had_error = true;
     } else {
-        eprintln!("  Wrote {:?}", fix_gates_path);
+        tribunus_compute_core::log_info!("  Wrote {:?}", fix_gates_path);
     }
 
     let elapsed = start.elapsed();
-    eprintln!();
     if had_error {
-        eprintln!(
+        tribunus_compute_core::log_error!(
             "Clustering completed with errors in {:.1}s",
             elapsed.as_secs_f64()
         );
         std::process::exit(1);
     } else {
-        eprintln!(
+        tribunus_compute_core::log_info!(
             "Clustering completed successfully in {:.1}s",
             elapsed.as_secs_f64()
         );

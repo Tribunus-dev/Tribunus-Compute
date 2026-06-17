@@ -14,13 +14,14 @@
 
 use std::time::Instant;
 
-use mlx_rs::{module::Module, ops::indexing::IndexOp, transforms::eval, Array};
+use mlx_rs::{module::Module, ops::indexing::IndexOp, Array};
 use tracing::{info, warn};
 
 use crate::config::{GenerationConfig, Qwen3TtsConfig, TalkerConfig};
 use crate::error::Result;
 use crate::sampling::{build_eos_suppression_mask, build_eos_unit_mask, build_suppression_mask, compute_eos_steering_bias, sample_logits_with_mask, RepetitionPenaltyMask, SamplingKey};
 use crate::talker::Talker;
+use mlx_rs::ops;
 
 // ── Repetition loop detection constants ─────────────────────────────────────
 /// Window size (in codec frames) for repetition detection. ~2s at 12Hz.
@@ -343,7 +344,7 @@ pub fn generate(
         tts_config.assistant_token_id,
         tts_config.tts_bos_token_id, // \n role token
     ];
-    let text_pad_token = tts_config.tts_pad_token_id;
+    let _text_pad_token = tts_config.tts_pad_token_id;
 
     // Gather codec prefix embeddings
     let codec_prefix_embeds: Vec<Array> = codec_prefix
@@ -369,7 +370,7 @@ pub fn generate(
     // Prefill: 10 positions with different codec/text combinations
     let no_codec_positions = 3; // im_start, assistant, \n
     let prefill_len = no_codec_positions + codec_prefix.len() + 2; // +2 for tts_bos+codec_pad and first_text+codec_bos
-    trace!("Prefill length: {} (no_codec={} + codec_prefix={} + 2)", prefill_len, no_codec_positions, codec_prefix.len());
+    tracing::trace!("Prefill length: {} (no_codec={} + codec_prefix={} + 2)", prefill_len, no_codec_positions, codec_prefix.len());
 
     let mut prefill_embeds: Vec<Array> = Vec::with_capacity(prefill_len);
 
@@ -402,8 +403,8 @@ pub fn generate(
 
     // Concatenate all prefill embeddings
     let concat_refs: Vec<&Array> = prefill_embeds.iter().collect();
-    let input_embeds = Array::concatenate(&concat_refs, 1)?;
-    let hidden_size = talker.hidden_size();
+    let input_embeds = ops::concatenate_axis(&concat_refs, 1)?;
+    let _hidden_size = talker.hidden_size();
 
     // Batched forward pass through talker transformer
     let (logits, final_hidden) = talker.forward_batch(input_embeds)?;
@@ -416,16 +417,16 @@ pub fn generate(
         .iter()
         .map(|&id| {
             let arr = Array::from_slice(&[id as i32], &[1, 1]);
-            let text_emb = talker.text_embedding.forward(&arr);
+            let text_emb = talker.text_embedding.forward(&arr)?;
             talker.text_projection.forward(&text_emb)
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let trailing_refs: Vec<&Array> = trailing_embeds.iter().collect();
-    let trailing_text_embeds = Array::concatenate(&trailing_refs, 1)?;
+    let trailing_text_embeds = ops::concatenate_axis(&trailing_refs, 1)?;
 
     let t1 = Instant::now();
     let prefill_ms = (t1 - t0).as_secs_f64() * 1000.0;
-    trace!("Prefill done in {:.1}ms", prefill_ms);
+    tracing::trace!("Prefill done in {:.1}ms", prefill_ms);
 
     // ========================================================================
     // Autoregressive generation loop
@@ -468,10 +469,11 @@ pub fn generate(
     let generation_ms = (t2 - t1).as_secs_f64() * 1000.0;
     info!("Generated {} codec frames in {:.1}ms", all_codes.len(), generation_ms);
 
+    let n_frames = all_codes.len();
     Ok((all_codes, GenerationTiming {
         prefill_ms,
         generation_ms,
-        generation_frames: all_codes.len(),
+        generation_frames: n_frames,
     }))
 }
 
@@ -511,7 +513,7 @@ pub fn generate_voice_clone(
     // Prefill: no role tokens, just tts_pad text + speaker embedding + first_text
     // Build codec prefix for voice clone: nothink + think_bos + think_eos
     let codec_prefix = build_codec_prefix_nothink(&tts_config.talker_config);
-    let no_codec_positions = 0; // No role tokens for voice clone
+    let _no_codec_positions = 0; // No role tokens for voice clone
 
     // tts_pad_embed for padding
     let tts_pad_arr = Array::from_slice(&[tts_config.tts_pad_token_id as i32], &[1, 1]);
@@ -536,7 +538,7 @@ pub fn generate_voice_clone(
     let mut prefill_embeds: Vec<Array> = Vec::with_capacity(prefill_len);
 
     // Speaker embedding is already in the right shape — use as text projection output directly
-    let spk_arr = Array::from_slice(speaker_embedding, &[1, 1, talker.hidden_size() as i32]);
+    let _spk_arr = Array::from_slice(speaker_embedding, &[1, 1, talker.hidden_size() as i32]);
     let spk_projected = talker.text_projection.forward(&tts_pad_embed)?;
     // Replace the text projection weights so the spk embedding dominates
     // Actually: we just concatenate spk embedding with codec_emb for those positions
@@ -561,7 +563,7 @@ pub fn generate_voice_clone(
 
     // Concatenate and forward
     let concat_refs: Vec<&Array> = prefill_embeds.iter().collect();
-    let input_embeds = Array::concatenate(&concat_refs, 1)?;
+    let input_embeds = ops::concatenate_axis(&concat_refs, 1)?;
     let (logits, final_hidden) = talker.forward_batch(input_embeds)?;
     let logits = logits.index((.., -1.., ..));
 
@@ -570,12 +572,12 @@ pub fn generate_voice_clone(
         .iter()
         .map(|&id| {
             let arr = Array::from_slice(&[id as i32], &[1, 1]);
-            let text_emb = talker.text_embedding.forward(&arr);
+            let text_emb = talker.text_embedding.forward(&arr)?;
             talker.text_projection.forward(&text_emb)
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let trailing_refs: Vec<&Array> = trailing_embeds.iter().collect();
-    let trailing_text_embeds = Array::concatenate(&trailing_refs, 1)?;
+    let trailing_text_embeds = ops::concatenate_axis(&trailing_refs, 1)?;
 
     let t1 = Instant::now();
     let prefill_ms = (t1 - t0).as_secs_f64() * 1000.0;
@@ -614,10 +616,11 @@ pub fn generate_voice_clone(
     let t2 = Instant::now();
     let generation_ms = (t2 - t1).as_secs_f64() * 1000.0;
 
+    let n_frames = all_codes.len();
     Ok((all_codes, GenerationTiming {
         prefill_ms,
         generation_ms,
-        generation_frames: all_codes.len(),
+        generation_frames: n_frames,
     }))
 }
 
@@ -658,9 +661,9 @@ pub fn generate_voice_design(
     codec_prefix: &[u32],
     gen_config: &GenerationConfig,
     tts_config: &Qwen3TtsConfig,
-    eos_token: u32,
-    bos_id: u32,
-    pad_id: u32,
+    _eos_token: u32,
+    _bos_id: u32,
+    _pad_id: u32,
     seed: Option<u64>,
 ) -> Result<(Vec<[u32; 16]>, GenerationTiming)> {
     // VoiceDesign: prepend voice description as trailing text before the actual text
@@ -701,15 +704,15 @@ pub struct GenerationState<'a> {
     combined_mask: Array,
 }
 
-impl GenerationState<'_> {
+impl<'a> GenerationState<'a> {
     pub fn new(
-        talker: &mut Talker,
+        talker: &'a mut Talker,
         text_token_ids: &[u32],
         codec_prefix: &[u32],
         gen_config: &GenerationConfig,
         tts_config: &Qwen3TtsConfig,
         seed: Option<u64>,
-    ) -> Result<GenerationState> {
+    ) -> Result<GenerationState<'a>> {
         let eos_token = tts_config.talker_config.codec_eos_token_id;
         let pad_id = tts_config.talker_config.codec_pad_id;
         let bos_id = tts_config.talker_config.codec_bos_id;
@@ -790,7 +793,7 @@ impl GenerationState<'_> {
         prefill_embeds.push(first_text_projected.add(&codec_bos_embed)?);
 
         let concat_refs: Vec<&Array> = prefill_embeds.iter().collect();
-        let input_embeds = Array::concatenate(&concat_refs, 1)?;
+        let input_embeds = ops::concatenate_axis(&concat_refs, 1)?;
         let (logits, final_hidden) = talker.forward_batch(input_embeds)?;
         let logits = logits.index((.., -1.., ..));
         let hidden = final_hidden;
@@ -800,12 +803,12 @@ impl GenerationState<'_> {
             .iter()
             .map(|&id| {
                 let arr = Array::from_slice(&[id as i32], &[1, 1]);
-                let text_emb = talker.text_embedding.forward(&arr);
+                let text_emb = talker.text_embedding.forward(&arr)?;
                 talker.text_projection.forward(&text_emb)
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let trailing_refs: Vec<&Array> = trailing_embeds.iter().collect();
-        let trailing_text_embeds = Array::concatenate(&trailing_refs, 1)?;
+        let trailing_text_embeds = ops::concatenate_axis(&trailing_refs, 1)?;
 
         let vocab_size = tts_config.talker_config.vocab_size as usize;
 

@@ -240,6 +240,46 @@ impl PagedIosurfaceAllocator {
         }
     }
 
+    /// Create a compressed-mode allocator where each page holds more token
+    /// positions by scaling the page size according to the compression ratio.
+    ///
+    /// `compression_ratio`: how many times smaller compressed values are
+    /// vs FP16. For TurboQuant3 (3.5 bits vs 16 bits), ratio = 4.57.
+    /// `tokens_per_block`: how many tokens worth of KV data per page.
+    /// Default 64 (matching PREFIX_BLOCK_SIZE).
+    ///
+    /// The IOSurface arena is created internally with size `max_pool_bytes`.
+    pub fn new_compressed(
+        max_pool_bytes: u64,
+        compression_ratio: f64,
+        tokens_per_block: u32,
+    ) -> Self {
+        // Standard FP16 block size for one KV head token (head_dim=128, FP16=2 bytes).
+        let fp16_block_size: u64 = 512;
+
+        // Compressed bytes per token (always at least 1 byte).
+        let compressed_token_size =
+            ((fp16_block_size as f64 / compression_ratio).ceil() as u64).max(1);
+
+        // Page size = compressed_token_size * tokens_per_block.
+        let page_size = (compressed_token_size * tokens_per_block as u64) as usize;
+
+        // Number of pages that fit in max_pool_bytes (at least 1).
+        let page_size_u64 = page_size as u64;
+        let num_pages = if page_size_u64 > 0 {
+            (max_pool_bytes / page_size_u64).max(1) as usize
+        } else {
+            1
+        };
+
+        // Arena is FP16 (2 bytes/element). Total elements = num_pages * page_size / 2.
+        let total_elements = (num_pages * page_size) / 2;
+        let arena = Arena::new(1, total_elements as u32, mlx_rs::Dtype::Float16)
+            .expect("new_compressed: arena allocation failed");
+
+        Self::new(arena, num_pages, page_size)
+    }
+
     /// Allocate a contiguous run of `count` pages.
     /// Returns None if insufficient contiguous free pages.
     pub fn allocate_pages(&mut self, count: usize) -> Option<Vec<usize>> {
@@ -439,6 +479,7 @@ impl KvCacheBlockAllocator {
 /// it returns the block to the allocator. The generation counter prevents
 /// use-after-free: any attempt to access a block through a stale handle
 /// will detect the mismatch.
+#[derive(Debug)]
 pub struct BlockHandle {
     /// Weak reference to the allocator, so handles do not prevent the
     /// allocator from being dropped.

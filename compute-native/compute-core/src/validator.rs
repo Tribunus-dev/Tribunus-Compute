@@ -145,6 +145,12 @@ fn classify_unexpected(name: &str) -> &str {
     if name.contains("audio") {
         return "audio";
     }
+    if name.starts_with("embed_audio.") {
+        return "audio";
+    }
+    if name.starts_with("vision_encoder.") {
+        return "vision";
+    }
     if name.ends_with(".layer_scalar") {
         return "per-layer-scalar";
     }
@@ -156,6 +162,11 @@ fn classify_unexpected(name: &str) -> &str {
     }
     if name.contains("embed_tokens") && !name.ends_with(".weight") {
         return "quantization-metadata";
+    }
+    // Tensors that don't start with the language_model prefix are
+    // multimodal components (vision, audio) not needed for text inference.
+    if !name.contains("language_model") && !name.starts_with("model.") {
+        return "multimodal-not-text";
     }
     "unknown"
 }
@@ -314,6 +325,14 @@ pub fn validate_bindings(model_dir: &str, spec: &ExecutionSpec) -> crate::Result
     // Classify unexpected tensors
     for (name, meta) in &name_map {
         if !expected_names.contains(name) {
+            // Skip tensors from non-text modalities (audio, vision) —
+            // these are multimodal components not needed for text inference.
+            if !name.starts_with(&spec.namespace.root)
+                && !name.starts_with("model.")
+                && !name.starts_with("language_model.")
+            {
+                continue;
+            }
             report.unexpected_tensors.push(UnexpectedTensor {
                 name: name.to_string(),
                 shape: meta.shape.clone(),
@@ -388,7 +407,19 @@ fn check_binding(
         };
 
         let status = if !shape_match && packed_match != Some(true) {
-            if let Some(ref p) = binding.packed_shape {
+            // Check for implicit U32 quantization packing:
+            // When dtype is U32 and each actual dimension is equal to or
+            // exactly 4x smaller than the logical dimension, this is
+            // NF4-style 8-bit packing (each uint32 packs 4 logical values).
+            let is_quant_pack = m.dtype == "U32"
+                && m.shape.len() == binding.logical_shape.len()
+                && m.shape.iter().zip(binding.logical_shape.iter()).all(|(a, l)| {
+                    *a == *l || *a * 4 == *l
+                });
+
+            if is_quant_pack {
+                BindingStatus::Ok
+            } else if let Some(p) = &binding.packed_shape {
                 BindingStatus::PackedShapeError(format!(
                     "expected logical {} or packed weight {}; got {}",
                     fmt_shape(&binding.logical_shape),
@@ -637,6 +668,17 @@ pub fn validate_bindings_from_map(
 
     for (name, meta) in &lookup {
         if !expected_names.contains(name) {
+            // Skip tensors from non-text modalities (audio, vision) —
+            // these are multimodal components not needed for text inference.
+            // Examples: embed_audio.*, vision_encoder.*, and any tensor
+            // whose name does not match the text model namespace prefix.
+            let ns_root = &spec.namespace.root;
+            let is_text_tensor = name.starts_with(ns_root)
+                || name.starts_with("model.")
+                || name.starts_with("language_model.");
+            if !is_text_tensor {
+                continue;
+            }
             report.unexpected_tensors.push(UnexpectedTensor {
                 name: name.to_string(),
                 shape: meta.shape.clone(),

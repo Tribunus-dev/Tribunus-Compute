@@ -58,23 +58,15 @@ pub fn compile_model_to_scheduled_module(
             let nh = l.n_heads as u64;
             let nkv = l.n_kv_heads as u64;
 
-            // QKV projections: ~3× hidden_size × intermediate buffers
+            // Flash attention: no score matrix materialized.
+            // QKV workspace (concurrent Q/K/V intermediates)
             let qkv_workspace = seq_len * (nh + 2 * nkv) * hd * 4;
-            // Attention scores: n_heads × seq_len × seq_len × fp32
-            let scores = nh * seq_len * seq_len * 4;
-            // O projection output
-            let o_proj = seq_len * hidden_size * 4;
-            // FFN gate + up
+            // FFN gate + up intermediates
             let ffn_inter = 2 * seq_len * intermediate_size * 4;
-            // FFN down output
-            let ffn_down = seq_len * hidden_size * 4;
 
-            // Peak is the max of several concurrent tensors
+            // Peak: concurrent QKV workspace + FFN intermediates + hidden state I/O
             let peak = qkv_workspace
-                .max(scores)
-                .max(o_proj)
                 .max(ffn_inter)
-                .max(ffn_down)
                 .max(hidden_state_bytes);
 
             peak
@@ -221,7 +213,7 @@ pub fn compile_model_to_scheduled_module(
     }
 
     // ── Memory plan ──
-    let total_layer_bytes: u64 = per_layer_bytes.iter().sum();
+    let peak_layer_bytes: u64 = per_layer_bytes.iter().max().copied().unwrap_or(hidden_state_bytes);
     let peak_bytes = per_layer_bytes
         .iter()
         .max()
@@ -241,11 +233,12 @@ pub fn compile_model_to_scheduled_module(
     }
 
     module.memory_plan = MemoryPlan {
-        total_bytes: total_layer_bytes + hidden_state_bytes + vocab_size * hidden_size * 4,
+        // Total runtime memory = one layer's peak + hidden state I/O (+ vocab embedding is a weight, not runtime temp)
+        total_bytes: peak_layer_bytes + hidden_state_bytes,
         peak_bytes: peak_bytes.max(hidden_state_bytes),
         per_backend: {
             let mut m = HashMap::new();
-            m.insert(BackendId(0), total_layer_bytes); // MLX
+            m.insert(BackendId(0), peak_layer_bytes); // MLX
             m.insert(BackendId(1), 0); // Accelerate
             m.insert(BackendId(2), 0); // Core ML
             m
@@ -312,11 +305,9 @@ pub fn estimate_layer_peak_memory(layer: &LayerPlan, arch: &TextArchitecture) ->
     let nkv = layer.n_kv_heads as u64;
 
     let qkv_workspace = seq_len * (nh + 2 * nkv) * hd * 4;
-    let scores = nh * seq_len * seq_len * 4;
     let ffn_inter = 2 * seq_len * intermediate_size * 4;
 
     qkv_workspace
-        .max(scores)
         .max(ffn_inter)
         .max(seq_len * hidden_size * 4)
 }
@@ -422,7 +413,7 @@ mod tests {
                 post_ffw_layernorm_tensor_id: None,
                 layer_scalar_ids: vec![],
                 quantization_ids: vec![],
-                route: crate::operation_route::OperationRoute::default(),
+            route: crate::config::operation_route::OperationRoute::default(),
             });
         }
 
@@ -467,6 +458,17 @@ mod tests {
         assert!(
             !module.memory_plan.buffer_reuse.is_empty(),
             "should have buffer reuse entries"
+        );
+        // Must not include O(n²) attention scores or 48× sum of peaks.
+        assert!(
+            module.memory_plan.total_bytes < 10_000_000_000, // < 10 GB, not 50+
+            "total_bytes {} should be realistic (< 10GB)",
+            module.memory_plan.total_bytes
+        );
+        assert!(
+            module.memory_plan.total_bytes > 100_000_000, // > 100 MB
+            "total_bytes {} should be non-trivial (> 100MB)",
+            module.memory_plan.total_bytes
         );
     }
 

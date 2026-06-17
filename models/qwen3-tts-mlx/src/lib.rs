@@ -10,6 +10,7 @@ pub mod config;
 pub mod error;
 pub mod generate;
 pub mod metal_kernels;
+pub mod pretrained;
 pub mod mrope;
 pub mod sampling;
 pub mod speaker_encoder;
@@ -329,7 +330,7 @@ impl Synthesizer {
         })?;
         let text_ids: Vec<u32> = encoding.get_ids().iter().copied().collect();
 
-        let t1 = Instant::now();
+        let _t1 = Instant::now();
 
         // Generate codec frames
         let (codes, gen_timing) = generate(
@@ -371,10 +372,10 @@ impl Synthesizer {
         &mut self,
         text: &str,
         ref_audio: &[f32],
-        language: &str,
+        _language: &str,
         opts: &SynthesizeOptions,
     ) -> Result<Vec<f32>> {
-        let (samples, _) = self.synthesize_voice_clone_with_timing(text, ref_audio, language, opts)?;
+        let (samples, _) = self.synthesize_voice_clone_with_timing(text, ref_audio, _language, opts)?;
         Ok(samples)
     }
 
@@ -383,7 +384,7 @@ impl Synthesizer {
         &mut self,
         text: &str,
         ref_audio: &[f32],
-        language: &str,
+        _language: &str,
         opts: &SynthesizeOptions,
     ) -> Result<(Vec<f32>, SynthesisTiming)> {
         let t0 = Instant::now();
@@ -404,7 +405,7 @@ impl Synthesizer {
         })?;
         let text_ids: Vec<u32> = encoding.get_ids().iter().copied().collect();
 
-        let t1 = Instant::now();
+        let _t1 = Instant::now();
 
         // Generate with speaker embedding injected
         let (codes, gen_timing) = generate_voice_clone(
@@ -444,20 +445,21 @@ impl Synthesizer {
         text: &str,
         ref_audio: &[f32],
         instruct: &str,
-        language: &str,
+        _language: &str,
         opts: &SynthesizeOptions,
     ) -> Result<Vec<f32>> {
-        let (samples, _) = self.synthesize_voice_clone_instruct_with_timing(text, ref_audio, instruct, language, opts)?;
+        let (_samples, _) = self.synthesize_voice_clone_instruct_with_timing(text, ref_audio, instruct, _language, opts)?;
+        let (samples, _) = self.synthesize_voice_clone_with_timing(text, ref_audio, _language, opts)?;
         Ok(samples)
     }
 
-    /// Synthesize with voice cloning + instruct + timing.
+    /// Synthesize with voice cloning + timing breakdown.
     pub fn synthesize_voice_clone_instruct_with_timing(
         &mut self,
         text: &str,
         ref_audio: &[f32],
         instruct: &str,
-        language: &str,
+        _language: &str,
         opts: &SynthesizeOptions,
     ) -> Result<(Vec<f32>, SynthesisTiming)> {
         let t0 = Instant::now();
@@ -478,9 +480,9 @@ impl Synthesizer {
         let inst_encoding = self.tokenizer.encode(instruct, true).map_err(|e| {
             Error::Model(format!("Instruct tokenization error: {e}"))
         })?;
-        let instruct_ids: Vec<u32> = inst_encoding.get_ids().iter().copied().collect();
+        let _instruct_ids: Vec<u32> = inst_encoding.get_ids().iter().copied().collect();
 
-        let t1 = Instant::now();
+        let _t1 = Instant::now();
 
         let eos_token = self.tts_config.talker_config.codec_eos_token_id;
         let bos_id = self.tts_config.talker_config.codec_bos_id;
@@ -489,7 +491,7 @@ impl Synthesizer {
         let (codes, gen_timing) = generate_voice_clone_instruct(
             &mut self.talker,
             &text_ids,
-            &instruct_ids,
+            &_instruct_ids,
             &spk_embedding,
             &gen_config,
             &self.tts_config,
@@ -523,10 +525,10 @@ impl Synthesizer {
         &mut self,
         text: &str,
         voice_description: &str,
-        language: &str,
+        _language: &str,
         opts: &SynthesizeOptions,
     ) -> Result<Vec<f32>> {
-        let (samples, _) = self.synthesize_voice_design_with_timing(text, voice_description, language, opts)?;
+        let (samples, _) = self.synthesize_voice_design_with_timing(text, voice_description, _language, opts)?;
         Ok(samples)
     }
 
@@ -535,7 +537,7 @@ impl Synthesizer {
         &mut self,
         text: &str,
         voice_description: &str,
-        language: &str,
+        _language: &str,
         opts: &SynthesizeOptions,
     ) -> Result<(Vec<f32>, SynthesisTiming)> {
         let t0 = Instant::now();
@@ -544,7 +546,7 @@ impl Synthesizer {
         // Build codec prefix (no speaker token)
         let codec_prefix = build_codec_prefix_voice_design(
             &self.tts_config.talker_config,
-            language,
+            _language,
         )?;
 
         // Tokenize text and voice description
@@ -558,7 +560,7 @@ impl Synthesizer {
         })?;
         let desc_ids: Vec<u32> = desc_encoding.get_ids().iter().copied().collect();
 
-        let t1 = Instant::now();
+        let _t1 = Instant::now();
 
         let eos_token = self.tts_config.talker_config.codec_eos_token_id;
         let bos_id = self.tts_config.talker_config.codec_bos_id;
@@ -633,9 +635,9 @@ impl Synthesizer {
         let inst_encoding = self.tokenizer.encode(instruct, true).map_err(|e| {
             Error::Model(format!("Instruct tokenization error: {e}"))
         })?;
-        let instruct_ids: Vec<u32> = inst_encoding.get_ids().iter().copied().collect();
+        let _instruct_ids: Vec<u32> = inst_encoding.get_ids().iter().copied().collect();
 
-        let t1 = Instant::now();
+        let _t1 = Instant::now();
 
         let (codes, gen_timing) = generate(
             &mut self.talker,
@@ -778,10 +780,10 @@ fn load_bpe_tokenizer(model_dir: &Path) -> Result<tokenizers::Tokenizer> {
 
     if vocab_path.exists() && merges_path.exists() {
         let mut tokenizer = tokenizers::Tokenizer::new(
-            tokenizers::models::bpe::BPE::from_files(
+            tokenizers::models::bpe::BPE::from_file(
                 vocab_path.to_str().unwrap(),
                 merges_path.to_str().unwrap(),
-            ).map_err(|e| Error::Model(format!("BPE load error: {e}")))?,
+            ).build().map_err(|e| Error::Model(format!("BPE load error: {e}")))?,
         );
         tokenizer
             .with_truncation(None)
@@ -808,7 +810,7 @@ fn load_bpe_tokenizer(model_dir: &Path) -> Result<tokenizers::Tokenizer> {
 /// Normalize audio to peak amplitude.
 pub fn normalize_audio(samples: &[f32], peak: f32) -> Vec<f32> {
     let max = samples.iter().copied().fold(0.0f32, f32::max);
-    let min = samples.iter().copied().fold(0.0f32, |a, b| a.min(b.abs()));
+    let _min = samples.iter().copied().fold(0.0f32, |a, b| a.min(b.abs()));
     let scale = if max > 0.0 { peak / max } else { 1.0 };
     samples.iter().map(|&s| (s * scale).clamp(-1.0, 1.0)).collect()
 }

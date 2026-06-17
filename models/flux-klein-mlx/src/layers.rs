@@ -7,7 +7,7 @@ use mlx_rs::{
     array,
     builder::Builder,
     error::Exception,
-    module::{Module, ModuleParameters},
+    module::Module,
     nn::{Linear, LinearBuilder, RmsNorm},
     ops,
     Array,
@@ -869,6 +869,7 @@ fn gate(x: &Array, gate: &Array) -> Result<Array, Exception> {
 }
 
 /// Check if array contains NaN values
+#[allow(dead_code)]
 fn has_nan_arr(arr: &Array) -> bool {
     let flat = match arr.reshape(&[-1]) {
         Ok(f) => f,
@@ -882,6 +883,7 @@ fn has_nan_arr(arr: &Array) -> bool {
 }
 
 /// Get min and max values of array
+#[allow(dead_code)]
 fn get_range(arr: &Array) -> (f32, f32) {
     let flat = match arr.reshape(&[-1]) {
         Ok(f) => f,

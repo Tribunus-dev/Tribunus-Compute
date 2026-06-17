@@ -117,6 +117,59 @@ impl OperationRoute {
             .map(|(i, _)| i as u32)
             .unwrap_or(0)
     }
+
+    /// Override the route so the given backend is dominant.
+    ///
+    /// Sets matrix-heavy operations (matmul, attention, softmax, rope, silu,
+    /// transpose) to the target backend so `dominant_backend()` returns it.
+    /// Element-wise ops (rms_norm, add, multiply, reshape) are left on
+    /// their optimal backend (Accelerate) unless the target is Orion/ANE
+    /// private runtime (backend 3) which sets all operations.
+    pub fn set_dominant_backend(&mut self, backend_id: u32) {
+        match backend_id {
+            0 => {
+                // MLX (GPU): matrix ops work best on GPU
+                self.matmul = 0;
+                self.attention = 0;
+                self.softmax = 0;
+                self.rope = 0;
+                self.silu = 0;
+                self.transpose = 0;
+                // rms_norm=1, add=1, multiply=1, reshape=1 preserved (Accelerate)
+            }
+            1 => {
+                // Accelerate: element-wise
+                self.rms_norm = 1;
+                self.add = 1;
+                self.multiply = 1;
+                self.reshape = 1;
+            }
+            2 => {
+                // Core ML / ANE: matrix ops for ANE's high-throughput matmul
+                self.matmul = 2;
+                self.attention = 2;
+                self.softmax = 2;
+                self.rope = 2;
+                self.silu = 2;
+                self.transpose = 2;
+                // rms_norm=1, add=1, multiply=1, reshape=1 preserved (Accelerate)
+            }
+            3 => {
+                // Orion/ANE private runtime: all operations
+                self.rms_norm = 3;
+                self.silu = 3;
+                self.matmul = 3;
+                self.attention = 3;
+                self.softmax = 3;
+                self.rope = 3;
+                self.add = 3;
+                self.multiply = 3;
+                self.transpose = 3;
+                self.reshape = 3;
+            }
+            _ => {}
+        }
+    }
 }
 
 impl Default for OperationRoute {

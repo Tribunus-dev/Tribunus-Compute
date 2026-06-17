@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- ANE compile access (needed for Core ML warmup path) -->
+    <key>com.apple.private.ane.compile</key>
+    <true/>
+    <!-- Metal Performance Shaders -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <!-- Allow JIT for Metal shader compilation -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <!-- Debugging -->
+    <key>com.apple.security.get-task-allow</key>
+    <true/>
+    <!-- Network access for server -->
+    <key>com.apple.security.network.server</key>
+    <true/>
+    <!-- Network access for HF downloads -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+    <!-- File read/write for model weights -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+</dict>
+</plist>
