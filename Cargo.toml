@@ -1,5 +1,4 @@
 [workspace]
-autodiscover = false
 members = [
     "compute-native",
     "mlx-rs-core",

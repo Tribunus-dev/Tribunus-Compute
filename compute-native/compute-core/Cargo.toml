@@ -53,6 +53,11 @@ path = "src/bin/tribunus-decode-attribution-measure.rs"
 name = "tribunus-mlx-compatibility-gate"
 path = "src/bin/tribunus-mlx-compatibility-gate.rs"
 
+[[bin]]
+name = "tribunus-server"
+required-features = ["server"]
+path = "src/bin/tribunus-server.rs"
+
 [[test]]
 name = "treatment_qualification"
 path = "tests/treatment_qualification.rs"
@@ -119,7 +124,9 @@ parking_lot = "0.12"
 tribunus-evidence-schema = { path = "../../compute-evidence-native/crates/evidence-schema" }
 libc = "0.2"
 lazy_static = "1.5"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "net"] }
+axum = { version = "0.8", optional = true }
+tower-http = { version = "0.6", optional = true, features = ["cors"] }
 async-trait = "0.1"
 thiserror = "2"
 coreml-proto = "0.1.0"
@@ -135,8 +142,10 @@ napi = []
 private-development = []
 default = ["mlx-backend"]
 stub-backend = []
+accelerate = []
 mlx-backend = ["mlx-rs/metal", "mlx-rs/accelerate", "mlx-rs/safetensors"]
 storage-adapters = ["dep:tokio-postgres", "dep:redis", "dep:duckdb"]
+server = ["dep:axum", "dep:tower-http"]
 
 [build-dependencies]
 cc = "1.2"
