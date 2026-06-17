@@ -314,6 +314,10 @@ pub struct LoadedProfiledModel {
     pub handle_baseline: usize,
     /// Compiled ANE programs for layers routed to Orion.
     pub ane_cache: Option<crate::memory::ane_program_cache::AneProgramCache>,
+    /// Shared IOSurface memory island — all runtime memory allocations
+    /// (intermediates, KV cache) come from this pool. MLX does NOT manage
+    /// memory independently.
+    pub memory_island: crate::heterogeneous::SharedMemoryIsland,
 }
 
 impl LoadedProfiledModel {
@@ -509,6 +513,15 @@ impl LoadedProfiledModel {
             }
         }
 
+        // ── Pre-warm ANE hardware via CoreML ─────────────────────────────
+        let _ane_prewarmed = crate::memory::orion_bridge::prewarm_ane();
+
+        // ── Shared IOSurface memory island ──────────────────────────────
+        // All runtime intermediates allocate from this pool, NOT from MLX.
+        // This ensures Accelerate and CoreML read the same physical pages
+        // that MLX writes, achieving zero-copy across all backends.
+        let memory_island = crate::heterogeneous::SharedMemoryIsland::new();
+
         // ── Compile ANE programs for Orion-routed layers ────────────────────
         let ane_cache = {
             let orion_indices: Vec<usize> = reader
@@ -565,6 +578,7 @@ impl LoadedProfiledModel {
             materialized_bytes,
             handle_baseline,
             ane_cache,
+            memory_island,
         })
     }
 }
@@ -689,7 +703,7 @@ impl ProfiledInferenceSession {
                 &hidden,
                 layer_plan,
                 &layer_plan.route,
-                None,
+                Some(&model.memory_island),
                 &lw.input_layernorm,
                 &lw.post_attention_layernorm,
                 &lw.q_proj_w,
@@ -913,7 +927,7 @@ impl ProfiledInferenceSession {
                 &hidden,
                 layer_plan,
                 &layer_plan.route,
-                None,
+                Some(&model.memory_island),
                 &lw.input_layernorm,
                 &lw.post_attention_layernorm,
                 &lw.q_proj_w,
