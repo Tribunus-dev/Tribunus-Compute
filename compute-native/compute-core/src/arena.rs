@@ -97,9 +97,9 @@ impl Arena {
     /// completes and any Core ML or Accelerate reads finish.  The caller
     /// is responsible for lease-based access serialisation.
     pub unsafe fn evaluate_into(&self, array: &mlx_rs::Array) -> crate::Result<()> {
-        array.evaluate_into(self).map_err(|e| crate::Error::new(format!(
-            "arena evaluate_into: {}", e
-        )))
+        array.evaluate_into(self).map_err(|e| {
+            crate::Error::from_reason(format!("arena evaluate_into: {}", e))
+        })
     }
 
     /// Returns the IOSurface ID (useful for cross-process sharing diagnostics).
@@ -165,7 +165,7 @@ impl Drop for Arena {
 
 // ── OutputBufferHint ──────────────────────────────────────────────────────
 
-unsafe impl OutputBufferHint for Arena {
+impl OutputBufferHint for Arena {
     fn buffer_ptr(&self) -> *const std::ffi::c_void {
         self.info.base_address as *const std::ffi::c_void
     }

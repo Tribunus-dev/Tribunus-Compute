@@ -1,66 +1,41 @@
-// SPDX-License-Identifier: AGPL-3.0-only
 //! Tribunus Compute Kernel — native MLX backend via napi-rs.
 
-mod attention;
-pub mod arena;
-pub mod arena_lifecycle;
-pub mod arena_pool;
-mod bridge;
-pub mod capability;
-pub mod compute_image;
-pub mod compile_pipeline;
-pub mod copy_ledger;
-pub mod compile_progress;
-pub mod compute_ir;
-pub mod compile_state;
-pub mod config;
-pub mod coreml_audit;
-pub mod coreml_pipeline;
-pub mod coreml_bridge;
-pub mod coreml_state;
-pub mod cpu_benchmarks;
-pub mod errors;
-pub mod engine;
-pub mod engine_error;
-pub mod engine_policy;
-pub mod engine_receipts;
-pub mod executor;
-pub mod external_array;
-pub mod fusion_region;
-mod gemma;
-pub mod gpu_worker;
-pub mod mlx_executor;
-pub mod hybrid_profile;
-pub mod transform_recipe;
-pub mod kv_cache;
-pub mod layout_compiler;
-pub mod mapped_image;
-pub mod model_store;
-pub mod model_runtime;
-pub mod placement_profile;
-pub mod profile_compiler;
-pub mod profiled_executor;
-mod loader;
-mod model;
-pub mod operation_catalog;
-pub mod primitives;
-pub mod quantized;
-pub mod requalification;
-pub mod mlx_inventory;
-pub mod mlx_patch_register;
-pub mod residency;
-pub mod runtime_trace;
-pub mod streaming;
-pub mod receipts;
-mod session;
-pub mod validator;
-pub mod worker_memory;
-pub mod worker_protocol;
-pub mod worker_supervisor;
-pub mod cli;
+use tribunus_compute_core::{
+    bridge, compute_image, config, engine, gemma, loader, validator, Status,
+};
 
 use mlx_rs::Array;
 use napi_derive::napi;
+
+fn to_napi_error(err: tribunus_compute_core::Error) -> napi::Error {
+    let status = match err.status {
+        Status::InvalidArg => napi::Status::InvalidArg,
+        _ => napi::Status::GenericFailure,
+    };
+    napi::Error::new(status, err.reason)
+}
+
+trait ToNapiResult<T> {
+    fn to_napi(self) -> napi::Result<T>;
+}
+
+impl<T> ToNapiResult<T> for std::result::Result<T, tribunus_compute_core::Error> {
+    fn to_napi(self) -> napi::Result<T> {
+        self.map_err(to_napi_error)
+    }
+}
+
+impl<T> ToNapiResult<T> for std::result::Result<T, mlx_rs::error::Exception> {
+    fn to_napi(self) -> napi::Result<T> {
+        self.map_err(|e| napi::Error::from_reason(format!("{:?}", e)))
+    }
+}
+
+impl<T> ToNapiResult<T> for std::result::Result<T, tribunus_compute_core::engine_error::EngineError> {
+    fn to_napi(self) -> napi::Result<T> {
+        self.map_err(|e| napi::Error::from_reason(format!("{:?}", e)))
+    }
+}
 
 #[napi]
 pub fn detect_default_device() -> napi::Result<serde_json::Value> {
@@ -82,7 +57,7 @@ pub fn create_array_raw(
     shape: Vec<i32>,
     dtype_id: u32,
 ) -> napi::Result<i64> {
-    bridge::create_array_raw(&data, &shape, dtype_id).map(|h| h as i64)
+    bridge::create_array_raw(&data, &shape, dtype_id).map(|h| h as i64).to_napi()
 }
 
 #[napi]
@@ -92,19 +67,19 @@ pub fn create_scalar_f32(value: f64) -> napi::Result<i64> {
 
 #[napi]
 pub fn array_eval(handle: i64) -> napi::Result<()> {
-    bridge::array_eval(handle as u64)
+    bridge::array_eval(handle as u64).to_napi()
 }
 #[napi]
 pub fn array_shape(handle: i64) -> napi::Result<Vec<i32>> {
-    bridge::array_shape(handle as u64)
+    bridge::array_shape(handle as u64).to_napi()
 }
 #[napi]
 pub fn array_size(handle: i64) -> napi::Result<u32> {
-    bridge::array_size(handle as u64).map(|s| s as u32)
+    bridge::array_size(handle as u64).map(|s| s as u32).to_napi()
 }
 #[napi]
 pub fn array_nbytes(handle: i64) -> napi::Result<u32> {
-    bridge::array_nbytes(handle as u64).map(|s| s as u32)
+    bridge::array_nbytes(handle as u64).map(|s| s as u32).to_napi()
 }
 
 #[napi]
@@ -112,12 +87,12 @@ pub fn array_data_f32(
     handle: i64,
     #[napi(ts_arg_type = "Float32Array")] mut out: napi::bindgen_prelude::Buffer,
 ) -> napi::Result<u32> {
-    bridge::array_data_f32(handle as u64, out.as_mut()).map(|n| n as u32)
+    bridge::array_data_f32(handle as u64, out.as_mut()).map(|n| n as u32).to_napi()
 }
 
 #[napi]
 pub fn free_array(handle: i64) -> napi::Result<()> {
-    bridge::free_array(handle as u64)
+    bridge::free_array(handle as u64).to_napi()
 }
 #[napi]
 pub fn drain_arrays() -> napi::Result<()> {
@@ -131,24 +106,24 @@ pub fn handle_count() -> napi::Result<u32> {
 
 #[napi]
 pub fn matmul(a: i64, b: i64) -> napi::Result<i64> {
-    bridge::matmul(a as u64, b as u64).map(|h| h as i64)
+    bridge::matmul(a as u64, b as u64).map(|h| h as i64).to_napi()
 }
 #[napi]
 pub fn add(a: i64, b: i64) -> napi::Result<i64> {
-    bridge::add(a as u64, b as u64).map(|h| h as i64)
+    bridge::add(a as u64, b as u64).map(|h| h as i64).to_napi()
 }
 #[napi]
 pub fn multiply(a: i64, b: i64) -> napi::Result<i64> {
-    bridge::multiply(a as u64, b as u64).map(|h| h as i64)
+    bridge::multiply(a as u64, b as u64).map(|h| h as i64).to_napi()
 }
 
 #[napi]
 pub fn load_safetensors(path: String) -> napi::Result<String> {
-    loader::load_safetensors_json(&path)
+    loader::load_safetensors_json(&path).to_napi()
 }
 #[napi]
 pub fn inspect_safetensors(path: String) -> napi::Result<String> {
-    loader::inspect_safetensors(&path)
+    loader::inspect_safetensors(&path).to_napi()
 }
 
 #[napi]
@@ -170,9 +145,10 @@ pub fn gemma_forward(
         std::slice::from_raw_parts(input_ids.as_ptr() as *const i32, input_ids.len() / 4)
     };
     let ia = Array::from_slice(ids, &[1, ids.len() as i32]);
-    let m = gemma::GemmaModel::new(gemma::GemmaConfig::gemma4_12b(), wv)?;
+    let m = gemma::GemmaModel::new(gemma::GemmaConfig::gemma4_12b(), wv).to_napi()?;
     let logits = m
         .forward(&ia, kv)
+        .to_napi()
         .map_err(|e| napi::Error::from_reason(format!("fwd: {:?}", e)))?;
     Ok(bridge::ARRAY_REGISTRY.write().insert(logits, None) as i64)
 }
@@ -190,8 +166,8 @@ pub fn gemma_sample_greedy(
         std::slice::from_raw_parts(input_ids.as_ptr() as *const i32, input_ids.len() / 4)
     };
     let ia = Array::from_slice(ids, &[1, ids.len() as i32]);
-    let m = gemma::GemmaModel::new(gemma::GemmaConfig::gemma4_12b(), wv)?;
-    m.sample_token(&ia, kv)
+    let m = gemma::GemmaModel::new(gemma::GemmaConfig::gemma4_12b(), wv).to_napi()?;
+    m.sample_token(&ia, kv).to_napi()
 }
 
 /// Execute the full 48-layer model from a compiled ComputeImage.
@@ -201,18 +177,20 @@ pub fn run_full_model_from_image(
     image_dir: String,
     input_ids: napi::bindgen_prelude::Buffer,
 ) -> napi::Result<u32> {
-    let reader = compute_image::CompiledImageReader::open(std::path::Path::new(&image_dir))?;
-    let mut runtime = reader.open_runtime(compute_image::StorageBackend::Copied)?;
+    let reader = compute_image::CompiledImageReader::open(std::path::Path::new(&image_dir))
+        .to_napi()?;
+    let mut runtime = reader.open_runtime(compute_image::StorageBackend::Copied)
+        .to_napi()?;
     let ids: Vec<i32> = input_ids
         .chunks(4)
         .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect();
-    runtime.run_full_model(&ids)
+    runtime.run_full_model(&ids).to_napi()
 }
 
 #[napi]
 pub fn parse_config_only(config_path: String) -> napi::Result<String> {
-    let (arch, quant, manifest) = config::parse_config(&config_path)?;
+    let (arch, quant, manifest) = config::parse_config(&config_path).to_napi()?;
     let r = serde_json::json!({"architecture":arch,"quantization":quant,"manifest":manifest});
     serde_json::to_string_pretty(&r).map_err(|e| napi::Error::from_reason(format!("json: {}", e)))
 }
@@ -235,7 +213,7 @@ pub fn validate_from_metadata(config_path: String, shard_jsons: String) -> napi:
     }
     let shards: Vec<SI> = serde_json::from_str(&shard_jsons)
         .map_err(|e| napi::Error::from_reason(format!("json: {}", e)))?;
-    let (arch, quant, _) = config::parse_config(&config_path)?;
+    let (arch, quant, _) = config::parse_config(&config_path).to_napi()?;
     let mut nm = std::collections::HashMap::new();
     let mut an = Vec::new();
     for s in &shards {
@@ -253,7 +231,7 @@ pub fn validate_from_metadata(config_path: String, shard_jsons: String) -> napi:
     }
     let ns = config::resolve_namespace(&an).ok_or_else(|| napi::Error::from_reason("ns"))?;
     let spec = config::compile(&arch, &ns, quant.as_ref());
-    serde_json::to_string_pretty(&validator::validate_bindings_from_map(&nm, &spec)?)
+    serde_json::to_string_pretty(&validator::validate_bindings_from_map(&nm, &spec).to_napi()?)
         .map_err(|e| napi::Error::from_reason(format!("json: {}", e)))
 }
 
@@ -261,16 +239,22 @@ pub fn validate_from_metadata(config_path: String, shard_jsons: String) -> napi:
 /// Outputs manifest.json, receipt.json, and execution-ordered segment files.
 #[napi]
 pub fn compile_image(source_dir: String, output_dir: String) -> napi::Result<String> {
-    let image = compute_image::compile(&source_dir, &output_dir)?;
+    let image = compute_image::compile_with_authority(
+        &source_dir,
+        &output_dir,
+        compute_image::CompilationAuthority::SealedComputeImage,
+        false,
+    ).to_napi()?;
     serde_json::to_string_pretty(&image)
         .map_err(|e| napi::Error::from_reason(format!("json: {}", e)))
 }
 
 #[napi]
 pub fn read_compiled_image(image_dir: String) -> napi::Result<String> {
-    let reader = compute_image::read(&image_dir)?;
+    let reader = compute_image::read(&image_dir).to_napi()?;
     let verification = reader
         .verify()
+        .to_napi()
         .map_err(|e| napi::Error::from_reason(format!("verify: {}", e)))?;
     let payload = serde_json::json!({
         "manifest": reader.manifest,
@@ -283,7 +267,7 @@ pub fn read_compiled_image(image_dir: String) -> napi::Result<String> {
 
 #[napi]
 pub fn verify_compiled_image(image_dir: String) -> napi::Result<String> {
-    let verification = compute_image::verify(&image_dir)?;
+    let verification = compute_image::verify(&image_dir).to_napi()?;
     serde_json::to_string_pretty(&verification)
         .map_err(|e| napi::Error::from_reason(format!("json: {}", e)))
 }
@@ -310,10 +294,7 @@ pub fn mlx_clear_cache() -> napi::Result<u32> {
 
 /// Install a model for the compute engine.
 #[napi]
-pub fn engine_install_model(
-    image_dir: String,
-    profile: String,
-) -> napi::Result<String> {
+pub fn engine_install_model(image_dir: String, profile: String) -> napi::Result<String> {
     Ok(format!(
         "engine_install_model: image_dir={}, profile={}",
         image_dir, profile
@@ -350,7 +331,7 @@ pub fn engine_generate(
         .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect();
 
-    let mut engine = engine::ComputeEngine::new()?;
+    let mut engine = engine::ComputeEngine::new().to_napi()?;
 
     // Set worker binary path from environment if available.
     if let Ok(path) = std::env::var("TRIBUNUS_WORKER_BINARY") {
@@ -358,7 +339,7 @@ pub fn engine_generate(
     }
 
     // Load the model.
-    engine.load_model(image_hash)?;
+    engine.load_model(image_hash).to_napi()?;
 
     // Generate — returns a GenerationHandle with job_id and stream.
     let handle = engine
@@ -381,11 +362,8 @@ pub fn engine_generate(
 /// failure.  The real cancellation path requires a persistent engine
 /// instance exposed as a napi external.
 #[napi]
-pub fn engine_cancel_generation(
-    image_hash: String,
-    job_id: String,
-) -> napi::Result<String> {
-    let mut engine = engine::ComputeEngine::new()?;
+pub fn engine_cancel_generation(image_hash: String, job_id: String) -> napi::Result<String> {
+    let mut engine = engine::ComputeEngine::new().to_napi()?;
 
     if let Ok(path) = std::env::var("TRIBUNUS_WORKER_BINARY") {
         engine.set_worker_binary_path(path);
@@ -396,6 +374,7 @@ pub fn engine_cancel_generation(
 
     engine
         .cancel_generation(job_id.clone())
+        .to_napi()
         .map_err(|e| napi::Error::from_reason(format!("Cancel failed: {}", e)))?;
 
     let result = serde_json::json!({

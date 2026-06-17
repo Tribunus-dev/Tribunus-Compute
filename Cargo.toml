@@ -1,12 +1,80 @@
 [workspace]
-members = ["compute-native"]
+autodiscover = false
+members = [
+    "compute-native",
+    "mlx-rs-core",
+    "mlx-rs-lm",
+    "models/gemma4-mlx",
+    "models/glm4-mlx",
+    "models/glm4-moe-mlx",
+    "models/glm-4.7-flash-mlx",
+    "models/gpt-sovits-mlx",
+    "models/mistral-mlx",
+    "models/mixtral-mlx",
+    "models/moxin-vlm-mlx",
+    "models/minicpm-sala-mlx",
+    "models/deepseek-ocr2-mlx",
+    "models/flux-klein-mlx",
+    "models/funasr-mlx",
+    "models/funasr-nano-mlx",
+    "models/funasr-qwen4b-mlx",
+    "models/qwen3-mlx",
+    "models/qwen3-asr-mlx",
+    "models/qwen3-tts-mlx",
+    "models/qwen3-tts-core",
+    "models/qwen3-vl-mlx",
+    "models/qwen3.5-35B-mlx",
+    "models/qwen-image-mlx",
+    "models/step-audio2-mlx",
+    "models/zimage-mlx",
+]
 resolver = "2"
+
+[workspace.dependencies]
+# mlx-rs-fork dependencies (needed for path deps within workspace)
+mlx-sys = { path = "mlx-rs-fork/mlx-sys" }
+mlx-macros = { path = "mlx-rs-fork/mlx-macros" }
+mlx-internal-macros = { path = "mlx-rs-fork/mlx-internal-macros" }
+mlx-rs = { path = "mlx-rs-fork/mlx-rs" }
+mlx-lm-utils = { path = "mlx-rs-fork/mlx-lm-utils" }
+bytemuck = "1"
+float_eq = "1"
+pretty_assertions = "1.4.0"
+dyn-clone = "1"
+half = "2"
+mach-sys = "0.5"
+num-complex = "0.4"
+num_enum = "0.7"
+num-traits = "0.2"
+paste = "1"
+smallvec = "1"
+strum = { version = "0.27", features = ["derive"] }
+itertools = "0.14"
+safetensors = "0.6"
+memmap2 = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2"
+libc = "0.2"
+parking_lot = "0.12"
+tempfile = "3"
+syn = { version = "2", features = ["full"] }
+quote = "1"
+darling = "0.21"
+proc-macro2 = "1"
+bindgen = "0.72"
+cmake = "0.1"
+cc = "1"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 repository = "https://github.com/Tribunus-dev/Tribunus-Compute"
+authors = ["Tribunus-dev"]
+documentation = "https://github.com/Tribunus-dev/Tribunus-Compute"
+keywords = ["mlx", "deep-learning", "machine-learning", "apple-silicon"]
+categories = ["science"]
 
 [workspace.lints.rust]
 unsafe_code = "warn"

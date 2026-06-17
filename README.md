@@ -163,13 +163,35 @@ Gemma 4 fusion topologies, profile compiler, hermetic Core ML toolchain (Python
 
 | Platform | Arch | MLX | Metal | Core ML | Accel | Worker | Status |
 |---|---|---|---|---|---|---|---|
-| macOS 15+ | ARM64 | ✓ | ✓ | ✓ | ✓ | ✓ | Primary |
-| macOS 15+ | x86_64 | — | — | ✓ | ✓ | ✓ | Worker |
-| Linux | ARM64/x86_64 | CPU | — | — | — | ✓ | Worker |
+| macOS 15+ ARM64 (M1) | arm64 | ✓ | ✓ | ✓ | ✓ | ✓ | Actively tested |
+| macOS 15+ ARM64 (M2+) | arm64 | ✓ | ✓ | ✓ | ✓ | ✓ | Expected compatible, unqualified |
+| macOS 15+ | x86_64 | — | — | — | — | ✓ | Planned |
+| Linux | arm64/x86_64 | CPU | — | — | — | ✓ | Implemented, unqualified |
+| Windows | x86_64 | — | — | — | — | — | Planned |
+| CUDA / ROCm / other | — | — | — | — | — | — | Planned |
 
 **Requirements:** Rust >= 1.82.0, Xcode CLT (macOS), MLX C 0.6.0 (from
 `mlx-rs-fork` submodule), Python 3.13 ARM64 + coremltools 9.0 (Core ML
 compilation only).
+
+### Platform Qualification Scope
+
+Tribunus Compute is currently bootstrapped and qualified on a first-generation
+Apple Silicon Mac with an M1 processor. macOS ARM64 is therefore the only
+actively developed and tested hardware target at this stage. Support for
+additional Apple Silicon generations, Intel macOS, Linux, Windows, discrete
+GPUs, and other accelerator configurations is planned after the kernel reaches
+a stable release baseline.
+
+Current platform claims should be understood as implementation targets unless
+they are backed by published qualification evidence for that specific operating
+system, architecture, and hardware configuration.
+
+Hardware donations, hosted test-machine access, CI runner sponsorships, and
+monetary contributions are welcome. Contributions will be used to expand the
+qualification matrix, acquire representative hardware, fund signing and release
+infrastructure, and validate the kernel across additional operating systems and
+accelerator configurations.
 
 ## 6. Repository Structure
 
@@ -211,7 +233,7 @@ compilation only).
 git submodule update --init --recursive
 cd compute-native && npm run build       # N-API addon (macOS)
 cargo build --release -p tribunus-compute-native  # All targets
-cargo build --release --bin tribunus-compute-worker  # Linux worker only
+cargo build --release --no-default-features --features linux-compat --bin tribunus-compute-worker  # Linux worker only
 ```
 
 Feature gate `private-development` relaxes memory limits (local only, never CI).
@@ -302,9 +324,8 @@ interaction.
 
 Proprietary incorporation — closed-source product, distribution under non-AGPL
 terms, or use where AGPL network obligations are not acceptable — requires a
-separate commercial license from the copyright holder. Includes proprietary
-embedding, warranties, indemnification, and separately negotiated patent rights.
-
+separate commercial license from the copyright holder.
+May include warranties, indemnification, and separately negotiated patent rights subject to negotiation.
 Inquiries: `license@tribunus.io` | See
 [docs/LICENSE-COMMERCIAL.md](docs/LICENSE-COMMERCIAL.md).
 

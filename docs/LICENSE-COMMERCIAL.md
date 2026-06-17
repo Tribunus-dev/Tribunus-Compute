@@ -1,7 +1,8 @@
 # Commercial Licensing — Tribunus Compute Kernel
 
-The Tribunus Compute Kernel is dual-licensed under AGPL-3.0-only and a
-separate commercial license. This document explains the commercial option.
+The Tribunus Compute Kernel is available under AGPL-3.0-only, with separate
+commercial licenses available from the copyright holder. This document
+explains the commercial option.
 
 ## When You Need a Commercial License
 
