@@ -7,6 +7,7 @@
 
 use crate::config::{EpiloguePlan, LayerPlan, ProloguePlan};
 use crate::kv_cache::KvCache;
+use crate::config::operation_route::OperationRoute;
 use crate::primitives;
 use crate::projection_identity::{dtype_to_storage, ProjectionContext, ProjectionFamily};
 use crate::session::SamplerConfig;
@@ -69,6 +70,8 @@ pub fn run_prologue(
 pub fn run_layer(
     hidden: &Array,
     plan: &LayerPlan,
+    route: &OperationRoute,
+    island: Option<&crate::heterogeneous::SharedMemoryIsland>,
     // Attention norm weights
     attn_norm: &Array,
     ffn_norm: &Array,
@@ -118,7 +121,7 @@ pub fn run_layer(
 
     // --- Attention norm ---
     let residual = hidden;
-    let normed = primitives::rms_norm(hidden, attn_norm, rms_norm_eps)?;
+    let normed = crate::heterogeneous::dispatch_rms_norm(hidden, attn_norm, rms_norm_eps, route, island)?;
 
     // --- Attention ---
     let attn_out = match plan.attention_kind.as_str() {
@@ -177,6 +180,7 @@ pub fn run_layer(
     };
 
     let hidden = residual.add(&attn_out)?;
+    let hidden = crate::heterogeneous::dispatch_add(residual, &attn_out, route, island)?;
 
     // --- FFN norm ---
     let residual = &hidden;
@@ -208,6 +212,7 @@ pub fn run_layer(
         5,
     )?;
     let gated = mlx_rs::nn::silu(&gate)?.multiply(&up)?;
+    let gated = crate::heterogeneous::dispatch_multiply(&mlx_rs::nn::silu(&gate)?, &up, route, island)?;
     let ffn_out = qmatmul_attributed(
         &gated,
         dw,
@@ -221,7 +226,7 @@ pub fn run_layer(
         6,
     )?;
 
-    residual.add(&ffn_out)
+    crate::heterogeneous::dispatch_add(residual, &ffn_out, route, island)
 }
 
 // ── Attention implementations ──────────────────────────────────────────────

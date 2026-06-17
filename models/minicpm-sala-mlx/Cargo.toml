@@ -1,0 +1,56 @@
+[package]
+name = "minicpm-sala-mlx"
+version = "0.1.0"
+edition = "2021"
+description = "MiniCPM-SALA hybrid attention model inference on Apple Silicon with MLX"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+mlx-rs = { path = "../../mlx-rs-fork/mlx-rs", features = ["metal", "accelerate"] }
+mlx-sys = { path = "../../mlx-rs-fork/mlx-sys" }
+mlx-rs-core = { path = "../../mlx-rs-core" }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokenizers = "0.21"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+tokio = { version = "1", features = ["full"] }
+hf-hub = "0.4"
+
+[[example]]
+name = "generate"
+path = "examples/generate.rs"
+
+[[example]]
+name = "save_quantized"
+path = "examples/save_quantized.rs"
+
+[[example]]
+name = "batch_generate"
+path = "examples/batch_generate.rs"
+
+[[example]]
+name = "chat"
+path = "examples/chat.rs"
+
+[[example]]
+name = "speculative_generate"
+path = "examples/speculative_generate.rs"
+
+[[example]]
+name = "server"
+path = "examples/server.rs"
+
+[[example]]
+name = "test_rope_batch"
+path = "examples/test_rope_batch.rs"
+
+[[example]]
+name = "needle_test"
+path = "examples/needle_test.rs"

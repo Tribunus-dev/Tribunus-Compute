@@ -1,0 +1,44 @@
+[package]
+name = "qwen-image-mlx"
+version = "0.1.0"
+edition = "2021"
+authors = ["Minghua Wu <michael.wu1107@gmail.com>"]
+repository = "https://github.com/oxideai/mlx-rs"
+license = "MIT OR Apache-2.0"
+rust-version = "1.82.0"
+description = "Qwen-Image-2512 implementation in Rust using MLX"
+
+[dependencies]
+mlx-rs = { path = "../../mlx-rs-fork/mlx-rs", features = ["safetensors"] }
+mlx-macros = { path = "../../mlx-rs-fork/mlx-macros" }
+mlx-rs-core = { path = "../../mlx-rs-core" }
+thiserror = "2"
+safetensors = "0.6"
+bytemuck = "1"
+memmap2 = "0.9"
+serde_json = "1"
+tokenizers = "0.21"
+mlx-sys = { path = "../../mlx-rs-fork/mlx-sys" }
+
+[dev-dependencies]
+pretty_assertions = "1.4.0"
+clap = { version = "4", features = ["derive"] }
+dirs = "5"
+half = "2"
+image = "0.25"
+
+[[example]]
+name = "generate_qwen_image"
+path = "examples/generate_qwen_image.rs"
+
+[[example]]
+name = "generate_full_precision"
+path = "examples/generate_full_precision.rs"
+
+[[example]]
+name = "generate_fp32"
+path = "examples/generate_fp32.rs"
+
+[[example]]
+name = "mfa_test"
+path = "examples/mfa_test/main.rs"

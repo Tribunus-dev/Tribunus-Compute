@@ -1,0 +1,194 @@
+#import "iosurface_tensor.h"
+#import <CoreVideo/CoreVideo.h>
+#import <arm_neon.h>
+
+// ANE tensor layout: fp16 [1, C, 1, S]
+// IOSurface provides zero-copy shared memory between CPU and ANE.
+// IOSurface uses a flat byte buffer; the 4D shape is conceptual (MIL assigns meaning).
+
+#pragma mark - T012: Create
+
+IOSurfaceRef orion_tensor_create(int channels, int seq_len) {
+    if (channels <= 0 || seq_len <= 0) return NULL;
+
+    // ANE uses fp16 (2 bytes per element). Total elements = C * S.
+    size_t bytes = (size_t)channels * seq_len * sizeof(_Float16);
+
+    // IOSurface properties: flat 1D byte buffer (width=bytes, height=1).
+    // The 4D [1, C, 1, S] layout is defined by the MIL program, not the IOSurface.
+    NSDictionary *props = @{
+        (id)kIOSurfaceWidth:           @(bytes),
+        (id)kIOSurfaceHeight:          @1,
+        (id)kIOSurfaceBytesPerElement:  @1,
+        (id)kIOSurfaceBytesPerRow:      @(bytes),
+        (id)kIOSurfaceAllocSize:        @(bytes),
+        (id)kIOSurfacePixelFormat:      @0
+    };
+
+    return IOSurfaceCreate((__bridge CFDictionaryRef)props);
+}
+
+IOSurfaceRef orion_tensor_create_f32(int channels, int seq_len) {
+    if (channels <= 0 || seq_len <= 0) return NULL;
+
+    // fp32: 4 bytes per element
+    size_t bytes = (size_t)channels * seq_len * sizeof(float);
+
+    NSDictionary *props = @{
+        (id)kIOSurfaceWidth:           @(bytes),
+        (id)kIOSurfaceHeight:          @1,
+        (id)kIOSurfaceBytesPerElement:  @1,
+        (id)kIOSurfaceBytesPerRow:      @(bytes),
+        (id)kIOSurfaceAllocSize:        @(bytes),
+        (id)kIOSurfacePixelFormat:      @0
+    };
+
+    return IOSurfaceCreate((__bridge CFDictionaryRef)props);
+}
+
+#pragma mark - T013: Raw fp16 Read/Write
+
+void orion_tensor_write(IOSurfaceRef surface, const void* data, size_t size) {
+    if (!surface || !data || size == 0) return;
+    IOSurfaceLock(surface, 0, NULL);
+    memcpy(IOSurfaceGetBaseAddress(surface), data, size);
+    IOSurfaceUnlock(surface, 0, NULL);
+}
+
+void orion_tensor_read(IOSurfaceRef surface, void* data, size_t size) {
+    if (!surface || !data || size == 0) return;
+    IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+    memcpy(data, IOSurfaceGetBaseAddress(surface), size);
+    IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+}
+
+#pragma mark - T014: NEON fp16↔fp32 Conversion
+
+void orion_tensor_write_f32(IOSurfaceRef surface, const float* data, int count) {
+    if (!surface || !data || count <= 0) return;
+    IOSurfaceLock(surface, 0, NULL);
+    _Float16 *dst = (_Float16 *)IOSurfaceGetBaseAddress(surface);
+
+    // NEON-accelerated f32 → f16 conversion (8 elements at a time)
+    int i = 0;
+    for (; i + 7 < count; i += 8) {
+        float16x8_t h = vcombine_f16(
+            vcvt_f16_f32(vld1q_f32(data + i)),
+            vcvt_f16_f32(vld1q_f32(data + i + 4)));
+        vst1q_f16((__fp16 *)(dst + i), h);
+    }
+    // Scalar tail
+    for (; i < count; i++) {
+        dst[i] = (_Float16)data[i];
+    }
+
+    IOSurfaceUnlock(surface, 0, NULL);
+}
+
+void orion_tensor_read_f32(IOSurfaceRef surface, float* data, int count) {
+    if (!surface || !data || count <= 0) return;
+    IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+    const _Float16 *src = (const _Float16 *)IOSurfaceGetBaseAddress(surface);
+
+    // NEON-accelerated f16 → f32 conversion (8 elements at a time)
+    int i = 0;
+    for (; i + 7 < count; i += 8) {
+        float16x8_t h = vld1q_f16((const __fp16 *)(src + i));
+        vst1q_f32(data + i,     vcvt_f32_f16(vget_low_f16(h)));
+        vst1q_f32(data + i + 4, vcvt_f32_f16(vget_high_f16(h)));
+    }
+    // Scalar tail
+    for (; i < count; i++) {
+        data[i] = (float)src[i];
+    }
+
+    IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+}
+
+void orion_tensor_read_f32_direct(IOSurfaceRef surface, float* data, int count) {
+    if (!surface || !data || count <= 0) return;
+    IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+    memcpy(data, IOSurfaceGetBaseAddress(surface), (size_t)count * sizeof(float));
+    IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+}
+
+#pragma mark - Region Copy
+
+void orion_tensor_copy_into(IOSurfaceRef dst, int dst_ch_offset,
+                             IOSurfaceRef src, int channels, int seq_len) {
+    if (!dst || !src || channels <= 0 || seq_len <= 0) return;
+
+    size_t elem_count = (size_t)channels * seq_len;
+    size_t byte_count = elem_count * sizeof(_Float16);
+    size_t dst_offset = (size_t)dst_ch_offset * seq_len * sizeof(_Float16);
+
+    IOSurfaceLock(src, kIOSurfaceLockReadOnly, NULL);
+    IOSurfaceLock(dst, 0, NULL);
+
+    const void *src_ptr = IOSurfaceGetBaseAddress(src);
+    void *dst_ptr = (uint8_t *)IOSurfaceGetBaseAddress(dst) + dst_offset;
+    memcpy(dst_ptr, src_ptr, byte_count);
+
+    IOSurfaceUnlock(dst, 0, NULL);
+    IOSurfaceUnlock(src, kIOSurfaceLockReadOnly, NULL);
+}
+
+void orion_tensor_write_f32_at(IOSurfaceRef dst, int dst_ch_offset,
+                                const float* data, int channels, int seq_len) {
+    if (!dst || !data || channels <= 0 || seq_len <= 0) return;
+
+    int count = channels * seq_len;
+    size_t dst_offset = (size_t)dst_ch_offset * seq_len * sizeof(_Float16);
+
+    IOSurfaceLock(dst, 0, NULL);
+    _Float16 *dst_ptr = (_Float16 *)((uint8_t *)IOSurfaceGetBaseAddress(dst) + dst_offset);
+
+    // NEON f32 → f16 conversion
+    int i = 0;
+    for (; i + 7 < count; i += 8) {
+        float16x8_t h = vcombine_f16(
+            vcvt_f16_f32(vld1q_f32(data + i)),
+            vcvt_f16_f32(vld1q_f32(data + i + 4)));
+        vst1q_f16((__fp16 *)(dst_ptr + i), h);
+    }
+    for (; i < count; i++) {
+        dst_ptr[i] = (_Float16)data[i];
+    }
+
+    IOSurfaceUnlock(dst, 0, NULL);
+}
+
+#pragma mark - T015: Unified Memory Island Bridge
+
+IOSurfaceRef orion_tensor_from_external(IOSurfaceRef surface) {
+    if (!surface) return NULL;
+    CFRetain(surface);
+    return surface;
+}
+
+IOSurfaceRef orion_tensor_from_arena(int channels, int seq_len) {
+    if (channels <= 0 || seq_len <= 0) return NULL;
+
+    // Arena pixel format: kCVPixelFormatType_OneComponent16Half
+    // Arena dimension convention: width=seq_len (S), height=channels (C), bytesPerElement=2
+    // This matches the IOSurfaceFp16ContiguousV1 profile used by the shared
+    // memory island (IosurfaceAllocator, Arena::new).
+    // Total bytes = width * height * bytesPerElement = seq_len * channels * 2.
+    NSDictionary *props = @{
+        (id)kIOSurfaceWidth: @(seq_len),
+        (id)kIOSurfaceHeight: @(channels),
+        (id)kIOSurfaceBytesPerElement: @(2),
+        (id)kIOSurfacePixelFormat: @(kCVPixelFormatType_OneComponent16Half),
+    };
+
+    IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+    return surface;
+}
+
+#pragma mark - Release
+
+void orion_tensor_release(IOSurfaceRef surface) {
+    if (surface) {
+        CFRelease(surface);
+    }
+}

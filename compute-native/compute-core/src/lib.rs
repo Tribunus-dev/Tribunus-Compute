@@ -51,6 +51,7 @@ pub mod external_array;
 pub mod fusion_region;
 pub mod gemma;
 pub mod gpu_worker;
+pub mod heterogeneous;
 pub mod hybrid_profile;
 pub mod inference_profile;
 pub mod kv_cache;

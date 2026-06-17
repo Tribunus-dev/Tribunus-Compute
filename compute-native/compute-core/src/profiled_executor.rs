@@ -688,6 +688,8 @@ impl ProfiledInferenceSession {
             hidden = crate::executor::run_layer(
                 &hidden,
                 layer_plan,
+                &layer_plan.route,
+                None,
                 &lw.input_layernorm,
                 &lw.post_attention_layernorm,
                 &lw.q_proj_w,
@@ -910,6 +912,8 @@ impl ProfiledInferenceSession {
             hidden = crate::executor::run_layer(
                 &hidden,
                 layer_plan,
+                &layer_plan.route,
+                None,
                 &lw.input_layernorm,
                 &lw.post_attention_layernorm,
                 &lw.q_proj_w,
