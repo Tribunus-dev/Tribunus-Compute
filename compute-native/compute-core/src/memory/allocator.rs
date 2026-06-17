@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
+use std::sync::{Arc, Weak};
 
 use crate::arena::Arena;
 use mlx_rs::Dtype;
@@ -323,6 +324,195 @@ impl PagedIosurfaceAllocator {
             count += word.count_ones() as usize;
         }
         count.min(self.num_pages)
+    }
+
+    /// Return the total number of pages (capacity).
+    pub fn num_pages(&self) -> usize {
+        self.num_pages
+    }
+}
+
+/// High-level KV cache block allocator on top of `PagedIosurfaceAllocator`.
+///
+/// Adds generation-counter safety and block-level tracking. Blocks are
+/// individual pages from the underlying bitmap page allocator. Each block
+/// carries a generation counter that increments when the page is recycled,
+/// preventing use-after-free via stale `BlockHandle`s.
+///
+/// Default block (page) size: 512 bytes = 1 KV head x 128 head_dim x FP16.
+/// For Gemma 4 with n_kv_heads=4, each layer needs 4 blocks per token position.
+pub struct KvCacheBlockAllocator {
+    /// Underlying page-level allocator.
+    pager: PagedIosurfaceAllocator,
+    /// Per-page generation counters, incremented on each free.
+    generations: Vec<u32>,
+}
+
+impl KvCacheBlockAllocator {
+    /// Create a new KV cache block allocator wrapping an existing pager.
+    ///
+    /// The pager must already be initialized with the desired IOSurface arena
+    /// and page configuration. Generation counters start at 0 for every page.
+    pub fn new(pager: PagedIosurfaceAllocator) -> Self {
+        let num_pages = pager.num_pages();
+        Self {
+            pager,
+            generations: vec![0u32; num_pages],
+        }
+    }
+
+    /// Allocate a single block (page).
+    ///
+    /// Returns `(page_index, generation)` on success, or an error if no pages
+    /// remain. The returned generation must be checked against the allocator's
+    /// current generation at access time to prevent use-after-free.
+    pub fn alloc_block(&mut self) -> Result<(usize, u32), String> {
+        let pages = self
+            .pager
+            .allocate_pages(1)
+            .ok_or_else(|| "KvCacheBlockAllocator: no free blocks available".to_string())?;
+        let idx = pages[0];
+        let gen = self.generations[idx];
+        Ok((idx, gen))
+    }
+
+    /// Free a block by page index.
+    ///
+    /// The page is returned to the underlying allocator's free pool and its
+    /// generation counter is incremented. Any `BlockHandle` still holding the
+    /// old generation will be stale.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index >= num_pages`.
+    pub fn free_block(&mut self, index: usize) {
+        assert!(
+            index < self.generations.len(),
+            "KvCacheBlockAllocator: block index {} out of range (max {})",
+            index,
+            self.generations.len()
+        );
+        self.pager.free_page(index);
+        self.generations[index] = self.generations[index].wrapping_add(1);
+    }
+
+    /// Translate a block index to a raw pointer into the IOSurface.
+    ///
+    /// Returns `None` when the index is out of range.
+    pub fn block_ptr(&self, index: usize) -> Option<*const u8> {
+        if index >= self.pager.num_pages() {
+            return None;
+        }
+        Some(self.pager.page_address(index) as *const u8)
+    }
+
+    /// Total number of blocks currently allocated.
+    pub fn allocated_blocks(&self) -> usize {
+        self.pager.num_pages() - self.pager.free_pages()
+    }
+
+    /// Number of free blocks available.
+    pub fn free_blocks(&self) -> usize {
+        self.pager.free_pages()
+    }
+
+    /// Total pool capacity in blocks.
+    pub fn capacity_blocks(&self) -> usize {
+        self.pager.num_pages()
+    }
+
+    /// True if the pool has no more free blocks.
+    pub fn is_full(&self) -> bool {
+        self.pager.free_pages() == 0
+    }
+
+    /// Page size in bytes (size of each block).
+    pub fn page_size(&self) -> usize {
+        self.pager.page_size()
+    }
+}
+
+/// A guard that auto-frees a KV cache block when dropped.
+///
+/// Each handle holds a page index and the generation that was current at
+/// allocation time. On `Drop`, if the handle has not been explicitly freed,
+/// it returns the block to the allocator. The generation counter prevents
+/// use-after-free: any attempt to access a block through a stale handle
+/// will detect the mismatch.
+pub struct BlockHandle {
+    /// Weak reference to the allocator, so handles do not prevent the
+    /// allocator from being dropped.
+    allocator: Weak<Mutex<KvCacheBlockAllocator>>,
+    /// Page index within the IOSurface.
+    page_index: usize,
+    /// Generation at allocation time.
+    generation: u32,
+    /// True if this handle has been explicitly freed or marked.
+    freed: bool,
+}
+
+impl BlockHandle {
+    /// Create a new block handle.
+    ///
+    /// `allocator` must be the same `Arc<Mutex<KvCacheBlockAllocator>>` that
+    /// allocated the page. `index` and `generation` come from
+    /// [`KvCacheBlockAllocator::alloc_block`].
+    pub fn new(
+        allocator: &Arc<Mutex<KvCacheBlockAllocator>>,
+        index: usize,
+        generation: u32,
+    ) -> Self {
+        Self {
+            allocator: Arc::downgrade(allocator),
+            page_index: index,
+            generation,
+            freed: false,
+        }
+    }
+
+    /// The page index this handle refers to.
+    pub fn index(&self) -> usize {
+        self.page_index
+    }
+
+    /// The generation this handle holds (snapshot from allocation time).
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    /// Mark this handle as freed without returning the block to the allocator.
+    ///
+    /// Use this when the block was already freed externally (e.g. through
+    /// the allocator directly) to prevent a double-free on drop.
+    pub fn mark_freed(&mut self) {
+        self.freed = true;
+    }
+
+    /// Check whether this handle is still valid against the allocator's
+    /// current generation for this page index.
+    ///
+    /// Returns `None` when the allocator has been dropped (no way to verify).
+    /// Returns `Some(true)` when the generation still matches.
+    /// Returns `Some(false)` when the generation is stale (use-after-free).
+    pub fn is_valid(&self) -> Option<bool> {
+        let alloc = self.allocator.upgrade()?;
+        let guard = alloc.lock();
+        if self.page_index >= guard.generations.len() {
+            return Some(false);
+        }
+        Some(guard.generations[self.page_index] == self.generation)
+    }
+}
+
+impl Drop for BlockHandle {
+    fn drop(&mut self) {
+        if self.freed {
+            return;
+        }
+        if let Some(alloc) = self.allocator.upgrade() {
+            let mut guard = alloc.lock();
+            guard.free_block(self.page_index);
+        }
     }
 }
 

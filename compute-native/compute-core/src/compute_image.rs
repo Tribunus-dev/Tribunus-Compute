@@ -3325,6 +3325,7 @@ impl ImageRuntime {
                 layer_plan,
                 &crate::config::operation_route::OperationRoute::default(),
                 None,
+                &[],
                 &attn_norm,
                 &ffn_norm,
                 &qw,

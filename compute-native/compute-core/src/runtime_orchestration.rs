@@ -60,6 +60,62 @@ pub struct InMemoryCoordinationFabric {
 }
 
 impl InMemoryCoordinationFabric {
+    /// Synchronous admit — delegates to the same logic as the async trait impl.
+    pub fn admit_sync(
+        &mut self,
+        work_item: RuntimeWorkItem,
+    ) -> crate::Result<RuntimeOrchestrationRecord> {
+        work_item.receipt_before_ack_guard()?;
+        let phase_scope = Self::open_phase_scope(&work_item);
+        phase_scope.authority_guard()?;
+        let record = RuntimeOrchestrationRecord {
+            work_item: work_item.clone(),
+            phase_scope: Some(phase_scope),
+            state: CoordinationState::Admitted,
+            receipt: None,
+        };
+        self.records
+            .insert(work_item.work_id.clone(), record.clone());
+        Ok(record)
+    }
+
+    /// Synchronous commit_receipt — delegates to the same logic as the async method.
+    pub fn commit_receipt_sync(
+        &mut self,
+        work_id: &str,
+    ) -> crate::Result<RuntimeOrchestrationRecord> {
+        let record = self
+            .records
+            .get_mut(work_id)
+            .ok_or_else(|| crate::Error::from_reason("work item not admitted"))?;
+        let phase_scope = record
+            .phase_scope
+            .clone()
+            .ok_or_else(|| crate::Error::from_reason("phase scope missing"))?;
+        let receipt = Self::receipt_for(&record.work_item, &phase_scope);
+        record.receipt = Some(receipt);
+        record.state = CoordinationState::ReceiptCommitted;
+        Ok(record.clone())
+    }
+
+    /// Synchronous ack — delegates to the same logic as the async trait impl.
+    pub fn ack_sync(&mut self, work_id: &str) -> crate::Result<()> {
+        let record = self
+            .records
+            .get_mut(work_id)
+            .ok_or_else(|| crate::Error::from_reason("work item not admitted"))?;
+        if !matches!(
+            record.state,
+            CoordinationState::ReceiptCommitted | CoordinationState::AckEligible
+        ) {
+            return Err(crate::Error::from_reason(
+                "receipt must be committed before ack is eligible",
+            ));
+        }
+        record.state = CoordinationState::Acked;
+        Ok(())
+    }
+
     fn open_phase_scope(work_item: &RuntimeWorkItem) -> PhaseScope {
         PhaseScope {
             schema: "tribunus.phase_scope.v1".into(),

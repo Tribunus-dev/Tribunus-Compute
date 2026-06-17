@@ -11,10 +11,21 @@ use crate::engine_error::{EngineError, EngineErrorCode};
 use crate::kv_cache::KvCache;
 use crate::mapped_image::MappedImage;
 use crate::placement_profile::ExecutionPlacementProfile;
+use crate::runtime_contract::{
+    AuthorityMode, BackendTarget, BudgetClass, RetryPolicy, RuntimeWorkItem,
+};
+use crate::runtime_orchestration::InMemoryCoordinationFabric;
+use crate::heterogeneous::ComputeRuntime;
 use crate::runtime_trace::{RuntimeTimeline, TimelineEvent, TimelineEventType};
 use crate::session::InferenceSessionState;
 use crate::worker_memory;
+use crate::coreml_bridge::CoreMlModel;
 use mlx_rs::Array;
+
+/// Maximum tokens per prefill chunk for chunked prefill.
+/// Longer prompts are split into chunks to allow interleaving decode
+/// of other sequences between chunks, preventing long-prefill latency spikes.
+pub const PREFILL_CHUNK_SIZE: u32 = 512;
 
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -314,10 +325,17 @@ pub struct LoadedProfiledModel {
     pub handle_baseline: usize,
     /// Compiled ANE programs for layers routed to Orion.
     pub ane_cache: Option<crate::memory::ane_program_cache::AneProgramCache>,
+    /// Pre-loaded CoreML models for ANE-routed attention layers, indexed by
+    /// layer index. Fused islands replicate their model (via Arc) across
+    /// all covered layer slots.
+    pub ane_coreml_models: Vec<Option<std::sync::Arc<CoreMlModel>>>,
     /// Shared IOSurface memory island — all runtime memory allocations
     /// (intermediates, KV cache) come from this pool. MLX does NOT manage
     /// memory independently.
     pub memory_island: crate::heterogeneous::SharedMemoryIsland,
+    /// Compiled schedule with regions, memory plan, and evaluation boundaries.
+    /// Populated during [`new()`] from the manifest's architecture + execution plan.
+    pub scheduled_module: Option<crate::compiler::scheduled::ScheduledModule>,
 }
 
 impl LoadedProfiledModel {
@@ -560,6 +578,46 @@ impl LoadedProfiledModel {
             }
         };
 
+        // ── Load ANE CoreML models for ANE-routed attention layers ─────
+        let n_layers = reader.manifest.execution_plan.layers.len();
+        let mut ane_coreml_models: Vec<Option<std::sync::Arc<CoreMlModel>>> =
+            vec![None; n_layers];
+        for island in &reader.manifest.execution_plan.fused_ane_islands {
+            let model_path = image_dir.join(&island.modelc_relpath);
+            match CoreMlModel::load_with_compute_units(
+                &model_path.to_string_lossy(),
+                crate::coreml_bridge::CoreMlComputeUnits::CpuAndNeuralEngine,
+            ) {
+                Ok(m) => {
+                    let arc = std::sync::Arc::new(m);
+                    for &layer_idx in &island.layer_indices {
+                        let idx = layer_idx as usize;
+                        if idx < ane_coreml_models.len() {
+                            ane_coreml_models[idx] = Some(arc.clone());
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[profiled-model] WARNING: failed to load ANE CoreML \
+                         model for island {}: {} (falling back to MLX)",
+                        island.island_id, e,
+                    );
+                }
+            }
+        }
+
+        // ── Compile scheduled module (memory plan, regions, boundaries) ──
+        let scheduled_module = Some(
+            crate::compiler::compile_schedule::compile_model_to_scheduled_module(
+                &reader.manifest.execution_plan,
+                &reader.manifest.architecture,
+                crate::backend::routing::EvidenceDigest(
+                    reader.manifest.image_hash.clone(),
+                ),
+            ),
+        );
+
         Ok(Self {
             image_dir: image_dir.to_path_buf(),
             reader,
@@ -578,7 +636,9 @@ impl LoadedProfiledModel {
             materialized_bytes,
             handle_baseline,
             ane_cache,
+            ane_coreml_models,
             memory_island,
+            scheduled_module,
         })
     }
 }
@@ -594,6 +654,16 @@ pub struct ProfiledInferenceSession {
     pub phase: InferenceSessionState,
     pub cancellation_flag: AtomicBool,
     pub timeline: RuntimeTimeline,
+    /// Runtime coordination fabric — tracks every layer's work lifecycle.
+    pub coordinator: InMemoryCoordinationFabric,
+    /// Per-backend compute lanes (MLX, Accelerate, CoreML).
+    pub runtime: Option<ComputeRuntime>,
+    /// Chunked prefill: tokens processed so far in the current prefill.
+    pub prefilled_tokens: u32,
+    /// Remaining prompt tokens for chunked prefill (None = prefill complete).
+    pub pending_prompt_tokens: Option<Vec<u32>>,
+    /// Active memory plan for the Metal allocator (applied before layers).
+    pub memory_plan: Option<crate::memory::plan::MemoryPlan>,
 }
 
 impl ProfiledInferenceSession {
@@ -617,47 +687,65 @@ impl ProfiledInferenceSession {
             phase: InferenceSessionState::Created,
             cancellation_flag: AtomicBool::new(false),
             timeline,
+            coordinator: InMemoryCoordinationFabric::default(),
+            runtime: None,
+            prefilled_tokens: 0,
+            pending_prompt_tokens: None,
+            memory_plan: None,
         }
     }
 
-    /// Run prefill on the given prompt tokens, populating KV caches.
+    /// Populate the memory plan from a loaded model's scheduled module.
+    pub fn setup_from_model(&mut self, model: &LoadedProfiledModel) {
+        if let Some(scheduled) = &model.scheduled_module {
+            if let Some(plan) = crate::memory::plan::plan_from_scheduled_module(
+                scheduled,
+                &crate::arena::Arena::new(1, 1, mlx_rs::Dtype::Float32).unwrap_or_else(|_| panic!("tmp arena")),
+            ) {
+                self.memory_plan = Some(plan);
+            }
+        }
+    }
+
+    /// Chunked prefill: process the next chunk of the prompt.
     ///
-    /// Accepts a prompt of up to 64 tokens.  Runs the prologue, all layers,
-    /// and the epilogue.  Returns the first generated token (the model's
-    /// continuation after the prompt).
+    /// On the first call, stores the full prompt and processes the first
+    /// chunk of up to [`PREFILL_CHUNK_SIZE`] tokens.  Subsequent calls
+    /// continue from where the previous chunk left off.
     ///
-    /// On success, advances `absolute_position` to `prompt_token_ids.len()`
-    /// and transitions the session phase to `Decoding`.
-    pub fn prefill(
+    /// Returns `Ok(None)` when the prefill is complete and the session
+    /// has transitioned to `Decoding`. Returns `Ok(Some(token))` if more
+    /// chunks remain (the caller should interleave decode steps for other
+    /// sequences before calling this again).
+    pub fn prefill_chunk(
         &mut self,
         prompt_token_ids: &[u32],
         model: &LoadedProfiledModel,
-    ) -> Result<u32, EngineError> {
-        if prompt_token_ids.len() > 64 {
-            return Err(EngineError::new(
-                EngineErrorCode::InvalidRequest,
-                format!(
-                    "prefill prompt too long: {} tokens (max 64)",
-                    prompt_token_ids.len()
-                ),
-            ));
+    ) -> Result<Option<u32>, EngineError> {
+        // On first call, store full prompt
+        if self.prefilled_tokens == 0 {
+            self.pending_prompt_tokens = Some(prompt_token_ids.to_vec());
+            self.phase = InferenceSessionState::PrefillRunning;
+            self.runtime = Some(crate::heterogeneous::ComputeRuntime {
+                island: model.memory_island.clone(),
+                lanes: crate::heterogeneous::create_backend_lanes(),
+            });
         }
 
-        self.phase = InferenceSessionState::PrefillRunning;
-
         let plan = &model.reader.manifest.execution_plan;
-        let kv_offset = self.absolute_position;
-        let seq_len = prompt_token_ids.len() as u32;
+        let full_prompt = self.pending_prompt_tokens.as_ref().unwrap();
+        let remaining = full_prompt.len() as u32 - self.prefilled_tokens;
+        let chunk_size = remaining.min(PREFILL_CHUNK_SIZE);
 
-        // Convert u32 prompt to i32 for the MLX array constructor.
-        let token_ids_i32: Vec<i32> = prompt_token_ids.iter().map(|&t| t as i32).collect();
-        let tok_arr = Array::from_slice(&token_ids_i32, &[1, seq_len as i32]);
-        let _pos_arr = Array::from_slice(
-            &(kv_offset..kv_offset + seq_len)
-                .map(|p| p as i32)
-                .collect::<Vec<i32>>(),
-            &[1, seq_len as i32],
-        );
+        // Build the chunk of token IDs
+        let chunk_start = self.prefilled_tokens as usize;
+        let chunk_end = chunk_start + chunk_size as usize;
+        let chunk_tokens = &full_prompt[chunk_start..chunk_end];
+
+        // Convert to MLX array
+        let kv_offset = self.absolute_position;
+        let token_ids_i32: Vec<i32> = chunk_tokens.iter().map(|&t| t as i32).collect();
+        let tok_arr = Array::from_slice(&token_ids_i32, &[1, chunk_size as i32]);
 
         let mut hidden = crate::executor::run_prologue(
             &tok_arr,
@@ -667,30 +755,17 @@ impl ProfiledInferenceSession {
             &plan.prologue,
             crate::executor::prologue_hidden_scale(&plan.prologue),
         )
-        .map_err(|e| {
-            EngineError::new(
-                EngineErrorCode::InferenceFailed,
-                format!("prologue: {:?}", e),
-            )
-        })?;
+        .map_err(|e| EngineError::new(
+            EngineErrorCode::InferenceFailed,
+            format!("chunk prologue: {:?}", e),
+        ))?;
         hidden.eval().map_err(|e| {
-            EngineError::new(
-                EngineErrorCode::NumericalFailure,
-                format!("prologue eval: {}", e),
-            )
+            EngineError::new(EngineErrorCode::NumericalFailure, format!("chunk prologue eval: {}", e))
         })?;
 
-        eprintln!("[phase] prefill start");
-        for (l, layer_plan) in plan.layers.iter().enumerate() {
-            if self.cancellation_flag.load(Ordering::Relaxed) {
-                return Err(EngineError::new(
-                    EngineErrorCode::Cancelled,
-                    "cancelled during prefill",
-                ));
-            }
+        let slots = model.memory_island.preallocate_layer_slots(1, 3840);
 
-            let layer_start = std::time::Instant::now();
-            let handles_before = crate::bridge::handle_count();
+        for (l, layer_plan) in plan.layers.iter().enumerate() {
             let lw = &model.layers[l];
             let is_full = layer_plan.attention_kind == "full_attention";
             let (rcos, rsin) = if is_full {
@@ -704,33 +779,18 @@ impl ProfiledInferenceSession {
                 layer_plan,
                 &layer_plan.route,
                 Some(&model.memory_island),
+                &model.ane_coreml_models,
                 &lw.input_layernorm,
                 &lw.post_attention_layernorm,
-                &lw.q_proj_w,
-                &lw.q_proj_s,
-                &lw.q_proj_b,
-                &lw.k_proj_w,
-                &lw.k_proj_s,
-                &lw.k_proj_b,
-                &lw.v_proj_w,
-                &lw.v_proj_s,
-                &lw.v_proj_b,
-                &lw.o_proj_w,
-                &lw.o_proj_s,
-                &lw.o_proj_b,
-                lw.q_norm.as_deref(),
-                lw.k_norm.as_deref(),
-                &lw.gate_proj_w,
-                &lw.gate_proj_s,
-                &lw.gate_proj_b,
-                &lw.up_proj_w,
-                &lw.up_proj_s,
-                &lw.up_proj_b,
-                &lw.down_proj_w,
-                &lw.down_proj_s,
-                &lw.down_proj_b,
-                rcos,
-                rsin,
+                &lw.q_proj_w, &lw.q_proj_s, &lw.q_proj_b,
+                &lw.k_proj_w, &lw.k_proj_s, &lw.k_proj_b,
+                &lw.v_proj_w, &lw.v_proj_s, &lw.v_proj_b,
+                &lw.o_proj_w, &lw.o_proj_s, &lw.o_proj_b,
+                lw.q_norm.as_deref(), lw.k_norm.as_deref(),
+                &lw.gate_proj_w, &lw.gate_proj_s, &lw.gate_proj_b,
+                &lw.up_proj_w, &lw.up_proj_s, &lw.up_proj_b,
+                &lw.down_proj_w, &lw.down_proj_s, &lw.down_proj_b,
+                rcos, rsin,
                 &mut self.kv_caches[l],
                 kv_offset,
                 plan.rms_norm_eps as f32,
@@ -748,109 +808,95 @@ impl ProfiledInferenceSession {
                 },
             )
             .map_err(|e| {
-                EngineError::new(
-                    EngineErrorCode::InferenceFailed,
-                    format!("prefill layer {}: {}", l, e),
-                )
+                EngineError::new(EngineErrorCode::InferenceFailed, format!("chunk layer {}: {}", l, e))
             })?;
-            // OPT-0005: batch eval every 6 layers (one local/global cycle)
+            crate::heterogeneous::evaluate_into_island(slots.hidden_a.as_ref(), &hidden)
+                .map_err(|e| EngineError::new(
+                    EngineErrorCode::NumericalFailure,
+                    format!("chunk evaluate_into_island: {}", e),
+                ))?;
             if ((l + 1) % 6 == 0) || (l + 1 == plan.layers.len()) {
                 hidden.eval().map_err(|e| {
-                    self.kv_caches[l].rollback();
-                    EngineError::new(
-                        EngineErrorCode::NumericalFailure,
-                        format!("prefill layer {} eval: {}", l, e),
-                    )
+                    EngineError::new(EngineErrorCode::NumericalFailure, format!("chunk layer {} eval: {}", l, e))
                 })?;
             }
             self.kv_caches[l].commit_step();
-            let kvc = &self.kv_caches[l];
-            eprintln!(
-                "[kv] layer={} capacity={} committed={} seq_len={} copy_bytes={} allocated_bytes={}",
-                l, kvc.capacity, kvc.committed_len, kvc.seq_len, kvc.copy_bytes(), kvc.allocated_bytes()
-            );
-            let s = hidden.shape();
-            let layer_elapsed_ms = layer_start.elapsed().as_millis() as u64;
-            let shape_d0 = s.first().copied().unwrap_or(0);
-            let shape_d1 = s.get(1).copied().unwrap_or(0);
-            eprintln!(
-                "[full-model] layer={} kind={} elapsed_ms={} handles={}→{} active_mem={}→{} cache_mem={}→{} shape=[{},{}] finite={}",
-                l,
-                layer_plan.attention_kind,
-                layer_elapsed_ms,
-                handles_before,
-                crate::bridge::handle_count(),
-                format_bytes(crate::compute_image::mlx_active_memory_bytes()),
-                format_bytes(crate::compute_image::mlx_active_memory_bytes()), // measured after eval above
-                format_bytes(crate::compute_image::mlx_cache_memory_bytes()),
-                format_bytes(crate::compute_image::mlx_cache_memory_bytes()),
-                shape_d0, shape_d1,
-                true,
-            );
         }
-        eprintln!("[phase] prefill end");
 
-        for (l, _) in plan.layers.iter().enumerate() {
-            if self.kv_caches[l].committed_len != seq_len {
-                return Err(EngineError::new(
+        // Clear the memory plan after the layer loop completes.
+        // Subsequent allocations (epilogue, next chunk) use normal paths
+        // unless a new plan is applied before the next region.
+        if self.memory_plan.is_some() {
+            let _ = crate::memory::plan::clear_memory_plan();
+        }
+
+        self.prefilled_tokens += chunk_size;
+        self.absolute_position += chunk_size;
+
+        let is_last_chunk = self.prefilled_tokens >= full_prompt.len() as u32;
+        if is_last_chunk {
+            // Run epilogue on completion
+            let sampler = crate::session::SamplerConfig::default();
+            let out_token = crate::executor::run_epilogue(
+                &hidden,
+                &model.fn_w,
+                &model.emb_w,
+                &model.emb_s,
+                &model.emb_b,
+                &plan.epilogue,
+                plan.rms_norm_eps as f32,
+                plan.tie_word_embeddings,
+                &sampler,
+            )
+            .map_err(|e| EngineError::new(
+                EngineErrorCode::InferenceFailed,
+                format!("chunk epilogue: {:?}", e),
+            ))?;
+            out_token.selected_token.eval().map_err(|e| {
+                EngineError::new(EngineErrorCode::NumericalFailure, format!("chunk epilogue eval: {:?}", e))
+            })?;
+            let token = out_token.selected_token.try_as_slice::<u32>()
+                .map_err(|e| EngineError::new(
                     EngineErrorCode::InferenceFailed,
-                    format!(
-                        "prefill layer {} committed {} positions, expected {}",
-                        l, self.kv_caches[l].committed_len, seq_len
-                    ),
-                ));
+                    format!("chunk epilogue token: {:?}", e),
+                ))?
+                .first().copied().unwrap_or(0);
+            self.generated_tokens.push(token);
+            self.phase = InferenceSessionState::Decoding;
+            self.pending_prompt_tokens = None;
+            self.prefilled_tokens = 0;
+            return Ok(Some(token));
+        }
+
+        Ok(None)
+    }
+
+    /// Run prefill on the given prompt tokens, populating KV caches.
+    ///
+    /// Accepts a prompt of any length.  Internally delegates to
+    /// [`prefill_chunk`] for chunked execution.  Runs the prologue, all layers,
+    /// and the epilogue.  Returns the first generated token (the model's
+    /// continuation after the prompt).
+    ///
+    /// On success, advances `absolute_position` to `prompt_token_ids.len()`
+    /// and transitions the session phase to `Decoding`.
+    pub fn prefill(
+        &mut self,
+        prompt_token_ids: &[u32],
+        model: &LoadedProfiledModel,
+    ) -> Result<u32, EngineError> {
+        // Delegate to chunked prefill, processing all chunks in a loop
+        loop {
+            match self.prefill_chunk(prompt_token_ids, model)? {
+                Some(token) => return Ok(token),
+                None => {
+                    // More chunks remain — the caller would interleave
+                    // decode here in continuous batching mode.
+                    // For full-batch prefill we continue immediately.
+                    continue;
+        }
             }
         }
-
-        let sampler = crate::session::SamplerConfig::default();
-        let out_token = crate::executor::run_epilogue(
-            &hidden,
-            &model.fn_w,
-            &model.emb_w,
-            &model.emb_s,
-            &model.emb_b,
-            &plan.epilogue,
-            plan.rms_norm_eps as f32,
-            plan.tie_word_embeddings,
-            &sampler,
-        )
-        .map_err(|e| {
-            EngineError::new(
-                EngineErrorCode::InferenceFailed,
-                format!("epilogue: {:?}", e),
-            )
-        })?;
-
-        out_token.selected_token.eval().map_err(|e| {
-            EngineError::new(
-                EngineErrorCode::NumericalFailure,
-                format!("epilogue eval: {:?}", e),
-            )
-        })?;
-        let token = out_token
-            .selected_token
-            .try_as_slice::<u32>()
-            .map_err(|e| {
-                EngineError::new(
-                    EngineErrorCode::InferenceFailed,
-                    format!("epilogue token: {:?}", e),
-                )
-            })?
-            .first()
-            .copied()
-            .unwrap_or(0);
-
-        self.absolute_position = seq_len;
-        self.generated_tokens.push(token);
-        self.phase = InferenceSessionState::Decoding;
-
-        self.timeline.push_event(TimelineEvent::new(
-            seq_len as u64,
-            TimelineEventType::Prefill,
-            format!("prefilled {} tokens, first token {}", seq_len, token),
-        ));
-
-        Ok(token)
     }
 
     /// Decode one token using the model.
@@ -905,15 +951,60 @@ impl ProfiledInferenceSession {
             "[phase] decode_step start token_step={}",
             self.absolute_position
         );
+
+        // Apply memory plan before executing layers (if one is set).
+        // The plan tells the Metal allocator to use pre-assigned IOSurface
+        // slices instead of allocating new GPU memory for each tensor.
+        if let Some(plan) = &self.memory_plan {
+            unsafe {
+                plan.apply().map_err(|e| {
+                    EngineError::new(EngineErrorCode::NumericalFailure,
+                        format!("memory plan apply: {}", e))
+                })?;
+            }
+            }
+
         for (l, layer_plan) in plan.layers.iter().enumerate() {
             if self.cancellation_flag.load(Ordering::Relaxed) {
                 return Err(EngineError::new(
                     EngineErrorCode::Cancelled,
-                    "cancelled during decode",
+                    "cancelled during prefill",
                 ));
             }
 
             let layer_start = std::time::Instant::now();
+            let work_id = format!("layer_{}", l);
+            let backend_id = layer_plan.route.dominant_backend();
+            let target = match backend_id {
+                0 => BackendTarget::Mlx,
+                1 => BackendTarget::Accelerate,
+                2 | 3 => BackendTarget::Coreml,
+                _ => BackendTarget::Mlx,
+            };
+            let work_item = RuntimeWorkItem {
+                schema: "tribunus.runtime_work_item.v1".into(),
+                schema_version: "v1".into(),
+                work_id: work_id.clone(),
+                run_id: self.session_id.clone(),
+                phase_id: format!("decode_{}", l),
+                canonical_phase: Some("inference_layer".into()),
+                backend_target: target,
+                island_id: "island_main".into(),
+                input_tensor_ids: vec![format!("hidden_{}", l)],
+                output_tensor_ids: vec![format!("hidden_{}", l + 1)],
+                authority_mode: AuthorityMode::Authority,
+                deadline: String::new(),
+                budget_class: BudgetClass::Interactive,
+                retry_policy: RetryPolicy {
+                    max_retries: 0,
+                    backoff_ms: 0,
+                },
+                expected_receipts: vec![],
+                receipt_before_ack: true,
+            };
+            self.coordinator
+                .admit_sync(work_item)
+                .map_err(|e| EngineError::new(EngineErrorCode::InferenceFailed, format!("admit layer {}: {}", l, e)))?;
             let handles_before = crate::bridge::handle_count();
             let lw = &model.layers[l];
             let is_full = layer_plan.attention_kind == "full_attention";
@@ -928,6 +1019,7 @@ impl ProfiledInferenceSession {
                 layer_plan,
                 &layer_plan.route,
                 Some(&model.memory_island),
+                &model.ane_coreml_models,
                 &lw.input_layernorm,
                 &lw.post_attention_layernorm,
                 &lw.q_proj_w,
@@ -1011,6 +1103,12 @@ impl ProfiledInferenceSession {
                 shape_d0, shape_d1,
                 true,
             );
+            self.coordinator
+                .commit_receipt_sync(&work_id)
+                .map_err(|e| EngineError::new(EngineErrorCode::InferenceFailed, format!("commit receipt layer {}: {}", l, e)))?;
+            self.coordinator
+                .ack_sync(&work_id)
+                .map_err(|e| EngineError::new(EngineErrorCode::InferenceFailed, format!("ack layer {}: {}", l, e)))?;
         }
         eprintln!("[phase] decode_step end");
         let expected = kv_offset + 1;

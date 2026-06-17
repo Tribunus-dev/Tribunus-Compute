@@ -10,6 +10,11 @@ use crate::memory::allocator::IosurfaceAllocator;
 use crate::arena::Arena;
 
 use std::sync::Arc;
+use crate::coreml_bridge::CoreMlModel;
+use crate::compute_lane::{
+    ComputeCommand, ComputeLaneId, DeviceIdentity, LaneHandle,
+    spawn_lane,
+};
 use parking_lot::Mutex;
 
 // ── Backend Identifiers ────────────────────────────────────────────────
@@ -26,6 +31,14 @@ pub const ANE: u32 = 3;
 /// so downstream MLX ops read zero-copy from the same physical pages.
 pub struct SharedMemoryIsland {
     pub allocator: Arc<Mutex<IosurfaceAllocator>>,
+}
+
+impl Clone for SharedMemoryIsland {
+    fn clone(&self) -> Self {
+        Self {
+            allocator: self.allocator.clone(),
+        }
+    }
 }
 
 impl SharedMemoryIsland {
@@ -59,6 +72,71 @@ impl SharedMemoryIsland {
         .map_err(|e| mlx_rs::error::Exception::from(e.as_str()))?;
         Ok((arena_arc, arr))
     }
+}
+
+// ── Pre-allocated Layer Slots ───────────────────────────────────────────
+
+/// Four pre-allocated IOSurface arenas for a single layer's intermediate
+/// tensors.  Using persistent IOSurface memory avoids MLX temporary handle
+/// churn between layers.
+pub struct PreallocatedSlots {
+    pub hidden_a: Arc<Arena>,
+    pub hidden_b: Arc<Arena>,
+    pub attn_out: Arc<Arena>,
+    pub ffn_out: Arc<Arena>,
+}
+
+impl PreallocatedSlots {
+    #[inline]
+    pub fn get_hidden_a(&self) -> &Arena {
+        &self.hidden_a
+    }
+
+    #[inline]
+    pub fn get_hidden_b(&self) -> &Arena {
+        &self.hidden_b
+    }
+
+    #[inline]
+    pub fn get_attn_out(&self) -> &Arena {
+        &self.attn_out
+    }
+
+    #[inline]
+    pub fn get_ffn_out(&self) -> &Arena {
+        &self.ffn_out
+    }
+}
+
+impl SharedMemoryIsland {
+    /// Pre-allocate four [n_tokens, hidden_dim] f32 arenas for one layer pass.
+    pub fn preallocate_layer_slots(&self, n_tokens: i32, hidden_dim: i32) -> PreallocatedSlots {
+        let shape = &[n_tokens, hidden_dim];
+        let dtype = mlx_rs::Dtype::Float32;
+        let (a, _) = self.alloc_mlx_array(shape, dtype).expect("hidden_a");
+        let (b, _) = self.alloc_mlx_array(shape, dtype).expect("hidden_b");
+        let (o, _) = self.alloc_mlx_array(shape, dtype).expect("attn_out");
+        let (f, _) = self.alloc_mlx_array(shape, dtype).expect("ffn_out");
+        PreallocatedSlots {
+            hidden_a: a,
+            hidden_b: b,
+            attn_out: o,
+            ffn_out: f,
+        }
+    }
+}
+
+/// Evaluate an MLX array such that its result materializes into `arena`'s
+/// IOSurface backing store.  This is a safe wrapper around
+/// [`Arena::evaluate_into`].
+pub fn evaluate_into_island(arena: &Arena, array: &Array) -> MlxResult<()> {
+    unsafe {
+        arena.evaluate_into(array)
+    }
+    .map_err(|e| {
+        let msg = e.to_string();
+        mlx_rs::error::Exception::from(msg.as_str())
+    })
 }
 
 // ── Accelerate Dispatch (IOSurface-backed) ─────────────────────────────
@@ -275,11 +353,162 @@ pub fn dispatch_reshape(x: &Array, shape: &[i32], route: &OperationRoute) -> Mlx
 
 // ── CoreML / ANE Dispatch (stub) ──────────────────────────────────────
 
+// ── CoreML / ANE Dispatch ────────────────────────────────────────────
+
+/// Dispatch attention to the ANE via a pre-loaded CoreML model.
+///
+/// Extracts Q, K, V data from MLX arrays into an IOSurface-backed input
+/// arena, runs the CoreML model via `predict`, and reads the result back
+/// as an MLX Array from the output arena.
 pub fn dispatch_attention_ane(
-    _query: &Array, _key: &Array, _value: &Array,
-    _cache: &mut crate::kv_cache::KvCache, _layer_name: &str,
+    query: &Array,
+    key: &Array,
+    value: &Array,
+    model: &CoreMlModel,
+    island: &SharedMemoryIsland,
 ) -> MlxResult<Array> {
-    Array::zeros::<f32>(&_query.shape())
+    // 1. Eval and extract Q, K, V as f32 slices
+    query.eval()?;
+    key.eval()?;
+    value.eval()?;
+
+    let q_slice = query
+        .try_as_slice::<f32>()
+        .map_err(|_| mlx_rs::error::Exception::from("ANE: query try_as_slice failed"))?;
+    let k_slice = key
+        .try_as_slice::<f32>()
+        .map_err(|_| mlx_rs::error::Exception::from("ANE: key try_as_slice failed"))?;
+    let v_slice = value
+        .try_as_slice::<f32>()
+        .map_err(|_| mlx_rs::error::Exception::from("ANE: value try_as_slice failed"))?;
+
+    let q_len = q_slice.len();
+    let k_len = k_slice.len();
+    let v_len = v_slice.len();
+    let total = q_len + k_len + v_len;
+
+    // 2. Concatenate Q, K, V into a single flat buffer
+    let mut qkv = Vec::with_capacity(total);
+    qkv.extend_from_slice(q_slice);
+    qkv.extend_from_slice(k_slice);
+    qkv.extend_from_slice(v_slice);
+
+    // 3. Allocate input IOSurface arena and write QKV data
+    let (input_arena, _input_arr) = island
+        .alloc_mlx_array(&[1, total as i32], mlx_rs::Dtype::Float32)
+        .map_err(|_| mlx_rs::error::Exception::from(
+            "ANE alloc input arena"
+        ))?;
+    unsafe {
+        let ptr = input_arena.base_ptr() as *mut f32;
+        std::ptr::copy_nonoverlapping(qkv.as_ptr(), ptr, total);
+    }
+
+    // 4. Allocate output IOSurface arena (same shape as query)
+    let out_shape = query.shape();
+    let (output_arena, output_arr) = island
+        .alloc_mlx_array(out_shape, mlx_rs::Dtype::Float32)
+        .map_err(|_| mlx_rs::error::Exception::from(
+            "ANE alloc output arena"
+        ))?;
+
+    // 5. Run CoreML prediction
+    model.predict("query", &input_arena.info, "output", &output_arena.info)
+        .map_err(|e| -> mlx_rs::error::Exception {
+            let msg = format!("ANE predict: {}", e);
+            mlx_rs::error::Exception::from(msg.as_str())
+        })?;
+
+
+    // 6. Return the output MLX Array backed by the IOSurface
+    Ok(output_arr)
+}
+
+/// Dispatch attention to the ANE via a per-layer cache of CoreML models.
+///
+/// Looks up the pre-loaded model for `layer_idx`, calls
+/// [`dispatch_attention_ane`], and falls back to an error if no model is
+/// available for this layer.
+pub fn dispatch_attention_coreml(
+    query: &Array,
+    key: &Array,
+    value: &Array,
+    ane_models: &[Option<std::sync::Arc<CoreMlModel>>],
+    layer_idx: usize,
+    island: &SharedMemoryIsland,
+) -> MlxResult<Array> {
+    if let Some(Some(model)) = ane_models.get(layer_idx) {
+        dispatch_attention_ane(query, key, value, model, island)
+    } else {
+        Err(mlx_rs::error::Exception::from(
+            "ANE model not available for this layer",
+        ))
+    }
+}
+
+// ── Backend execution lanes ──────────────────────────────────────────
+
+/// A set of one lane per backend for heterogeneous execution.
+pub struct BackendLanes {
+    pub mlx: LaneHandle,
+    pub accelerate: LaneHandle,
+    pub coreml: LaneHandle,
+}
+
+/// Drain commands from a stub backend lane — accepts commands but does
+/// not process them.  The channel is kept open so senders do not fail.
+fn stub_runner(mut rx: tokio::sync::mpsc::Receiver<ComputeCommand>) {
+    while let Some(_cmd) = rx.blocking_recv() {
+        // Stub: accept and discard all commands.
+    }
+}
+
+/// Create one stub lane per backend (MLX, Accelerate, CoreML).
+pub fn create_backend_lanes() -> BackendLanes {
+    let mlx = spawn_lane(
+        ComputeLaneId(0),
+        DeviceIdentity {
+            lane_id: ComputeLaneId(0),
+            backend_name: "mlx".into(),
+            substrate: "stub".into(),
+        },
+        64,
+        move |rx| stub_runner(rx),
+    );
+
+    let accelerate = spawn_lane(
+        ComputeLaneId(1),
+        DeviceIdentity {
+            lane_id: ComputeLaneId(1),
+            backend_name: "accelerate".into(),
+            substrate: "stub".into(),
+        },
+        64,
+        move |rx| stub_runner(rx),
+    );
+
+    let coreml = spawn_lane(
+        ComputeLaneId(2),
+        DeviceIdentity {
+            lane_id: ComputeLaneId(2),
+            backend_name: "coreml".into(),
+            substrate: "stub".into(),
+        },
+        64,
+        move |rx| stub_runner(rx),
+    );
+
+    BackendLanes {
+        mlx,
+        accelerate,
+        coreml,
+    }
+}
+
+/// Combined compute runtime — shared memory island and per-backend lanes.
+pub struct ComputeRuntime {
+    pub island: SharedMemoryIsland,
+    pub lanes: BackendLanes,
 }
 
 // ── Heterogeneous Layer Runner ─────────────────────────────────────────
@@ -302,7 +531,7 @@ pub fn run_layer_heterogeneous(
     ctx: &crate::projection_identity::ProjectionContext,
 ) -> MlxResult<Array> {
     crate::executor::run_layer(
-        hidden, plan, route, island,
+        hidden, plan, route, island, &[],
         attn_norm, ffn_norm,
         qw, qs, qb, kw, ks, kb, vw, vs, vb, ow, os, ob,
         q_norm_weight, k_norm_weight,

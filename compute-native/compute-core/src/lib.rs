@@ -50,6 +50,7 @@ pub mod experiment;
 pub mod external_array;
 pub mod fusion_region;
 pub mod gemma;
+pub mod gguf;
 pub mod gpu_worker;
 pub mod heterogeneous;
 pub mod hybrid_profile;
@@ -97,6 +98,7 @@ pub mod scheduling;
 pub mod server;
 pub mod session;
 pub mod sidecar;
+pub mod speculative;
 
 #[cfg(feature = "storage-adapters")]
 pub mod storage_adapters;

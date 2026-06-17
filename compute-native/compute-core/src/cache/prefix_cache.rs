@@ -5,8 +5,9 @@
 //! Detects common prefixes across requests, stores KV cache blocks indexed
 //! by token hash, and reuses cached blocks to avoid redundant computation.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::time::Instant;
 
 /// Fixed number of tokens per prefix block
@@ -80,27 +81,107 @@ impl BlockAwarePrefixCache {
         }
     }
 
-    /// Compute block hash from a slice of token IDs
-    pub fn compute_block_hash(_tokens: &[u32]) -> BlockHash {
-        // TODO: implement block hashing (SipHash or SHA-256)
-        todo!("block hash computation not yet implemented")
-    }
-
-    /// Find longest matching prefix in the cache
+    /// Compute block hash from a slice of token IDs.
     ///
-    /// Returns (matched block indices, remaining token slice start)
-    pub fn find_prefix(&self, _tokens: &[u32]) -> (Vec<&BlockCacheEntry>, usize) {
-        // TODO: walk the prefix tree to find longest match
-        todo!("prefix lookup not yet implemented")
+    /// Uses `DefaultHasher` (SipHash-2-4) to hash up to `PREFIX_BLOCK_SIZE` tokens.
+    /// If the slice is shorter than 64 tokens, remaining positions are padded with `0u32`.
+    /// The 64-bit SipHash result is expanded deterministically to fill a 32-byte block hash.
+    pub fn compute_block_hash(tokens: &[u32]) -> BlockHash {
+        let mut hasher = DefaultHasher::new();
+        let n = tokens.len().min(PREFIX_BLOCK_SIZE);
+        for &tok in &tokens[..n] {
+            tok.hash(&mut hasher);
+        }
+        for _ in n..PREFIX_BLOCK_SIZE {
+            0u32.hash(&mut hasher);
+        }
+        let result = hasher.finish();
+
+        // Expand the 64-bit hash to 32 bytes by repeating with wrapping multiplies
+        let mut hash = [0u8; 32];
+        hash[..8].copy_from_slice(&result.to_le_bytes());
+        for i in 1..4 {
+            let v = result.wrapping_mul(i as u64 + 1);
+            hash[i * 8..(i + 1) * 8].copy_from_slice(&v.to_le_bytes());
+        }
+        BlockHash(hash)
     }
 
-    /// Insert new blocks into the cache
-    pub fn insert(&mut self, _tokens: &[u32]) {
-        // TODO: chunk tokens, hash, store in cache, update LRU
+    /// Find longest matching prefix in the cache.
+    ///
+    /// Walks the token sequence in `PREFIX_BLOCK_SIZE` chunks, computing the hash
+    /// for each block and looking it up in the cache. Returns the matched entries
+    /// and the token index where matching stopped (first miss or end of input).
+    pub fn find_prefix(&mut self, tokens: &[u32]) -> (Vec<&BlockCacheEntry>, usize) {
+        let mut matched = Vec::new();
+        let mut matched_blocks = 0usize;
+        let total_blocks = (tokens.len() + PREFIX_BLOCK_SIZE - 1) / PREFIX_BLOCK_SIZE;
+
+        for block_idx in 0..total_blocks {
+            let start = block_idx * PREFIX_BLOCK_SIZE;
+            let end = (start + PREFIX_BLOCK_SIZE).min(tokens.len());
+            let block_tokens = &tokens[start..end];
+            let hash = Self::compute_block_hash(block_tokens);
+
+            if let Some(entry) = self.cache.get(&hash) {
+                matched.push(entry);
+                matched_blocks += 1;
+                self.stats.hits += 1;
+            } else {
+                // First miss breaks the prefix
+                self.stats.misses += 1;
+                break;
+            }
+        }
+
+        let matched_tokens = matched_blocks * PREFIX_BLOCK_SIZE;
+        (matched, matched_tokens)
     }
 
-    /// Evict least recently used blocks
-    #[allow(dead_code)]
+    /// Insert new blocks into the cache.
+    ///
+    /// Chunks the token sequence into blocks of `PREFIX_BLOCK_SIZE`, hashes each
+    /// block, and either updates the LRU position (if already cached) or inserts
+    /// a new entry and evicts if over capacity.
+    pub fn insert(&mut self, tokens: &[u32]) {
+        let total_blocks = (tokens.len() + PREFIX_BLOCK_SIZE - 1) / PREFIX_BLOCK_SIZE;
+
+        for block_idx in 0..total_blocks {
+            let start = block_idx * PREFIX_BLOCK_SIZE;
+            let end = (start + PREFIX_BLOCK_SIZE).min(tokens.len());
+            let block_tokens = &tokens[start..end];
+            let hash = Self::compute_block_hash(block_tokens);
+
+            if self.cache.contains_key(&hash) {
+                // Already cached — touch LRU by moving to back
+                self.touch_lru(&hash);
+                continue;
+            }
+
+            let block_index = self.stats.cached_blocks + block_idx;
+            let entry = BlockCacheEntry {
+                block_hash: hash,
+                block_index,
+                last_access: Instant::now(),
+            };
+
+            self.cache.insert(hash, entry);
+            self.lru_order.push_back(hash);
+            self.stats.cached_blocks += 1;
+
+            self.evict_lru();
+        }
+    }
+
+    /// Touch a hash in the LRU order, moving it to the back (most recently used).
+    fn touch_lru(&mut self, hash: &BlockHash) {
+        if let Some(pos) = self.lru_order.iter().position(|h| *h == *hash) {
+            let h = self.lru_order.remove(pos).unwrap();
+            self.lru_order.push_back(h);
+        }
+    }
+
+    /// Evict least recently used blocks until the cache is within capacity.
     fn evict_lru(&mut self) {
         while self.cache.len() > self.max_blocks {
             if let Some(hash) = self.lru_order.pop_front() {
@@ -108,6 +189,14 @@ impl BlockAwarePrefixCache {
                 self.stats.evicted_blocks += 1;
             }
         }
+    }
+
+    /// Clear all cache state: entries, LRU order, tip lineage, and stats.
+    pub fn clear(&mut self) {
+        self.cache.clear();
+        self.lru_order.clear();
+        self.tip_lineage.clear();
+        self.stats = PrefixCacheStats::default();
     }
 
     /// Get cache stats
@@ -122,7 +211,6 @@ mod tests {
 
     #[test]
     fn test_block_hash_creation() {
-        // Just tests the type compiles and default behavior
         let _cache = BlockAwarePrefixCache::new(1024);
     }
 
@@ -132,5 +220,127 @@ mod tests {
         assert!(table.is_empty());
         table.blocks.push(0);
         assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn test_compute_block_hash_consistency() {
+        let tokens = vec![42u32, 99, 7, 13];
+        let h1 = BlockAwarePrefixCache::compute_block_hash(&tokens);
+        let h2 = BlockAwarePrefixCache::compute_block_hash(&tokens);
+        assert_eq!(h1, h2, "same input must produce same hash");
+    }
+
+    #[test]
+    fn test_compute_block_hash_padding() {
+        let short = vec![1u32];
+        let long: Vec<u32> = (0..PREFIX_BLOCK_SIZE as u32).collect();
+        let h_short = BlockAwarePrefixCache::compute_block_hash(&short);
+        let h_long = BlockAwarePrefixCache::compute_block_hash(&long);
+        assert_ne!(h_short, h_long, "padded short must differ from full block");
+    }
+
+    #[test]
+    fn test_insert_and_find_prefix() {
+        let mut cache = BlockAwarePrefixCache::new(64);
+        let tokens: Vec<u32> = (0..128).collect(); // 2 full blocks
+
+        cache.insert(&tokens);
+        assert_eq!(cache.stats.cached_blocks, 2);
+
+        let (matched, matched_tokens) = cache.find_prefix(&tokens);
+        assert_eq!(matched.len(), 2);
+        assert_eq!(matched_tokens, 128);
+        assert_eq!(cache.stats.hits, 2);
+    }
+
+    #[test]
+    fn test_find_prefix_partial_match() {
+        let mut cache = BlockAwarePrefixCache::new(64);
+        let first_block: Vec<u32> = (0..64).collect();
+        let second_block: Vec<u32> = (64..128).collect();
+        let both: Vec<u32> = [&first_block[..], &second_block[..]].concat();
+
+        // Insert only the first block
+        cache.insert(&first_block);
+        assert_eq!(cache.stats.cached_blocks, 1);
+
+        // Searching two blocks should match only the first
+        let (matched, matched_tokens) = cache.find_prefix(&both);
+        assert_eq!(matched.len(), 1);
+        assert!(matched_tokens < 128);
+        assert!(matched_tokens >= 64);
+        assert_eq!(cache.stats.hits, 1);
+        assert_eq!(cache.stats.misses, 1);
+    }
+
+    #[test]
+    fn test_eviction() {
+        let mut cache = BlockAwarePrefixCache::new(2); // only 2 blocks
+        let block_a: Vec<u32> = (0..64).collect();
+        let block_b: Vec<u32> = (64..128).collect();
+        let block_c: Vec<u32> = (128..192).collect();
+
+        cache.insert(&block_a);
+        cache.insert(&block_b);
+        assert_eq!(cache.stats.cached_blocks, 2);
+
+        // Inserting C should evict A (oldest)
+        cache.insert(&block_c);
+        assert_eq!(cache.stats.cached_blocks, 3); // was incremented
+        assert_eq!(cache.stats.evicted_blocks, 1);
+
+        // A should no longer be findable
+        let (matched, _) = cache.find_prefix(&block_a);
+        assert!(matched.is_empty());
+
+        // B and C should still be findable
+        let (matched_b, _) = cache.find_prefix(&block_b);
+        assert_eq!(matched_b.len(), 1);
+        let (matched_c, _) = cache.find_prefix(&block_c);
+        assert_eq!(matched_c.len(), 1);
+    }
+
+    #[test]
+    fn test_clear() {
+        let mut cache = BlockAwarePrefixCache::new(64);
+        let tokens: Vec<u32> = (0..128).collect();
+        cache.insert(&tokens);
+        assert!(cache.stats.cached_blocks > 0);
+
+        cache.clear();
+        assert_eq!(cache.stats.cached_blocks, 0);
+        assert_eq!(cache.stats.evicted_blocks, 0);
+        assert_eq!(cache.stats.hits, 0);
+        assert!(cache.cache.is_empty());
+        assert!(cache.lru_order.is_empty());
+    }
+
+    #[test]
+    fn test_find_prefix_empty_tokens() {
+        let mut cache = BlockAwarePrefixCache::new(64);
+        let (matched, matched_tokens) = cache.find_prefix(&[]);
+        assert!(matched.is_empty());
+        assert_eq!(matched_tokens, 0);
+    }
+
+    #[test]
+    fn test_insert_empty_tokens() {
+        let mut cache = BlockAwarePrefixCache::new(64);
+        cache.insert(&[]);
+        assert_eq!(cache.stats.cached_blocks, 0);
+        assert!(cache.cache.is_empty());
+    }
+
+    #[test]
+    fn test_compute_block_hash_truncation() {
+        // More than PREFIX_BLOCK_SIZE tokens should be truncated
+        let exact: Vec<u32> = (0..PREFIX_BLOCK_SIZE as u32).collect();
+        let longer: Vec<u32> = (0..PREFIX_BLOCK_SIZE as u32 + 10).collect();
+        let h_exact = BlockAwarePrefixCache::compute_block_hash(&exact);
+        let h_longer = BlockAwarePrefixCache::compute_block_hash(&longer);
+        assert_eq!(
+            h_exact, h_longer,
+            "excess tokens beyond block size must be ignored"
+        );
     }
 }

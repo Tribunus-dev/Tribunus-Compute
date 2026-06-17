@@ -13,11 +13,14 @@ pub mod enforcer;
 pub mod iosurface_storage;
 pub mod monitor;
 pub mod orion_bridge;
+pub mod plan;
 pub mod pool;
 pub mod telemetry;
 
 pub use allocator::IosurfaceAllocator;
 pub use allocator::PagedIosurfaceAllocator;
+pub use allocator::BlockHandle;
+pub use allocator::KvCacheBlockAllocator;
 pub use enforcer::MemoryEnforcer;
 pub use monitor::MemoryMonitor;
 pub use pool::EnginePool;

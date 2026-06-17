@@ -72,6 +72,7 @@ pub fn run_layer(
     plan: &LayerPlan,
     route: &OperationRoute,
     island: Option<&crate::heterogeneous::SharedMemoryIsland>,
+    ane_coreml_models: &[Option<std::sync::Arc<crate::coreml_bridge::CoreMlModel>>],
     // Attention norm weights
     attn_norm: &Array,
     ffn_norm: &Array,
@@ -128,6 +129,10 @@ pub fn run_layer(
         "sliding_attention" => sliding_attention_layer(
             &normed,
             plan,
+            route,
+            ane_coreml_models,
+            plan.layer_index as usize,
+            island,
             qw,
             qs,
             qb,
@@ -151,6 +156,10 @@ pub fn run_layer(
         "full_attention" => full_attention_layer(
             &normed,
             plan,
+            route,
+            ane_coreml_models,
+            plan.layer_index as usize,
+            island,
             qw,
             qs,
             qb,
@@ -226,7 +235,9 @@ pub fn run_layer(
         6,
     )?;
 
-    crate::heterogeneous::dispatch_add(residual, &ffn_out, route, island)
+    let result = crate::heterogeneous::dispatch_add(residual, &ffn_out, route, island)?;
+    result.eval()?;
+    Ok(result)
 }
 
 // ── Attention implementations ──────────────────────────────────────────────
@@ -386,6 +397,10 @@ fn qmatmul_attributed(
 fn sliding_attention_layer(
     x: &Array,
     plan: &LayerPlan,
+    route: &OperationRoute,
+    ane_coreml_models: &[Option<std::sync::Arc<crate::coreml_bridge::CoreMlModel>>],
+    layer_idx: usize,
+    island: Option<&crate::heterogeneous::SharedMemoryIsland>,
     qw: &Array,
     qs: &Array,
     qb: &Array,
@@ -461,6 +476,20 @@ fn sliding_attention_layer(
     k.eval()?;
     v.eval()?;
 
+    // ANE dispatch: if this layer is routed to ANE, send Q/K/V to CoreML
+    if route.attention == crate::heterogeneous::ANE {
+        return crate::heterogeneous::dispatch_attention_coreml(
+            &q, &k, &v,
+            ane_coreml_models,
+            layer_idx,
+            island.ok_or_else(|| {
+                mlx_rs::error::Exception::from(
+                    "ANE sliding attention requires SharedMemoryIsland",
+                )
+            })?,
+        );
+    }
+
     cache.append(k, v)?;
     let (k_cached, v_cached) = cache
         .read_window()
@@ -516,6 +545,10 @@ fn sliding_attention_layer(
 fn full_attention_layer(
     x: &Array,
     plan: &LayerPlan,
+    route: &OperationRoute,
+    ane_coreml_models: &[Option<std::sync::Arc<crate::coreml_bridge::CoreMlModel>>],
+    layer_idx: usize,
+    island: Option<&crate::heterogeneous::SharedMemoryIsland>,
     qw: &Array,
     qs: &Array,
     qb: &Array,
@@ -595,6 +628,20 @@ fn full_attention_layer(
     q.eval()?;
     k.eval()?;
     v.eval()?;
+    // ANE dispatch: if this layer is routed to ANE, send Q/K/V to CoreML
+    if route.attention == crate::heterogeneous::ANE {
+        return crate::heterogeneous::dispatch_attention_coreml(
+            &q, &k, &v,
+            ane_coreml_models,
+            layer_idx,
+            island.ok_or_else(|| {
+                mlx_rs::error::Exception::from(
+                    "ANE full attention requires SharedMemoryIsland",
+                )
+            })?,
+        );
+    }
+
     cache.append(k, v)?;
     let (k_cached, v_cached) = cache
         .read_window()
