@@ -15,7 +15,7 @@ pub trait OutputBufferHint {
 }
 
 extern "C" {
-    fn tribunus_arena_alloc(info: *mut ArenaInfo, dim0: i32, dim1: i32) -> i32;
+    fn tribunus_arena_alloc(info: *mut ArenaInfo, dim0: i32, dim1: i32, dtype: i32) -> i32;
     fn tribunus_arena_free(info: *mut ArenaInfo);
     fn tribunus_arena_io_surface_id(info: *const ArenaInfo) -> i32;
     fn tribunus_arena_lock(info: *const ArenaInfo) -> i32;
@@ -46,13 +46,15 @@ impl Arena {
     /// Currently supports FP16 only. Returns an error for any other dtype.
     /// The ObjC bridge owns all storage; Rust merely holds the metadata.
     pub fn new(logical_dim0: u32, logical_dim1: u32, dtype: mlx_rs::Dtype) -> Result<Self, String> {
-        if dtype != mlx_rs::Dtype::Float16 {
-            return Err(format!("unsupported arena dtype: {:?} (FP16 only)", dtype));
+        match dtype {
+            mlx_rs::Dtype::Float16 | mlx_rs::Dtype::Float32 => {},
+            _ => return Err(format!("unsupported arena dtype: {:?} (FP16/F32 only)", dtype)),
         }
 
         let mut info: ArenaInfo = unsafe { std::mem::zeroed() };
-        let rc =
-            unsafe { tribunus_arena_alloc(&mut info, logical_dim0 as i32, logical_dim1 as i32) };
+        let rc = unsafe {
+            tribunus_arena_alloc(&mut info, logical_dim0 as i32, logical_dim1 as i32, dtype as i32)
+        };
         if rc != 0 {
             return Err(format!("tribunus_arena_alloc failed: {}", rc));
         }

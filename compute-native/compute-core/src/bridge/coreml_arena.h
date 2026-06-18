@@ -24,7 +24,8 @@ typedef struct {
 
 int tribunus_arena_alloc(TribunusArenaInfo* info,
                           int32_t logical_dim0,
-                          int32_t logical_dim1);
+                          int32_t logical_dim1,
+                          int32_t dtype);
 
 void tribunus_arena_free(TribunusArenaInfo* info);
 

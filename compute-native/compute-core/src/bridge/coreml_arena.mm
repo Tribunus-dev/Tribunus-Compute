@@ -12,26 +12,38 @@
 // It may not be defined in older SDKs, so define it ourselves.
 #ifndef kCVPixelFormatType_OneComponent16Half
 #define kCVPixelFormatType_OneComponent16Half 0x4C303068
+
+#ifndef kCVPixelFormatType_OneComponent32Float
+#define kCVPixelFormatType_OneComponent32Float 0x4C303066
+#endif
 #endif
 
 extern "C" {
 
 int tribunus_arena_alloc(TribunusArenaInfo* info,
                           int32_t logical_dim0,
-                          int32_t logical_dim1) {
+                          int32_t logical_dim1,
+                          int32_t dtype) {
     @autoreleasepool {
         if (!info || logical_dim0 <= 0 || logical_dim1 <= 0) return -1;
         memset(info, 0, sizeof(TribunusArenaInfo));
 
+        // Select pixel format based on dtype
+        bool is_float16 = (dtype == 0);  // MLX Dtype::Float16 = 0
+        int bytes_per_elem = is_float16 ? 2 : 4;
+        uint32_t pixel_format = is_float16
+            ? kCVPixelFormatType_OneComponent16Half
+            : kCVPixelFormatType_OneComponent32Float;
+
         int32_t width = logical_dim1;
         int32_t height = logical_dim0;
-        int32_t byte_size = width * height * 2; // FP16 = 2 bytes per element
+        int32_t byte_size = width * height * bytes_per_elem;
 
         NSDictionary* surfaceAttrs = @{
             (id)kIOSurfaceWidth: @(width),
             (id)kIOSurfaceHeight: @(height),
-            (id)kIOSurfaceBytesPerElement: @(2),
-            (id)kIOSurfacePixelFormat: @(kCVPixelFormatType_OneComponent16Half),
+            (id)kIOSurfaceBytesPerElement: @(bytes_per_elem),
+            (id)kIOSurfacePixelFormat: @(pixel_format),
         };
 
         IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)surfaceAttrs);
@@ -68,7 +80,7 @@ int tribunus_arena_alloc(TribunusArenaInfo* info,
         info->height = height;
         info->logical_dim0 = logical_dim0;
         info->logical_dim1 = logical_dim1;
-        info->pixel_format = kCVPixelFormatType_OneComponent16Half;
+        info->pixel_format = pixel_format;
         info->byte_size = byte_size;
         info->bytes_per_row = (uint32_t)bpr;
         info->base_address = base;
