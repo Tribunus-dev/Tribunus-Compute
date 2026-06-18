@@ -87,8 +87,10 @@ impl AneSinkDetector {
         self.total_predictions += 1;
 
         // Prefer ANE path when a model is loaded.
-        if let Some(ref model) = self.model {
-            return self.check_ane(model, attention_weights);
+        if let Some(model) = self.model.take() {
+            let result = self.check_ane(&model, attention_weights);
+            self.model = Some(model);
+            return result;
         }
 
         // CPU fallback: compute entropy heuristic.

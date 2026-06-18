@@ -110,10 +110,10 @@ impl AccelerateBackend {
     /// Handles free-list reuse and generation bumping.
     fn allocate_slot(&mut self, storage: TensorStorage, shape: &[i32]) -> Result<usize, String> {
         if let Some(idx) = self.free_list.pop() {
-            let gen = self.generations[idx]
+            let generation = self.generations[idx]
                 .checked_add(1)
                 .ok_or_else(|| "generation overflow".to_string())?;
-            self.generations[idx] = gen;
+            self.generations[idx] = generation;
             self.tensors[idx] = Some(storage);
             self.shapes[idx] = Some(shape.to_vec());
             Ok(idx)
@@ -246,19 +246,19 @@ impl AccelerateBackend {
         handle: QuantizedWeightHandle,
     ) -> Result<&mut DequantizedWeight, String> {
         let slot = handle.slot as usize;
-        let gen = handle.generation;
+        let generation = handle.generation;
         match self.weight_storage.get_mut(slot) {
-            Some(Some(w)) if gen == self.weight_generations[slot] => Ok(w),
-            _ => Err(format!("invalid quantized weight slot={slot} gen={gen}")),
+            Some(Some(w)) if generation == self.weight_generations[slot] => Ok(w),
+            _ => Err(format!("invalid quantized weight slot={slot} gen={generation}")),
         }
     }
 
     /// Release a quantized weight, freeing its slot.
     pub fn release_weight(&mut self, handle: QuantizedWeightHandle) -> Result<(), String> {
         let slot = handle.slot as usize;
-        let gen = handle.generation;
-        if slot >= self.weight_storage.len() || self.weight_generations[slot] != gen {
-            return Err(format!("invalid weight handle slot={slot} gen={gen}"));
+        let generation = handle.generation;
+        if slot >= self.weight_storage.len() || self.weight_generations[slot] != generation {
+            return Err(format!("invalid weight handle slot={slot} gen={generation}"));
         }
         if self.weight_storage[slot].is_none() {
             return Err(format!("weight slot {slot} already released"));
@@ -1231,10 +1231,10 @@ impl TensorBackend for AccelerateBackend {
 
     fn release(&mut self, handle: TensorHandle) -> Result<(), String> {
         let slot = handle.slot as usize;
-        let gen = handle.generation;
-        if slot >= self.tensors.len() || self.generations[slot] != gen {
+        let generation = handle.generation;
+        if slot >= self.tensors.len() || self.generations[slot] != generation {
             return Err(format!(
-                "AccelerateBackend: invalid handle slot={slot} gen={gen}"
+                "AccelerateBackend: invalid handle slot={slot} gen={generation}"
             ));
         }
         if self.tensors[slot].is_none() {

@@ -470,7 +470,7 @@ impl VisionEncoder {
         }
 
         let img_data: Vec<f32> = image
-            .as_slice::<f32>()
+            .try_as_slice::<f32>()
             .map_err(|e| format!("image as_slice: {:?}", e))?
             .to_vec();
 
@@ -545,7 +545,6 @@ impl VisionEncoder {
             .forward(&ffn_normed)
             .map_err(|e| format!("gate_proj: {:?}", e))?;
         let gate_act = mlx_rs::nn::silu(&gate)
-        let gate_act = mlx_rs::nn::silu(&gate)
             .map_err(|e| format!("silu: {:?}", e))?;
         let up = layer
             .up_proj
@@ -579,10 +578,13 @@ fn rms_norm(x: &Array, binding: &QuantizedLinearBinding, eps: f32) -> Result<Arr
 
     let x_sq = mlx_rs::ops::multiply(x, x)
         .map_err(|e| format!("rms_norm x_sq: {:?}", e))?;
-    let mean = mlx_rs::ops::mean(&x_sq, &[-1], true)
+    let mean = mlx_rs::ops::mean_axis(&x_sq, -1, false)
         .map_err(|e| format!("rms_norm mean: {:?}", e))?;
-    let rms = mlx_rs::ops::rsqrt(&mlx_rs::ops::add(&mean, &Array::from_slice(&[eps], &[1])))
-        .map_err(|e| format!("rms_norm rsqrt: {:?}", e))?;
+    let rms = mlx_rs::ops::rsqrt(
+        &mlx_rs::ops::add(&mean, &Array::from_slice(&[eps], &[1]))
+            .map_err(|e| format!("rms_norm add: {:?}", e))?,
+    )
+    .map_err(|e| format!("rms_norm rsqrt: {:?}", e))?;
     let x_normed = mlx_rs::ops::multiply(x, &rms)
         .map_err(|e| format!("rms_norm scale: {:?}", e))?;
 
@@ -613,8 +615,7 @@ fn self_attention(
         .map_err(|e| format!("v reshape: {:?}", e))?;
 
     // Compute attention scores: Q @ K^T / sqrt(head_dim)
-    let k_t = k_reshaped
-        .transpose(&[0, 1, 3, 2])
+    let k_t = mlx_rs::ops::transpose_axes(&k_reshaped, &[0, 1, 3, 2])
         .map_err(|e| format!("k transpose: {:?}", e))?;
     // mlx-rs requires manual batched matmul.
     // Use a simple approach: direct matmul with scaling.
@@ -628,7 +629,7 @@ fn self_attention(
     .map_err(|e| format!("attn scale: {:?}", e))?;
 
     // Softmax.
-    let attn = mlx_rs::ops::softmax(&scores_scaled, &[-1])
+    let attn = mlx_rs::ops::softmax_axis(&scores_scaled, -1, false)
         .map_err(|e| format!("attn softmax: {:?}", e))?;
 
     // Attention @ V.

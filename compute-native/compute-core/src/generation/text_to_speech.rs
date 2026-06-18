@@ -79,7 +79,7 @@ impl TextToSpeechGenerator {
 /// Produces standard 16-bit little-endian PCM WAV.
 pub fn pcm_to_wav(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     if samples.is_empty() {
-        return wav_header(0, sample_rate);
+        return wav_header(0, sample_rate).to_vec();
     }
 
     let num_samples = samples.len() as u32;

@@ -142,7 +142,7 @@ impl AnomalyTracer {
         let hash_match = computed_hash == entry.source_sha256;
 
         // Determine the weight family name from the tensor name
-        let family = weight_family_name(weight_name).unwrap_or("unknown");
+        let family = weight_family_name(weight_name).unwrap_or_else(|| "unknown".to_string());
 
         // Reference MSE: compare against a zero-error baseline (the tensor
         // as-is). In a full implementation this would run through replay_projection.rs.

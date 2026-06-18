@@ -1,10 +1,5 @@
 //! Deterministic heterogeneous routing types.
-//!
-//! Every operation carries a stable `OperationId` and complete descriptor.
-//! The router selects a backend from a sealed `ComputeRouteProfile`; it does
-//! not make opportunistic decisions.  All routing events emit typed receipts
-//! into the evidence plane so future profiles are derived from measured data,
-//! not hand-written assumptions.
+use serde::{Deserialize, Serialize};
 
 use super::DType;
 
@@ -19,7 +14,7 @@ pub struct TensorId(pub u64);
 pub struct OperationId(pub u64);
 
 /// Identifies a specific backend implementation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BackendId(pub u32);
 
 /// Identifies a sealed route profile (deterministic backend assignment).

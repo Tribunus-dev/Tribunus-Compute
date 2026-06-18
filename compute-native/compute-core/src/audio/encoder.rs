@@ -43,7 +43,7 @@ impl AudioEncoderLayer {
         let v = self.v_proj.forward(&normed).map_err(|e| format!("v_proj: {:?}", e))?;
 
         // Self-attention.
-        let dim = self.hidden_size as i32;
+        let _dim = self.hidden_size as i32;
         let n_heads = self.hidden_size as i32 / 64; // Default head_dim = 64
         let head_dim = 64i32;
 
@@ -132,7 +132,7 @@ impl AudioEncoder {
         // Helper to find a tensor entry and create a QuantizedLinearBinding.
         let load_side_tensor = |model: &LoadedProfiledModel,
                                  name: &str,
-                                 segment: &crate::mapped_image::MappedSegment|
+                                 segment: &std::sync::Arc<crate::mapped_image::MappedSegment>|
          -> Result<u64, String> {
             let entry = model
                 .reader

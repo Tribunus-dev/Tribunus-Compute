@@ -48,14 +48,15 @@ pub struct Scheduler {
 impl Scheduler {
     /// Create a new scheduler with the given config.
     pub fn new(config: SchedulerConfig) -> Self {
-        let slots = (0..config.max_batch_size)
+        let config_for_slots = config.clone();
+        let slots = (0..config_for_slots.max_batch_size)
             .map(|id| Slot {
                 id,
                 request_id: None,
                 tokens_generated: 0,
                 kv_cache_start: 0,
                 kv_cache_length: 0,
-                backend_id: config.default_backend_id,
+                backend_id: config_for_slots.default_backend_id,
                 kv_cache_pages: vec![],
             })
             .collect();
@@ -63,12 +64,12 @@ impl Scheduler {
             queue: Vec::new(),
             active: Vec::new(),
             slots,
-            config,
+            max_prefill_batch: config.max_prefill_batch,
             max_concurrent: config.max_batch_size,
+            config,
             max_seq_len: 4096,
             batch_prefills: false,
             batch_decodes: false,
-            max_prefill_batch: config.max_prefill_batch,
             route_profile: None,
             kv_cache_allocator: None,
             kv_cache_pager: None,

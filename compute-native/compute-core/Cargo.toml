@@ -112,6 +112,7 @@ harness = false
 path = "benches/benchmark_placement.rs"
 
 [dependencies]
+hf-hub = "0.4"
 mlx-rs = { workspace = true }
 mlx-sys = { workspace = true }
 qwen3-tts-mlx = { path = "../../models/qwen3-tts-mlx" }
@@ -127,7 +128,7 @@ notify = "6"
 tribunus-evidence-schema = { path = "../../compute-evidence-native/crates/evidence-schema" }
 libc = "0.2"
 lazy_static = "1.5"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "net", "signal"] }
 tokio-stream = "0.1"
 axum = { version = "0.8", optional = true }
 tower-http = { version = "0.6", optional = true, features = ["cors"] }

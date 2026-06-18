@@ -1039,7 +1039,7 @@ impl PageMigrationService {
         let searcher = EvolKV::new(num_layers);
         let budget = searcher.search(&calibration_set, self.total_cache_budget)?;
         budget.apply(cache);
-        self.evolkv_budget = Some(budget);
+        self.evolvk_budget = Some(budget);
         Ok(())
     }
 
@@ -1051,22 +1051,26 @@ impl PageMigrationService {
     /// — a failed promotion leaves the page at its current tier.
     pub fn tick(&mut self) -> Result<(), String> {
         let now = std::time::Instant::now();
-        for page in &mut self.pages {
+        let hot_threshold = self.hot_threshold;
+        let cold_threshold = self.cold_threshold;
+        let mut pages = std::mem::take(&mut self.pages);
+        for mut page in pages {
             let age = now.duration_since(page.last_access);
 
             // Skip pages that are already in their optimal tier.
-            if age < self.hot_threshold && page.current_tier != KVCacheTier::L1AneSram {
+            if age < hot_threshold && page.current_tier != KVCacheTier::L1AneSram {
                 // Promote to L1: decompress via ANE, store FP16.
-                self.promote_to_l1(page)?;
-            } else if age > self.cold_threshold && page.current_tier != KVCacheTier::L3DramHeap {
+                self.promote_to_l1(&mut page)?;
+            } else if age > cold_threshold && page.current_tier != KVCacheTier::L3DramHeap {
                 // Demote to L3: compress to 2-bit via ANE.
-                self.demote_to_l3(page)?;
+                self.demote_to_l3(&mut page)?;
             }
 
             // Pages at L1 that have aged past cold_threshold → demote.
-            if age > self.cold_threshold && page.current_tier == KVCacheTier::L1AneSram {
-                self.demote_to_l3(page)?;
+            if age > cold_threshold && page.current_tier == KVCacheTier::L1AneSram {
+                self.demote_to_l3(&mut page)?;
             }
+            self.pages.push(page);
         }
         Ok(())
     }
@@ -1083,9 +1087,13 @@ impl PageMigrationService {
                     "promote_to_l1: L3 page has no l3_data".to_string()
                 })?;
 
-                let fp16 = self
+                let fp16_bytes = self
                     .ane_compressor
-                    .decompress_from_l3(l3_bytes, self.head_dim, self.n_kv_heads)?;
+                    .decompress_from_l3(l3_bytes);
+                let fp16: Vec<f32> = fp16_bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_ne_bytes(c.try_into().unwrap()))
+                    .collect();
 
                 // At L2 the data lives in the IOSurface, so we don't keep a
                 // separate Vec copy — just record the transition. The BlockHandle
@@ -1134,9 +1142,12 @@ impl PageMigrationService {
                     "demote_to_l3: L1 page has no l1_data".to_string()
                 })?;
 
+                // Reinterpret FP16 data as byte slice for ANE compressor
+                let fp16_slice = fp16.as_slice();
+                let (_, fp16_bytes, _) = unsafe { fp16_slice.align_to::<u8>() };
                 let packed = self
                     .ane_compressor
-                    .compress_to_l3(fp16, self.head_dim, self.n_kv_heads)?;
+                    .compress_to_l3(fp16_bytes);
 
                 page.l3_data = Some(packed);
                 page.l1_data = None;

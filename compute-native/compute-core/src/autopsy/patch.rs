@@ -116,7 +116,7 @@ impl SegmentPatch {
         let write_bytes = if self.corrected_bytes.is_empty() {
             // No explicit corrected bytes provided — the tensor is already in
             // the segment and we are just re-verifying.
-            &segment_data[offset..offset + byte_len]
+            segment_data[offset..offset + byte_len].to_vec()
         } else {
             if self.corrected_bytes.len() != byte_len {
                 return Err(format!(
@@ -125,7 +125,7 @@ impl SegmentPatch {
                     byte_len
                 ));
             }
-            &self.corrected_bytes
+            self.corrected_bytes.clone()
         };
 
         // Create backup of the original segment (only if not already backed up)
@@ -136,7 +136,7 @@ impl SegmentPatch {
         }
 
         // Replace the tensor bytes in the segment
-        segment_data[offset..offset + byte_len].copy_from_slice(write_bytes);
+        segment_data[offset..offset + byte_len].copy_from_slice(&write_bytes);
 
         // Recompute the segment SHA-256
         let mut hasher = Sha256::new();

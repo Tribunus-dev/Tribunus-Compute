@@ -185,18 +185,18 @@ impl ImageToImageGenerator {
         // zero array.  The shapes match a standard 8× spatial
         // compression (e.g. SDXL, FLUX).
         let shape = self.model_shape();
-        Ok(Array::zeros::<f32>(&[shape[0], shape[1].max(8) / 8, shape[2].max(8) / 8]))
+        Ok(Array::zeros::<f32>(&[shape[0], shape[1].max(8) / 8, shape[2].max(8) / 8])?)
     }
 
     /// Decode latent back to pixel space.
     fn decode_from_latent(&self, _latent: &Array) -> Result<Array, String> {
         let shape = self.model_shape();
-        Ok(Array::zeros::<f32>(&[3, shape[1], shape[2]]))
+        Ok(Array::zeros::<f32>(&[3, shape[1], shape[2]])?)
     }
 
     /// Embed a text prompt into conditioning vectors.
     fn encode_text(&self, _prompt: &str) -> Result<Array, String> {
-        Ok(Array::zeros::<f32>(&[1, 77, 768]))
+        Ok(Array::zeros::<f32>(&[1, 77, 768])?)
     }
 
     /// Blend noise into masked regions (inpainting).
@@ -393,6 +393,7 @@ fn decode_png(data: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
             4 => {
                 rgba.extend_from_slice(row_data);
             }
+            _ => todo!("unsupported bit depth"),
             _ => {
                 rgba.extend_from_slice(row_data);
             }
@@ -450,6 +451,7 @@ fn min_inflate(data: &[u8]) -> Result<Vec<u8>, String> {
             3 => {
                 return Err("invalid block type 3".into());
             }
+            _ => return Err(format!("unsupported block type: {btype}")),
         }
 
         if bfinal {
@@ -522,14 +524,7 @@ fn clamp_image(arr: &Array) -> Vec<u8> {
     let total = height.saturating_mul(width);
 
     // Read back as f32 slice.
-    let data: Vec<f32> = match arr.as_slice::<f32>() {
-        Ok(s) => s.to_vec(),
-        Err(_) => {
-            // Fallback: try to convert.
-            let flat: Vec<f32> = (0..channels * total).map(|_| 0.5).collect();
-            flat
-        }
-    };
+    let data: Vec<f32> = arr.as_slice::<f32>().to_vec();
     if data.len() < channels * total {
         return Vec::new();
     }
@@ -696,7 +691,7 @@ fn sample_normal_like(template: &Array) -> Array {
     let shape = template.shape();
     // mlx_rs::random::normal doesn't exist — produce zeros as fallback.
     // A real impl would call into mlx_rs PRNG.
-    Array::zeros::<f32>(&shape)
+    Array::zeros::<f32>(&shape).expect("sample_normal_like zeros")
 }
 
 /// Linear interpolation: `a * (1 - t) + b * t`.
@@ -713,7 +708,7 @@ fn rand_seed() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos()
+        .as_nanos().try_into().unwrap()
 }
 
 // ---------------------------------------------------------------------------

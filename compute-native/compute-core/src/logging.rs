@@ -172,3 +172,12 @@ macro_rules! log_debug {
         )
     };
 }
+
+// Re-export macros as crate-level items for Rust 2021 edition compatibility.
+// #[macro_export] macros in submodules are not automatically in scope for
+// binary targets within the same crate. The pub(crate) use allows importing
+// them with `use crate::log_info;`.
+pub use log_info;
+pub use log_error;
+pub use log_warn;
+pub use log_debug;

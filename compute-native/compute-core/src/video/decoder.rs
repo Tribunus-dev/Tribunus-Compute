@@ -42,7 +42,7 @@ pub fn extract_frames(
     //
     // Scaling: resize so the longer dimension fits `target_size`, then
     // center-pad to exactly `target_size x target_size`.
-    let filter = format!(
+    let _filter = format!(
         "fps={}/{},scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,setsar=1",
         1, // we set fps=1/interval to get the right frame count via frame selection
         0, // placeholder; we actually use select='between(n,...)' or fps

@@ -135,7 +135,7 @@ fn main() {
         // If not set by parent, use a default in the temp dir.
         if std::env::var("CML_BREADCRUMB_PATH").is_err() {
             let default_crumb = tmp_dir.join("predict_breadcrumbs.txt");
-            std::env::set_var("CML_BREADCRUMB_PATH", &default_crumb);
+            unsafe { std::env::set_var("CML_BREADCRUMB_PATH", &default_crumb); }
         }
 
         let receipt = run_backend(

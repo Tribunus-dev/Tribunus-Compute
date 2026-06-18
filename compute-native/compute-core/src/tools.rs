@@ -95,10 +95,10 @@ pub fn validate_and_fix(
                 .and_then(|f| f.get("name"))
         });
 
-    let current_name = name_val.and_then(|n| n.as_str()).unwrap_or("");
+    let current_name = name_val.and_then(|n| n.as_str()).unwrap_or("").to_string();
 
     if !current_name.is_empty() && current_name != tool.name {
-        if let Some(corrected) = fuzzy_match_function_name(current_name, tool) {
+        if let Some(corrected) = fuzzy_match_function_name(&current_name, tool) {
             if let Some(obj) = val.as_object_mut() {
                 obj.insert("name".into(), serde_json::json!(corrected));
                 fixes.push(format!(
@@ -189,7 +189,7 @@ pub fn validate_and_fix(
     let name = tool.name.clone();
     let fc = FunctionCall {
         name: name.clone(),
-        arguments: val,
+        arguments: val.clone(),
         raw: val.to_string(),
     };
 

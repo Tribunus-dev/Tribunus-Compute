@@ -71,7 +71,7 @@ pub struct ClusterInfo {
 }
 
 /// Information about a single node in the EXO cluster.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NodeInfo {
     pub id: String,
     pub address: String,
@@ -424,6 +424,7 @@ impl DistributedKvCache {
             source_node: self.local_node.clone(),
             rdma_offset,
         };
+        Ok(())
 }
 
     /// Send page data to a remote node for storage.

@@ -126,7 +126,7 @@ impl VideoEncoder {
 
         // 3. Apply temporal position embeddings (if available).
         let encoded = match &self.temporal_pos_embed {
-            Some(pos) => add_temporal_positions(&stacked, pos, frames.len()),
+            Some(pos) => add_temporal_positions(&stacked, pos, frames.len())?,
             None => stacked,
         };
 
@@ -153,7 +153,7 @@ fn stack_frames(frames: &[Array]) -> Result<Array, String> {
 
     // Concatenate along the first (patch) axis.
     // mlx-rs Array::concatenate stacks arrays along a given axis.
-    mlx_rs::ops::concatenate_axis_device(frames, 0).map_err(|e| format!("failed to stack frame features: {}", e))
+    mlx_rs::ops::concatenate(frames).map_err(|e| format!("failed to stack frame features: {}", e))
 }
 
 /// Add temporal position embeddings to the stacked feature sequence.
@@ -164,7 +164,7 @@ fn add_temporal_positions(
     stacked: &Array,
     pos_embed: &Array,
     num_frames: usize,
-) -> Array {
+) -> Result<Array, String> {
     // pos_embed shape: [max_frames, 1, projection_dim] or [max_frames, projection_dim]
     // We need to repeat each frame's position vector for all patches in that frame.
     //
@@ -174,8 +174,8 @@ fn add_temporal_positions(
 
     // For now we use a simple add: add the mean position embedding to all tokens.
     // A full implementation would reshape and broadcast properly.
-    let pos_mean = pos_embed.mean(&[0]);
-    stacked.add(&pos_mean)
+    let pos_mean = pos_embed.mean(false).map_err(|e| format!("pos mean: {:?}", e))?;
+    stacked.add(&pos_mean).map_err(|e| format!("add pos: {:?}", e))
 }
 
 /// Average-pool all frames' features into a single set of patch tokens.
@@ -210,17 +210,18 @@ fn average_pool_frames(encoded: &Array) -> Result<Array, String> {
 
     if num_frames == 0 || total_tokens % num_frames != 0 {
         // Can't determine frame boundary — just return a mean across all tokens.
-        return encoded.mean(&[0]).map_err(|e| format!("mean pooling failed: {}", e));
+        return Ok(encoded.mean(false).map_err(|e| format!("pool mean: {:?}", e))?);
+
     }
 
     // Reshape to [num_frames, patches_per_frame, projection_dim] and average.
     let reshaped = mlx_rs::Array::reshape(
         encoded,
         &[num_frames as i32, patches_per_frame_val as i32, proj_dim as i32],
-    );
+    ).map_err(|e| format!("pool reshape: {:?}", e))?;
 
     // Take mean along axis 0 (frames).
-    reshaped.mean(&[0]).map_err(|e| format!("average_pool_frames failed: {}", e))
+    Ok(reshaped.mean(false).map_err(|e| format!("pool mean: {:?}", e))?)
 }
 
 /// Lightweight cross-frame attention.

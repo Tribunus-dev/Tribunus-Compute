@@ -90,7 +90,7 @@ impl SegmentWatcher {
         let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
 
         let mut watcher =
-            RecommendedWatcher::new(tx).map_err(|e| format!("create notify watcher: {}", e))?;
+            RecommendedWatcher::new(tx, notify::Config::default()).map_err(|e| format!("create notify watcher: {}", e))?;
 
         watcher
             .watch(&self.segment_dir, RecursiveMode::NonRecursive)
@@ -307,7 +307,7 @@ impl ModelCache {
         let sources = crate::model_cache::default_model_sources();
         for (name, source) in &sources {
             eprintln!("[model-cache] Preloading {}...", name);
-            self.get_or_load(name, source)?;
+            self.get_or_load(name, source, None)?;
         }
         Ok(())
     }
@@ -322,11 +322,12 @@ impl ModelCache {
     ) -> Result<Arc<LoadedProfiledModel>, String> {
         // Fast path: already cached — touch LRU and return.
         if let Some(cached) = self.lru.get(name) {
+            let model = cached.model.clone();
             self.touch_lru(name);
             if let Some(t) = telemetry {
                 t.record_cache_hit(CacheKind::Model);
             }
-            return Ok(cached.model.clone());
+            return Ok(model);
         }
 
         if let Some(t) = telemetry {

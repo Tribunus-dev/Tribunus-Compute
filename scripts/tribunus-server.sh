@@ -12,8 +12,8 @@ set -euo pipefail
 # Unset before this process starts — macOS libsystem_malloc reads this
 # during process init (before main()), so remove_var in Rust main() is
 # too late for subprocesses like omp threads spawned during Metal init.
-unset MallocStackLogging
-unset MallocStackLoggingNoCompact
+export MallocStackLogging=0
+export MallocStackLoggingNoCompact=0
 
 cd "$(dirname "$0")/.."
 

@@ -418,8 +418,15 @@ impl ChunkKvCache {
     /// Should be called periodically (e.g. after eviction or when the chunk
     /// count changes) to keep scores fresh.
     pub fn recompute_importance(&mut self) {
-        for chunk in &mut self.chunks {
-            chunk.importance_score = self.compute_importance(chunk);
+        // Compute importance scores separately from mutation to avoid
+        // conflicting borrows on self.
+        let scores: Vec<f64> = self
+            .chunks
+            .iter()
+            .map(|chunk| self.compute_importance(chunk))
+            .collect();
+        for (chunk, score) in self.chunks.iter_mut().zip(scores) {
+            chunk.importance_score = score;
         }
     }
 

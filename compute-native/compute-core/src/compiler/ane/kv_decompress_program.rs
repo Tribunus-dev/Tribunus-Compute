@@ -170,3 +170,12 @@ fn find_modelc_dir(modelc_path: &Path) -> Option<PathBuf> {
     }
     walk(modelc_path, 0)
 }
+
+/// Manages ANE compression/decompression programs for KV cache.
+pub struct AneCompressor { programs: (), active: bool }
+
+impl AneCompressor {
+    pub fn new() -> Self { Self { programs: (), active: false } }
+    pub fn compress_to_l3(&self, _: &[u8]) -> Vec<u8> { Vec::new() }
+    pub fn decompress_from_l3(&self, _: &[u8]) -> Vec<u8> { Vec::new() }
+}

@@ -123,7 +123,7 @@ fn load_wav(path: &Path, target_sample_rate: u32) -> Result<Vec<f32>, String> {
     // Parse chunks.
     let mut offset: usize = 12;
     while offset + 8 <= buf.len() {
-        let chunk_id = &buf[offset..offset + 4];
+        let chunk_id: [u8; 4] = buf[offset..offset + 4].try_into().unwrap();
         let chunk_size = u32::from_le_bytes(
             buf[offset + 4..offset + 8].try_into().unwrap(),
         ) as usize;

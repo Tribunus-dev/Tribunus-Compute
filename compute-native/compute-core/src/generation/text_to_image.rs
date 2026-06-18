@@ -17,6 +17,7 @@ use std::sync::Arc;
 use mlx_rs::array;
 use mlx_rs::ops::{self, conv2d};
 use mlx_rs::ops::indexing::IndexOp;
+use mlx_rs::module::Module;
 use mlx_rs::Array;
 
 use crate::profiled_executor::LoadedProfiledModel;
@@ -56,8 +57,7 @@ fn tensor_by_name(model: &LoadedProfiledModel, name: &str) -> Result<Array, Stri
             }
 
             let shape_i32: Vec<i32> = shape.iter().map(|&d| d as i32).collect();
-            Array::from_slice(&buf, &shape_i32)
-                .map_err(|e| crate::Error::from_reason(format!("create Array '{}': {:?}", name, e)))
+            Ok(Array::from_slice(&buf, &shape_i32))
         })
         .map_err(|e| format!("load tensor '{}': {:?}", name, e))
 }
@@ -68,7 +68,7 @@ fn tensor_by_name(model: &LoadedProfiledModel, name: &str) -> Result<Array, Stri
 fn linear_fwd(x: &Array, w: &Array, b: Option<&Array>) -> Result<Array, String> {
     // x shape: [1, seq, in_features]
     // w shape: [out_features, in_features] (standard Linear storage)
-    let out = ops::matmul(x, &ops::transpose(w, &[1, 0]).map_err(|e| format!("W^T: {:?}", e))?)
+    let out = ops::matmul(x, &ops::transpose_axes(w, &[1, 0]).map_err(|e| format!("W^T: {:?}", e))?)
         .map_err(|e| format!("matmul: {:?}", e))?;
     match b {
         Some(bias) => ops::add(&out, bias).map_err(|e| format!("add bias: {:?}", e)),
@@ -108,10 +108,10 @@ fn unsafe_reshape(arr: &Array, shape: &[i32]) -> Result<Array, String> {
 fn mha(q: &Array, k: &Array, v: &Array, head_dim: f32) -> Result<Array, String> {
     let scale = 1.0 / head_dim.sqrt();
     let scale_arr = Array::from_slice(&[scale], &[1]).map_err(|_| "scale".to_string())?;
-    let k_t = ops::transpose(k, &[0, 1, 3, 2]).map_err(|e| format!("K^T: {:?}", e))?;
+    let k_t = ops::transpose_axes(k, &[0, 1, 3, 2]).map_err(|e| format!("K^T: {:?}", e))?;
     let score = ops::matmul(q, &k_t).map_err(|e| format!("QK^T: {:?}", e))?;
     let scaled = ops::multiply(&score, &scale_arr).map_err(|e| format!("scale: {:?}", e))?;
-    let attn = ops::softmax(&scaled, -1).map_err(|e| format!("softmax: {:?}", e))?;
+    let attn = ops::softmax(&scaled, Some(false)).map_err(|e| format!("softmax: {:?}", e))?;
     ops::matmul(&attn, v).map_err(|e| format!("attn@V: {:?}", e))
 }
 
@@ -149,16 +149,13 @@ fn array_to_rgba(img: &Array, width: u32, height: u32) -> Result<Vec<u8>, String
         img.clone()
     } else if shape[2] as u32 == height && shape[3] as u32 == width && shape[1] == 3 {
         // NCHW -> transpose to NHWC
-        ops::transpose(img, &[0, 2, 3, 1])
+        ops::transpose_axes(img, &[0, 2, 3, 1])
             .map_err(|e| format!("NCHW->NHWC: {:?}", e))?
     } else {
         return Err(format!("unexpected shape {:?} for [1,{}x{}]", shape, height, width));
     };
 
-    let flat: Vec<f32> = match nhwc.as_slice::<f32>() {
-        Ok(s) => s.to_vec(),
-        Err(e) => return Err(format!("as_slice: {:?}", e)),
-    };
+    let flat: Vec<f32> = nhwc.as_slice::<f32>().to_vec();
 
     let h = height as usize;
     let w = width as usize;
@@ -376,7 +373,7 @@ impl TextToImageGenerator {
             .map_err(|e| format!("txt_embed concat: {:?}", e))?;
 
         // Pooled: mean over sequence dim
-        let pooled = ops::mean(&txt_embeds, &[1], false)
+        let pooled = ops::mean_axes(&txt_embeds, &[1], None).map_err(|e| format!("mean: {:?}", e))
             .map_err(|e| format!("pooled: {:?}", e))?;
 
         Ok((txt_embeds, pooled))
@@ -386,7 +383,7 @@ impl TextToImageGenerator {
     fn rms_norm_fwd(&self, x: &Array, weight: &Array, eps: f32) -> Result<Array, String> {
         let eps_a = Array::from_slice(&[eps], &[1]).map_err(|_| "eps".to_string())?;
         let x2 = ops::multiply(x, x).map_err(|e| format!("x^2: {:?}", e))?;
-        let mean = ops::mean(&x2, &[-1], true).map_err(|e| format!("mean: {:?}", e))?;
+        let mean = ops::mean_axes(&x2, &[-1], None).map_err(|e| format!("mean: {:?}", e))?;
         let rms = ops::rsqrt(&ops::add(&mean, &eps_a).map_err(|e| format!("+eps: {:?}", e))?)
             .map_err(|e| format!("rsqrt: {:?}", e))?;
         let normed = ops::multiply(x, &rms).map_err(|e| format!("norm: {:?}", e))?;
@@ -689,7 +686,7 @@ impl TextToImageGenerator {
         let patch_h = ((latents.shape()[1] as f32).sqrt().ceil()) as i32;
         let patch_w = latents.shape()[1] / patch_h;
         let lat_2d = unsafe_reshape(latents, &[1, patch_h, patch_w, z_ch])?;
-        let lat_chw = ops::transpose(&lat_2d, &[0, 3, 1, 2])
+        let lat_chw = ops::transpose_axes(&lat_2d, &[0, 3, 1, 2])
             .map_err(|e| format!("latent→NCHW: {:?}", e))?;
 
         // Centre: (latent / scale) + shift
@@ -798,7 +795,7 @@ impl TextToImageGenerator {
         // Skip connection
         match skip_w {
             Some(sw) => {
-                let skip = self.conv2d_fwd(x, &sw, skip_b.as_ref().unwrap_or(&Array::zeros(&[out_ch]).map_err(|_| "zero".to_string())?), 1, 1)?;
+                let skip = self.conv2d_fwd(x, &sw, skip_b.as_ref().unwrap_or(&Array::zeros::<f32>(&[out_ch])?), 1, 1)?;
                 ops::add(&h, &skip).map_err(|e| format!("+skip: {:?}", e))
             }
             None => {
@@ -834,8 +831,7 @@ impl TextToImageGenerator {
     /// VAE upsample: nearest ×2 + conv.
     fn vae_upsample(&self, x: &Array, prefix: &str) -> Result<Array, String> {
         use mlx_rs::nn::Upsample;
-        let up = Upsample::new(2.0, mlx_rs::nn::UpsampleMode::Nearest)
-            .map_err(|e| format!("upsample: {:?}", e))?;
+        let mut up = Upsample::new(2.0, mlx_rs::nn::UpsampleMode::Nearest);
         let up_out = up.forward(x).map_err(|e| format!("up fwd: {:?}", e))?;
 
         let c_w = tensor_by_name(&self.model, &format!("{}.conv.weight", prefix))?;
@@ -854,10 +850,7 @@ fn embed_lookup(table: &Array, ids: &[u32]) -> Result<Array, String> {
     let dim = table.shape()[1] as i32;
 
     let mut rows: Vec<f32> = Vec::with_capacity(seq as usize * dim as usize);
-    let table_slice: Vec<f32> = match table.as_slice::<f32>() {
-        Ok(s) => s.to_vec(),
-        Err(e) => return Err(format!("embed table: {:?}", e)),
-    };
+    let table_slice: Vec<f32> = table.as_slice::<f32>().to_vec();
 
     for &id in ids {
         let idx = id as usize * dim as usize;
@@ -879,6 +872,6 @@ fn split_chunks(arr: &Array, n: i32) -> Result<Vec<Array>, String> {
 /// `[1, n_heads, seq, head_dim]`.
 fn reshape_mha(x: &Array, seq: i32, n_heads: i32, head_dim: i32) -> Result<Array, String> {
     let r = unsafe_reshape(x, &[1, seq, n_heads, head_dim])?;
-    ops::transpose(&r, &[0, 2, 1, 3])
+    ops::transpose_axes(&r, &[0, 2, 1, 3])
         .map_err(|e| format!("reshape_mha: {:?}", e))
 }

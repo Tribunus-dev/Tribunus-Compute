@@ -144,7 +144,7 @@ impl GraphOptimizer {
             let embed_out = "embedding_output".to_string();
             let embed_shape = vec![plan.vocab_size, plan.hidden_size];
             opt.known_tensor_shapes
-                .insert(embed_out.clone(), embed_shape);
+                .insert(embed_out.clone(), embed_shape.clone());
 
             let node = OpNode {
                 id: opt.nodes.len(),
@@ -663,7 +663,8 @@ impl GraphOptimizer {
                 // Infer output shape from operation kind and input shapes.
                 let output_shape = self.infer_shape(node);
                 if let Some(shape) = output_shape {
-                    for output in &node.outputs {
+                    let outputs = node.outputs.clone();
+                    for output in &outputs {
                         if !self.known_tensor_shapes.contains_key(output) {
                             self.known_tensor_shapes.insert(output.clone(), shape.clone());
                             changed = true;
@@ -680,7 +681,7 @@ impl GraphOptimizer {
             return node.known_output_shape.clone();
         }
         match node.kind {
-            OpKind::RmsNorm | OpKind::ResidualAdd => {
+            OpKind::RmsNorm | OpKind::ResidualAdd | OpKind::QNorm | OpKind::KNorm => {
                 // Same shape as input (preserves hidden dimension).
                 node.inputs
                     .first()
@@ -701,8 +702,9 @@ impl GraphOptimizer {
                     .and_then(|input| self.known_tensor_shapes.get(input))
                     .map(|shape| {
                         let mut s = shape.clone();
-                        if s.len() >= 2 {
-                            s[s.len() - 1] = self.intermediate_size;
+                        let last = s.len();
+                        if last >= 2 {
+                            s[last - 1] = self.intermediate_size;
                         }
                         s
                     })
@@ -714,8 +716,9 @@ impl GraphOptimizer {
                     .and_then(|input| self.known_tensor_shapes.get(input))
                     .map(|shape| {
                         let mut s = shape.clone();
-                        if s.len() >= 2 {
-                            s[s.len() - 1] = self.hidden_size;
+                        let last = s.len();
+                        if last >= 2 {
+                            s[last - 1] = self.hidden_size;
                         }
                         s
                     })

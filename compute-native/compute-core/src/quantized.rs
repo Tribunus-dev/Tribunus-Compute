@@ -3,7 +3,7 @@
 use mlx_rs::error::Result as MlxResult;
 use mlx_rs::Array;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct QuantizedLinearBinding {
     pub weight_handle: u64,
     pub scales_handle: u64,

@@ -71,13 +71,13 @@ pub fn inject_vision_features(
     // 1. Replace the hidden state at image token positions with vision features.
     //    For each image token position, insert the corresponding vision feature.
     let mut h_data: Vec<f32> = hidden
-        .as_slice::<f32>()
+        .try_as_slice::<f32>()
         .map_err(|e| format!("hidden as_slice: {:?}", e))?
         .to_vec();
     let hidden_size = hidden.shape().get(2).copied().unwrap_or(1) as usize;
 
     let vf_data: Vec<f32> = vision_features
-        .as_slice::<f32>()
+        .try_as_slice::<f32>()
         .map_err(|e| format!("vision_features as_slice: {:?}", e))?
         .to_vec();
     let vf_dim = vision_features.shape().get(1).copied().unwrap_or(1) as usize;
@@ -180,14 +180,12 @@ fn cross_attention(
         .map_err(|e| format!("v mh reshape: {:?}", e))?;
 
     // Transpose K for matmul: [kv_seq, q_heads, head_dim] -> [q_heads, head_dim, kv_seq]
-    let k_t = k_mh
-        .transpose(&[1, 2, 0])
+    let k_t = mlx_rs::ops::transpose_axes(&k_mh, &[1, 2, 0])
         .map_err(|e| format!("k_t transpose: {:?}", e))?;
 
     // Q @ K^T: [q_seq, q_heads, head_dim] x [q_heads, head_dim, kv_seq]
     // We need to transpose Q too for batch matmul.
-    let q_t = q_mh
-        .transpose(&[1, 0, 2])
+    let q_t = mlx_rs::ops::transpose_axes(&q_mh, &[1, 0, 2])
         .map_err(|e| format!("q_t transpose: {:?}", e))?;
 
     let scale = (head_dim as f32).sqrt().recip();
@@ -199,20 +197,18 @@ fn cross_attention(
     )
     .map_err(|e| format!("cross scale: {:?}", e))?;
 
-    let attn = mlx_rs::ops::softmax(&scores_scaled, &[-1])
+    let attn = mlx_rs::ops::softmax_axis(&scores_scaled, -1, false)
         .map_err(|e| format!("cross softmax: {:?}", e))?;
 
     // V transpose for matmul: [kv_seq, q_heads, head_dim] -> [q_heads, kv_seq, head_dim]
-    let v_t = v_mh
-        .transpose(&[1, 0, 2])
+    let v_t = mlx_rs::ops::transpose_axes(&v_mh, &[1, 0, 2])
         .map_err(|e| format!("v_t transpose: {:?}", e))?;
 
     let out = mlx_rs::ops::matmul(&attn, &v_t)
         .map_err(|e| format!("cross output: {:?}", e))?;
 
     // Collapse heads: [q_heads, q_seq, head_dim] -> [q_seq, q_heads * head_dim]
-    let out_collapsed = out
-        .transpose(&[1, 0, 2])
+    let out_collapsed = mlx_rs::ops::transpose_axes(&out, &[1, 0, 2])
         .map_err(|e| format!("out transpose: {:?}", e))?
         .reshape(&[q_seq, num_heads * head_dim])
         .map_err(|e| format!("out reshape: {:?}", e))?;
@@ -230,7 +226,7 @@ fn cross_attention(
 fn rms_norm_simple(x: &Array, eps: f32) -> Result<Array, String> {
     let x_sq = mlx_rs::ops::multiply(x, x)
         .map_err(|e| format!("rms x_sq: {:?}", e))?;
-    let mean = mlx_rs::ops::mean(&x_sq, &[-1], true)
+    let mean = mlx_rs::ops::mean_axis(&x_sq, -1, false)
         .map_err(|e| format!("rms mean: {:?}", e))?;
     let rms = mlx_rs::ops::rsqrt(
         &mlx_rs::ops::add(&mean, &Array::from_slice(&[eps], &[1]))

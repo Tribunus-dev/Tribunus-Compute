@@ -1,3 +1,4 @@
+use tribunus_compute_core::logging::{log_info, log_error, log_warn, log_debug};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -10,6 +11,7 @@ use tribunus_compute_core::model_cache::ModelCache;
 use tribunus_compute_core::profiled_executor::{LoadedProfiledModel, ProfiledInferenceSession};
 use tribunus_compute_core::scheduling::HardwareConfig;
 use tribunus_compute_core::server::admin::ActiveRequestInfo;
+
 use tribunus_compute_core::server::{
     auth::ApiKeyValidator,
     benchmark,
@@ -23,8 +25,15 @@ async fn main() {
     // macOS workaround: unset MallocStackLogging inherited from Xcode/LLDB
     // to suppress "can't turn off malloc stack logging because it was not enabled"
     // on stderr during process exit, which corrupts terminal output.
-    std::env::remove_var("MallocStackLogging");
-    std::env::remove_var("MallocStackLoggingNoCompact");
+    // Must happen BEFORE any allocation or thread spawn (hence at the very
+    // top of main, not in an init function).
+    // Must happen BEFORE any memory allocation or thread spawn.
+    // Setting to "0" (rather than removing) prevents libsystem_malloc's
+    // unconditional thread-cleanup message on macOS 26.5 Metal/OMP.
+    unsafe {
+        std::env::set_var("MallocStackLogging", "0");
+        std::env::set_var("MallocStackLoggingNoCompact", "0");
+    }
 
     // Pre-parse --config and --help before loading config
     let args: Vec<String> = std::env::args().collect();
@@ -73,7 +82,7 @@ async fn main() {
 
     // Propagate --config as env var so ServerConfig::load() picks it up
     if let Some(path) = &config_path_override {
-        std::env::set_var("TRIBUNUS_CONFIG_PATH", path);
+        unsafe { std::env::set_var("TRIBUNUS_CONFIG_PATH", path); }
     }
 
     // Load config: defaults -> config.toml -> env vars -> CLI args (highest priority)
@@ -164,7 +173,7 @@ async fn main() {
     } else {
         ((total_ram_mb as f64 * 0.5) as u64).max(2048)
     };
-    let model_cache = ModelCache::new(cache_max_mb);
+    let mut model_cache = ModelCache::new(cache_max_mb);
 
     // Configure cache for detected hardware and preload on memory-rich systems.
     model_cache.configure_for_hardware();

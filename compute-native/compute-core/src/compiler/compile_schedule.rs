@@ -206,6 +206,7 @@ pub fn compile_model_to_scheduled_module(
             outputs: vec![TensorId(layer_id * 100 + 2)],
             dependencies,
             fusions: vec![],
+            fusion_regions: vec![],
             state_effects,
             temp_memory_bytes: per_layer_bytes[i as usize],
             is_fence: false,

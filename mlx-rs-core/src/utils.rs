@@ -205,5 +205,5 @@ where
         None => None,
     };
 
-    mlx_rs::fast::scaled_dot_product_attention(queries, keys, values, scale, sdpa_mask)
+    mlx_rs::fast::scaled_dot_product_attention(queries, keys, values, scale, sdpa_mask, None)
 }

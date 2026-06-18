@@ -34,7 +34,7 @@ pub fn write_breadcrumb(name: &str) {
 
 /// Set the breadcrumb file path for the current process.
 pub fn set_breadcrumb_path(path: &Path) {
-    std::env::set_var("CML_BREADCRUMB_PATH", path);
+        unsafe { std::env::set_var("CML_BREADCRUMB_PATH", path); }
 }
 
 /// Read all breadcrumbs from a breadcrumb file.
@@ -80,7 +80,7 @@ mod tests {
     #[test]
     fn no_env_var_skips_write() {
         // If CML_BREADCRUMB_PATH is not set, write_breadcrumb should not panic.
-        std::env::remove_var("CML_BREADCRUMB_PATH");
+        unsafe { std::env::remove_var("CML_BREADCRUMB_PATH"); }
         write_breadcrumb("should_not_crash");
     }
 

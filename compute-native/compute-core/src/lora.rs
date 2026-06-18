@@ -110,7 +110,7 @@ impl LoraAdapter {
                 let a = mlx_rs::random::uniform::<_, f32>(
                     -bound as f32,
                     bound as f32,
-                    Some(&[in_dim as i32, r]),
+                    &[in_dim as i32, r],
                     None,
                 )
                 .map_err(|e| format!("lora_a init: {:?}", e))?;
@@ -274,7 +274,7 @@ impl LoraAdapter {
             let h = rms_norm(&h, &fn_w, rms_norm_eps);
 
             // LM head projection (tied embeddings)
-            let logits = ops::matmul(&h, &emb_w, None::<&Array>).unwrap();
+            let logits = ops::matmul(&h, &emb_w).unwrap();
 
             // Cross-entropy loss
             let loss = cross_entropy_loss(&logits, &target_ids_arr);
@@ -289,7 +289,6 @@ impl LoraAdapter {
             .first()
             .ok_or_else(|| "no loss output from value_and_grad".to_string())?
             .as_slice::<f32>()
-            .map_err(|e| format!("loss as_slice: {:?}", e))?
             .first()
             .copied()
             .unwrap_or(f32::INFINITY) as f64;
@@ -343,10 +342,9 @@ impl LoraAdapter {
                 let Some(lora_b) = self.lora_b.get(&key) else { continue };
 
                 // Compute delta: A @ B * (alpha / rank)
-                let ab = ops::matmul(lora_a, lora_b, None::<&Array>)
-                    .map_err(|e| format!("matmul A@B for merge: {:?}", e))?;
+                let ab = ops::matmul(lora_a, lora_b).unwrap();
                 let scale = self.alpha / self.rank as f32;
-                let delta = ops::multiply(&ab, scale).unwrap();
+                let delta = ops::multiply(&ab, &Array::from_f32(scale)).unwrap();
 
                 // Apply to the matching weight
                 let (orig_w, _orig_s, _orig_b) = get_weight_mut(module, lw);
@@ -625,7 +623,7 @@ impl SharedWeightTable {
         let h = rms_norm(&h, &model.fn_w, rms_eps);
 
         // ── LM head (tied embeddings) ──────────────────────────────────
-        let logits = ops::matmul(&h, &model.emb_w, None::<&Array>).unwrap();
+        let logits = ops::matmul(&h, &model.emb_w).unwrap();
         Ok(logits)
     }
 }
@@ -775,7 +773,7 @@ fn embed_lookup_2d(
     // emb_w: [vocab_size, hidden_size]
     // tok_ids: [batch, seq_len] — i32 values
     let flat = ops::reshape(tok_ids, &[-1]).unwrap();
-    ops::take_axis(emb_w, &flat, 0).unwrap()
+    emb_w.take_axis(&flat, 0).unwrap()
 }
 
 /// RMS normalisation.
@@ -789,7 +787,7 @@ fn rms_norm(x: &Array, weight: &Array, eps: f32) -> Array {
 
     // variance = mean(x^2)
     let x_sq = ops::square(&x_f32).unwrap();
-    let variance = ops::mean_axis(&x_sq, -1).unwrap();
+    let variance = ops::mean_axis(&x_sq, -1, None).unwrap();
     // x / sqrt(variance + eps) * weight
     let eps_arr = Array::from_f32(eps);
     let denom = ops::sqrt(&ops::add(&variance, &eps_arr).unwrap()).unwrap();
@@ -812,7 +810,7 @@ fn matmul(x: &Array, w: &Array, _s: &Array, _b: &Array) -> Array {
     // Plain FP matmul: x @ w^T where w is [out_dim, in_dim]
     // MLX matmul with [batch, seq, in_dim] x [in_dim, out_dim]
     let w_t = ops::transpose_axes(w, &[1, 0]).unwrap();
-    ops::matmul(x, &w_t, None::<&Array>).unwrap()
+    ops::matmul(x, &w_t).unwrap()
 }
 
 /// LoRA contribution: `(x @ A) @ B * (alpha / rank)`
@@ -820,8 +818,8 @@ fn matmul_lora(x: &Array, lora_a: &Array, lora_b: &Array, alpha: f32, rank: f32)
     // x: [batch, seq, in_dim]
     // lora_a: [in_dim, rank]
     // lora_b: [rank, out_dim]
-    let a_out = ops::matmul(x, lora_a, None::<&Array>).unwrap();
-    let b_out = ops::matmul(&a_out, lora_b, None::<&Array>).unwrap();
+    let a_out = ops::matmul(x, lora_a).unwrap();
+    let b_out = ops::matmul(&a_out, lora_b).unwrap();
     let scale = alpha / rank;
     ops::multiply(&b_out, &Array::from_f32(scale)).unwrap()
 }
@@ -831,11 +829,11 @@ fn matmul_lora(x: &Array, lora_a: &Array, lora_b: &Array, alpha: f32, rank: f32)
 /// q, k, v: [batch, seq, dim]
 fn simplified_attention(q: &Array, k: &Array, v: &Array) -> Array {
     let scale = 1.0 / ((k.shape().last().copied().unwrap_or(1) as f32).sqrt());
-    let scores = ops::matmul(q, &ops::transpose_axes(k, &[0, 2, 1]).unwrap(), None::<&Array>)
+    let scores = ops::matmul(q, &ops::transpose_axes(k, &[0, 2, 1]).unwrap())
         .unwrap();
     let scaled = ops::multiply(&scores, &Array::from_f32(scale)).unwrap();
     let attn = ops::softmax_axes(&scaled, &[-1], None::<bool>).unwrap();
-    ops::matmul(&attn, v, None::<&Array>).unwrap()
+    ops::matmul(&attn, v).unwrap()
 }
 
 /// SiLU activation: x * sigmoid(x).
@@ -855,8 +853,8 @@ fn cross_entropy_loss(logits: &Array, targets: &Array) -> Array {
     // targets: [batch, seq_len] — i32 token ids
     let lse = ops::logsumexp_axis(logits, -1, Some(true)).unwrap();
     let log_softmax = ops::subtract(logits, &lse).unwrap();
-    let nll = ops::take_along_axis(&log_softmax, targets, -1).unwrap();
-    let loss = ops::mean(&nll, None).unwrap();
+    let nll = log_softmax.take_along_axis(targets, -1).unwrap();
+    let loss = ops::mean(&nll, None::<bool>).unwrap();
     ops::multiply(&loss, &Array::from_f32(-1.0)).unwrap()
 }
 

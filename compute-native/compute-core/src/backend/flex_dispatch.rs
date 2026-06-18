@@ -484,8 +484,11 @@ impl FlexDispatch {
         self.sample_now();
 
         let state = &self.last_state;
+        // Collect operation IDs first to avoid conflicting borrows on executor
+        let op_ids: Vec<_> = executor.operation_registry.keys().copied().collect();
 
-        for (op_id, op_desc) in &executor.operation_registry {
+        for op_id in op_ids {
+            let op_desc = &executor.operation_registry[&op_id];
             let family = classify_family(op_desc.family);
             let backend_id = match family {
                 DispatchFamily::MatMul => {
@@ -514,7 +517,7 @@ impl FlexDispatch {
                 DispatchFamily::Softmax | DispatchFamily::LayerNorm => BackendId(1),
             };
 
-            executor.set_route(*op_id, backend_id);
+            executor.set_route(op_id, backend_id);
         }
 
         Ok(())

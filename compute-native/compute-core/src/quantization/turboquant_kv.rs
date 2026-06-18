@@ -999,9 +999,10 @@ impl TurboQuantKvCache {
                 let mut v = dequantize_polar_hadamard(&st.values, num_elems, st.v_bits);
                 // Apply QJL correction if present
                 if !st.qjl_values.is_empty() {
+                    let num_elements = v.len();
                     apply_qjl_correction(&mut v, &QjlCorrection {
                         residual_bits: st.qjl_values.clone(),
-                        num_elements: v.len(),
+                        num_elements,
                         residual_magnitude: st.qjl_val_magnitude.max(1e-10),
                     });
                 }

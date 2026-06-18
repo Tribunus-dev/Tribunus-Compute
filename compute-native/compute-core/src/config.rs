@@ -322,7 +322,7 @@ pub struct ExecutionSpec {
 }
 
 /// Selected namespace root for text model tensors.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct NamespaceBinding {
     pub root: String,
     /// How the root was discovered.
@@ -333,7 +333,7 @@ pub struct NamespaceBinding {
 }
 
 /// A layer's complete specification.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct LayerSpec {
     pub index: u32,
     pub attention_kind: AttentionKind,
@@ -353,7 +353,7 @@ pub struct LayerSpec {
 }
 
 /// A single tensor's expected identity in the safetensors file.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct TensorBinding {
     pub name: String,
     pub role: TensorRole,
@@ -362,7 +362,7 @@ pub struct TensorBinding {
     pub packed_shape: Option<PackedLinearShapes>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct PackedLinearShapes {
     pub weight: Vec<u32>,
     pub scales: Vec<u32>,
@@ -372,7 +372,7 @@ pub struct PackedLinearShapes {
     pub groups: u32,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub enum TensorRole {
     Embedding,
     FinalNorm,
@@ -2132,4 +2132,20 @@ impl ServerConfig {
         self.cluster.autoscale_min = other.cluster.autoscale_min;
         self.cluster.autoscale_max = other.cluster.autoscale_max;
     }
+}
+
+
+/// Generate per-backend fusion plans.
+pub fn generate_backend_plans(
+    plan: &ModelExecutionPlan,
+    backends: &[&str],
+) -> HashMap<String, std::collections::HashMap<String, Vec<FusedOperation>>> {
+    let mut result = std::collections::HashMap::new();
+    for backend in backends {
+        let layer_ops: std::collections::HashMap<String, Vec<FusedOperation>> = plan.layers.iter().map(|layer| {
+            (layer.layer_index.to_string(), layer.fused_operations.clone())
+        }).collect();
+        result.insert(backend.to_string(), layer_ops);
+    }
+    result
 }

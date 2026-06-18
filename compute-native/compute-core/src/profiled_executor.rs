@@ -14,7 +14,6 @@ use crate::mapped_image::MappedImage;
 use crate::quantization::turboquant_kv::AsymmetricQuantMode;
 use crate::ane::hot_row_predictor::HotRowPredictor;
 use crate::ane::weight_row_cache::WeightRowCache;
-use crate::compiler::ane::kv_decompress_program::AneCompressor;
 use crate::arena::Arena;
 use crate::autopsy::ModelAutopsy;
 use crate::cache::chunk_kv::ChunkKvCache;
@@ -894,7 +893,7 @@ impl LayerWeightStreamer {
     fn load_layer(&self, layer_idx: u32) -> Result<LayerWeights, String> {
         let base = format!("language_model.model.layers.{}", layer_idx);
 
-        let mut load_tensor = |name: &str| -> Result<Arc<Array>, String> {
+        let load_tensor = |name: &str| -> Result<Arc<Array>, String> {
             let entry = self.reader.manifest.tensor_table
                 .iter()
                 .find(|e| e.name == name)
@@ -1084,7 +1083,7 @@ impl WorkingSetManager {
             .learn_evolk_budgets(num_layers, calibration_set, cache)?;
         Ok(self
             .kv_page_migration
-            .evolkv_budget
+            .evolvk_budget
             .clone()
             .expect("learn_evolk_budgets just set evolvk_budget"))
     }
@@ -1185,11 +1184,16 @@ pub struct ProfiledInferenceSession {
     /// instead of individual pages.  New tokens are buffered between
     /// chunk boundaries.
     pub chunk_kv_cache: Option<ChunkKvCache>,
+    /// Per-token execution receipts for this session.
+    pub receipts: Vec<crate::receipt::TokenReceipt>,
     /// Latest output logits from the most recent forward pass.
     /// Populated by the inference engine after each prefill/decode step.
     /// Used by SpecHub speculative decoding to access the target distribution
     /// without re-running the model.
     pub logits: Option<Array>,
+    /// Physical memory page table indexed by page_id.
+    /// Each entry holds an ArenaPage when the page is resident.
+    pub page_table: Vec<Option<crate::ring::ArenaPage>>,
 }
 
 /// Pooling strategy for extracting a single embedding vector from
@@ -1241,6 +1245,8 @@ impl ProfiledInferenceSession {
             working_set: None,
             chunk_kv_cache: None,
             logits: None,
+            receipts: Vec::new(),
+            page_table: (0..256).map(|_| None).collect(),
         }
         }
 
@@ -1460,10 +1466,10 @@ impl ProfiledInferenceSession {
             EngineError::new(EngineErrorCode::NumericalFailure, format!("chunk prologue eval: {}", e))
         })?;
 
-        let slots = model.memory_island.preallocate_layer_slots(1, 3840);
+        let _slots = model.memory_island.preallocate_layer_slots(1, 3840);
 
         for (l, layer_plan) in plan.layers.iter().enumerate() {
-            let lw = match &self.working_set {
+            let lw = match &mut self.working_set {
                 Some(ws) => ws.weight_streamer.activate(l as u32)
                     .map_err(|e| EngineError::new(EngineErrorCode::InferenceFailed, e))?,
                 None => &model.layers[l],
@@ -1475,7 +1481,7 @@ impl ProfiledInferenceSession {
                 (&model.rope_cos, &model.rope_sin)
             };
 
-            hidden = crate::executor::run_layer(
+            hidden = crate::executor::run_layer_with_sinks(
                 &hidden,
                 layer_plan,
                 &layer_plan.route,
@@ -1513,11 +1519,10 @@ impl ProfiledInferenceSession {
             .map_err(|e| {
                 EngineError::new(EngineErrorCode::InferenceFailed, format!("chunk layer {}: {}", l, e))
             })?;
-            crate::heterogeneous::evaluate_into_island(slots.hidden_a.as_ref(), &hidden)
-                .map_err(|e| EngineError::new(
-                    EngineErrorCode::NumericalFailure,
-                    format!("chunk evaluate_into_island: {}", e),
-                ))?;
+            hidden.eval().map_err(|e| EngineError::new(
+                EngineErrorCode::NumericalFailure,
+                format!("chunk layer {} eval: {}", l, e),
+            ))?;
             if ((l + 1) % 6 == 0) || (l + 1 == plan.layers.len()) {
                 hidden.eval().map_err(|e| {
                     EngineError::new(EngineErrorCode::NumericalFailure, format!("chunk layer {} eval: {}", l, e))
@@ -1532,6 +1537,10 @@ impl ProfiledInferenceSession {
         if self.memory_plan.is_some() {
             let _ = crate::memory::plan::clear_memory_plan();
         }
+
+        // Record a receipt for this prefill chunk.
+        let chunk_start = self.absolute_position;
+        self.receipts.push(self.build_receipt(model, chunk_start));
 
         self.prefilled_tokens += chunk_size;
         self.absolute_position += chunk_size;
@@ -1566,12 +1575,14 @@ impl ProfiledInferenceSession {
                 .first().copied().unwrap_or(0);
             self.generated_tokens.push(token);
             // Advance the grammar FSM if grammar-guided generation is active.
-            if let Some(tokenizer) = &self.sampler.grammar_tokenizer {
-                let text = tokenizer.decode(token);
-                if !text.is_empty() {
-                    if let Err(e) = self.sampler.advance_grammar(text) {
-                        eprintln!("[grammar] prefill advance failed for token {}: {}", token, e);
-                    }
+            let text = if let Some(tokenizer) = &self.sampler.grammar_tokenizer {
+                tokenizer.decode(token).to_string()
+            } else {
+                String::new()
+            };
+            if !text.is_empty() {
+                if let Err(e) = self.sampler.advance_grammar(&text) {
+                    eprintln!("[grammar] prefill advance failed for token {}: {}", token, e);
                 }
             }
             self.phase = InferenceSessionState::Decoding;
@@ -1825,7 +1836,7 @@ impl ProfiledInferenceSession {
                 .admit_sync(work_item)
                 .map_err(|e| EngineError::new(EngineErrorCode::InferenceFailed, format!("admit layer {}: {}", l, e)))?;
             let handles_before = crate::bridge::handle_count();
-            let lw = match &self.working_set {
+            let lw = match &mut self.working_set {
                 Some(ws) => ws.weight_streamer.activate(l as u32)
                     .map_err(|e| EngineError::new(EngineErrorCode::InferenceFailed, e))?,
                 None => &model.layers[l],
@@ -1837,7 +1848,7 @@ impl ProfiledInferenceSession {
                 (&model.rope_cos, &model.rope_sin)
             };
 
-            hidden = crate::executor::run_layer(
+            hidden = crate::executor::run_layer_with_sinks(
                 &hidden,
                 layer_plan,
                 &layer_plan.route,
@@ -1952,7 +1963,8 @@ impl ProfiledInferenceSession {
         }
 
         // Check for anomalies in the decoded step (NaN, Inf, forbidden tokens)
-        if let Err(e) = self.check_anomalies(&layer_hiddens, &self.generated_tokens) {
+        let gen_tokens = self.generated_tokens.clone();
+        if let Err(e) = self.check_anomalies(&layer_hiddens, &gen_tokens) {
             eprintln!("[autopsy] Anomaly check failed: {}", e);
         }
 
@@ -2003,21 +2015,27 @@ impl ProfiledInferenceSession {
         // The FSM tracks which tokens are valid given the current generation
         // state. We need the tokenizer to decode the token ID back to text
         // so the FSM can consume the text and advance to the next state.
-        if let Some(tokenizer) = &self.sampler.grammar_tokenizer {
-            let text = tokenizer.decode(token);
-            if !text.is_empty() {
-                if let Err(e) = self.sampler.advance_grammar(text) {
-                    eprintln!("[grammar] advance failed for token {}: {}", token, e);
-                }
+        let text = if let Some(tokenizer) = &self.sampler.grammar_tokenizer {
+            tokenizer.decode(token).to_string()
+        } else {
+            String::new()
+        };
+        if !text.is_empty() {
+            if let Err(e) = self.sampler.advance_grammar(&text) {
+                eprintln!("[grammar] advance failed for token {}: {}", token, e);
             }
         }
 
-    /// Inject encoded media tokens into the prompt embedding sequence.
+    // Inject encoded media tokens into the prompt embedding sequence.
         self.timeline.push_event(TimelineEvent::new(
             self.absolute_position as u64,
             TimelineEventType::DecodeStep,
             format!("decoded token {}", token),
         ));
+
+        // Record a receipt for this decoded token.
+        let token_index = self.absolute_position.saturating_sub(1);
+        self.receipts.push(self.build_receipt(model, token_index));
 
         Ok(token)
     }
@@ -2100,7 +2118,7 @@ impl ProfiledInferenceSession {
 
         // ── Execute all transformer layers ─────────────────────────────
         for (l, layer_plan) in plan.layers.iter().enumerate() {
-            let lw = match &self.working_set {
+            let lw = match &mut self.working_set {
                 Some(ws) => ws.weight_streamer.activate(l as u32)
                     .map_err(|e| EngineError::new(EngineErrorCode::InferenceFailed, e))?,
                 None => &model.layers[l],
@@ -2194,25 +2212,14 @@ impl ProfiledInferenceSession {
             }
             EmbedPoolStrategy::Cls => {
                 // First token at position 0
-                mlx_rs::ops::indexing::IndexOp::index(&hidden_f32, 0i32).map_err(|e| {
-                    EngineError::new(
-                        EngineErrorCode::NumericalFailure,
-                        format!("embed cls pool: {}", e),
-                    )
-                })?
+                mlx_rs::ops::indexing::IndexOp::index(&hidden_f32, 0i32)
             }
             EmbedPoolStrategy::Last => {
                 // Last token at position seq_len - 1
                 mlx_rs::ops::indexing::IndexOp::index(
                     &hidden_f32,
-                    (seq_len as i32 - 1),
+                    seq_len as i32 - 1,
                 )
-                .map_err(|e| {
-                    EngineError::new(
-                        EngineErrorCode::NumericalFailure,
-                        format!("embed last pool: {}", e),
-                    )
-                })?
             }
         };
         pooled.eval().map_err(|e| {
@@ -2364,13 +2371,40 @@ impl ProfiledInferenceSession {
                 &[feat_idx as i32, 0],
                 &[1, feat_dim as i32],
                 &[1, 1],
-            );
+            )?;
 
             // Extract the single position in the embedding sequence.
-            let _ = prompt_embeds.slice_assign(
-                &[0, pos as i32, 0],
-                &feat_slice,
-            );
+            // slice_assign is not available in the mlx-rs fork — rebuild via concatenation.
+            let pos_i32 = pos as i32;
+            let hidden_i32 = feat_dim as i32;
+            let seq_len_i32 = seq_len as i32;
+            let left = if pos > 0 {
+                Some(mlx_rs::Array::slice(
+                    prompt_embeds,
+                    &[0, 0, 0],
+                    &[1, pos_i32, hidden_i32],
+                    &[1, 1, 1],
+                )?)
+            } else {
+                None
+            };
+            let right_len = seq_len_i32 - pos_i32 - 1;
+            let right = if right_len > 0 {
+                Some(mlx_rs::Array::slice(
+                    prompt_embeds,
+                    &[0, pos_i32 + 1, 0],
+                    &[1, right_len, hidden_i32],
+                    &[1, 1, 1],
+                )?)
+            } else {
+                None
+            };
+            let mut parts: Vec<&Array> = Vec::new();
+            if let Some(l) = left.as_ref() { parts.push(l); }
+            parts.push(&feat_slice);
+            if let Some(r) = right.as_ref() { parts.push(r); }
+            *prompt_embeds = mlx_rs::ops::concatenate_axis(&parts, 1)
+                .map_err(|e| format!("media injection concatenation: {}", e))?;
         }
 
         Ok(())
@@ -2460,12 +2494,23 @@ impl ProfiledInferenceSession {
                 },
                 MultiModalInput::Image(img) => {
                     // Delegate to the vision encoder for single-image encoding.
+                    let vision_config = model.reader.manifest.vision_config
+                        .as_ref()
+                        .ok_or_else(|| EngineError::new(
+                            EngineErrorCode::InvalidRequest,
+                            "image input requires vision_config in model manifest".to_string(),
+                        ))?;
                     let vision_enc = model.vision_encoder.as_ref()
                         .ok_or_else(|| EngineError::new(
                             EngineErrorCode::InvalidRequest,
                             "image input requires vision_encoder in model".to_string(),
                         ))?;
-                    let features = vision_enc.encode_frame(&img.data)
+                    let processed = crate::vision::preprocess::preprocess_image(&img.source, vision_config)
+                        .map_err(|e| EngineError::new(
+                            EngineErrorCode::InferenceFailed,
+                            format!("image preprocessing failed: {}", e),
+                        ))?;
+                    let features = vision_enc.encode(&processed)
                         .map_err(|e| EngineError::new(
                             EngineErrorCode::InferenceFailed,
                             format!("image encoding failed: {}", e),
@@ -2477,8 +2522,8 @@ impl ProfiledInferenceSession {
                     // Audio is handled by the audio subsystem.
                     // For now, emit a placeholder message and skip.
                     eprintln!(
-                        "[prefill_with_media] audio input not yet implemented; skipping {} bytes",
-                        audio.data.len(),
+                        "[prefill_with_media] audio input not yet implemented; skipping {}",
+                        audio.source,
                     );
                     // Push empty features to keep indexing consistent.
                     let empty = mlx_rs::Array::from_slice::<f32>(
@@ -2553,10 +2598,10 @@ impl ProfiledInferenceSession {
         }
 
         let kv_offset = 0u32;
-        let slots = model.memory_island.preallocate_layer_slots(1, 3840);
+        let _slots = model.memory_island.preallocate_layer_slots(1, 3840);
 
         for (l, layer_plan) in plan.layers.iter().enumerate() {
-            let lw = match &self.working_set {
+            let lw = match &mut self.working_set {
                 Some(ws) => ws.weight_streamer.activate(l as u32)
                     .map_err(|e| EngineError::new(EngineErrorCode::InferenceFailed, e))?,
                 None => &model.layers[l],
@@ -2568,7 +2613,7 @@ impl ProfiledInferenceSession {
                 (&model.rope_cos, &model.rope_sin)
             };
 
-            hidden = crate::executor::run_layer(
+            hidden = crate::executor::run_layer_with_sinks(
                 &hidden,
                 layer_plan,
                 &layer_plan.route,
@@ -2610,12 +2655,9 @@ impl ProfiledInferenceSession {
                 )
             })?;
 
-            crate::heterogeneous::evaluate_into_island(
-                slots.hidden_a.as_ref(),
-                &hidden,
-            ).map_err(|e| EngineError::new(
+            hidden.eval().map_err(|e| EngineError::new(
                 EngineErrorCode::NumericalFailure,
-                format!("prefill_with_media evaluate_into_island: {}", e),
+                format!("prefill_with_media layer {} eval: {}", l, e),
             ))?;
 
             if ((l + 1) % 6 == 0) || (l + 1 == plan.layers.len()) {
@@ -2671,6 +2713,56 @@ impl ProfiledInferenceSession {
         self.pending_prompt_tokens = None;
 
         Ok(token)
+    }
+
+    /// Build a per-token receipt from the current session state.
+    fn build_receipt(
+        &self,
+        model: &LoadedProfiledModel,
+        token_index: u32,
+    ) -> crate::receipt::TokenReceipt {
+        // Determine the dominant backend from the first layer's route.
+        let plan = &model.reader.manifest.execution_plan;
+        let backend_id = plan
+            .layers
+            .first()
+            .map(|l| l.route.dominant_backend())
+            .unwrap_or(0);
+        let backend = crate::receipt::backend_id_to_label(backend_id as u8).to_string();
+
+        crate::receipt::TokenReceipt {
+            token_index,
+            backend,
+            bytes_copied_h2d: 0,
+            bytes_copied_d2d: 0,
+            bytes_copied_d2h: 0,
+            arena_allocations: 0,
+            arena_failures: 0,
+            fallback_count: 0,
+            fallback_by_priority: Vec::new(),
+            stage_durations_us: Vec::new(),
+            speculative_branches_accepted: 0,
+            speculative_branches_rejected: 0,
+            kv_page_faults: 0,
+            disk_bytes_read: 0,
+        }
+    }
+
+    /// Return aggregated session receipts.
+    pub fn session_receipts(&self) -> crate::receipt::SessionReceipts {
+        let total_fallbacks = self.receipts.iter().map(|r| r.fallback_count).sum();
+        let total_backend_switches = self
+            .receipts
+            .windows(2)
+            .filter(|w| w[0].backend != w[1].backend)
+            .count() as u32;
+
+        crate::receipt::SessionReceipts {
+            per_token: self.receipts.clone(),
+            total_tokens: self.generated_tokens.len() as u32,
+            total_backend_switches,
+            total_fallbacks,
+        }
     }
 }
 
@@ -2866,7 +2958,7 @@ pub fn prefill_with_audio(
     let token_ids_i32: Vec<i32> = text_tokens.iter().map(|&t| t as i32).collect();
     let tok_arr = Array::from_slice(&token_ids_i32, &[1, text_tokens.len() as i32]);
 
-    let mut hidden = run_prologue(
+    let hidden = run_prologue(
         &tok_arr,
         &model.emb_w,
         &model.emb_s,
@@ -2888,7 +2980,6 @@ pub fn prefill_with_audio(
     } else {
         mlx_rs::ops::concatenate(
             &audio_features_list.iter().collect::<Vec<_>>(),
-            0,
         )
         .map_err(|e| EngineError::new(
             EngineErrorCode::InferenceFailed,
@@ -2904,7 +2995,7 @@ pub fn prefill_with_audio(
             format!("combined hidden eval: {}", e))
     })?;
 
-    let kv_offset = 0u32;
+    let _kv_offset = 0u32;
     sess.phase = InferenceSessionState::PrefillRunning;
 
     let total_tokens = text_tokens_count + total_audio_frames as u32;
@@ -2921,7 +3012,7 @@ pub fn prefill_with_audio(
             ));
         }
 
-        let lw = match &sess.working_set {
+        let lw = match &mut sess.working_set {
             Some(ws) => ws.weight_streamer.activate(l as u32)
                 .map_err(|e| EngineError::new(EngineErrorCode::InferenceFailed, e))?,
             None => &model.layers[l],
@@ -2933,7 +3024,7 @@ pub fn prefill_with_audio(
             (&model.rope_cos, &model.rope_sin)
         };
 
-        layer_hidden = crate::executor::run_layer(
+        layer_hidden = crate::executor::run_layer_with_sinks(
             &layer_hidden,
             layer_plan,
             &layer_plan.route,

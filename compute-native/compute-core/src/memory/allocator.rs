@@ -412,8 +412,8 @@ impl KvCacheBlockAllocator {
             .allocate_pages(1)
             .ok_or_else(|| "KvCacheBlockAllocator: no free blocks available".to_string())?;
         let idx = pages[0];
-        let gen = self.generations[idx];
-        Ok((idx, gen))
+        let generation = self.generations[idx];
+        Ok((idx, generation))
     }
 
     /// Free a block by page index.

@@ -206,8 +206,8 @@ impl KnowledgeEditor {
                         v_sum = ops::add(&v_sum, vi).unwrap();
                     }
                     let n = group.len() as f32;
-                    let u_avg = ops::multiply(&u_sum, &Array::from_float(n.recip())).unwrap();
-                    let v_avg = ops::multiply(&v_sum, &Array::from_float(n.recip())).unwrap();
+                    let u_avg = ops::multiply(&u_sum, &Array::from_slice(&[n.recip()], &[1])).unwrap();
+                    let v_avg = ops::multiply(&v_sum, &Array::from_slice(&[n.recip()], &[1])).unwrap();
                     (u_avg, v_avg)
                 };
 
@@ -272,7 +272,7 @@ impl KnowledgeEditor {
 
             // Corrupt: zero out a representative row of the weight matrix
             // to simulate MLP output corruption at this layer.
-            let corrupted = ops::multiply(&orig, &Array::from_float(0.0f32)).unwrap();
+            let corrupted = ops::multiply(&orig, &Array::from_slice(&[0.0f32], &[1])).unwrap();
 
             // We cannot actually mutate the model here because we only
             // have an Arc ref.  This is fine for a compile-time placeholder:
@@ -414,6 +414,7 @@ impl KnowledgeEditor {
         // during an edit.
         let cell = &self.model.layers[layer as usize];
         let ptr = &cell.down_proj_w as *const Arc<Array> as *mut Arc<Array>;
+        #[allow(invalid_reference_casting)]
         unsafe {
             *ptr = Arc::new(updated_weight.clone());
         }
@@ -439,7 +440,7 @@ impl KnowledgeEditor {
                 )
             })?;
         // Serialise the updated weight to bytes (matching segment layout).
-        let corrected_bytes = if let Some(bytes) = updated_weight.as_slice::<u8>() {
+        let corrected_bytes = if let Ok(bytes) = updated_weight.try_as_slice::<u8>() {
             bytes.to_vec()
         } else {
             // Fallback: save to safetensors buffer.
@@ -663,9 +664,9 @@ impl KnowledgeEditor {
         let token_idx = (hash % vocab_size as u64) as i32;
 
         // Look up the embedding row for this token.
-        let emb_row = ops::take_axis(&self.model.emb_w, &Array::from_int(token_idx), 0)
+        let emb_row = self.model.emb_w.take_axis(&Array::from_int(token_idx), 0)
             .map_err(|e| format!("embedding lookup: {:?}", e))?;
-        let emb_row = ops::reshape(&emb_row, &[1, -1], None::<i32>).unwrap();
+        let emb_row = ops::reshape(&emb_row, &[1, -1]).unwrap();
 
         // Average the last-layer down_proj output to simulate the logit
         // contribution.
@@ -679,14 +680,14 @@ impl KnowledgeEditor {
         let logit_val = ops::sum(&logit_vec, None::<bool>).unwrap();
 
         // Read the scalar value.
-        let scalar = match logit_val.as_slice::<f32>() {
-            Some(s) => *s.first().unwrap_or(&0.0) as f64,
-            None => {
+        let scalar = match logit_val.try_as_slice::<f32>() {
+            Ok(s) => *s.first().unwrap_or(&0.0) as f64,
+            Err(_) => {
                 // Fallback: convert to scalar via mean.
                 let mean = ops::mean(&logit_val, None::<bool>).unwrap();
-                match mean.as_slice::<f32>() {
-                    Some(s) => *s.first().unwrap_or(&0.0) as f64,
-                    None => 0.0,
+                match mean.try_as_slice::<f32>() {
+                    Ok(s) => *s.first().unwrap_or(&0.0) as f64,
+                    Err(_) => 0.0,
                 }
             }
         };

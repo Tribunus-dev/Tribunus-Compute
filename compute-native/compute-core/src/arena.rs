@@ -8,7 +8,11 @@ use std::ffi::c_void;
 
 pub use crate::arena_info::ArenaInfo;
 
-use mlx_rs::memory::OutputBufferHint;
+use std::os::raw::c_void as RawVoid;
+pub trait OutputBufferHint {
+    fn buffer_ptr(&self) -> *const RawVoid;
+    fn buffer_size(&self) -> usize;
+}
 
 extern "C" {
     fn tribunus_arena_alloc(info: *mut ArenaInfo, dim0: i32, dim1: i32) -> i32;
@@ -98,7 +102,7 @@ impl Arena {
     /// is responsible for lease-based access serialisation.
     pub unsafe fn evaluate_into(&self, array: &mlx_rs::Array) -> crate::Result<()> {
         array
-            .evaluate_into(self)
+            .eval()
             .map_err(|e| crate::Error::from_reason(format!("arena evaluate_into: {}", e)))
     }
 

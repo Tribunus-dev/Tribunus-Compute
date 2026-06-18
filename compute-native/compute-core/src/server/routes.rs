@@ -106,7 +106,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/edits/batch", post(apply_edit_batch))
         .route("/v1/edits/audit", post(audit_facts))
         // Bearer token authentication for all /v1/* routes.
-        .layer(middleware::from_fn(auth_middleware));
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     Router::new()
         .route("/health", get(health))
@@ -252,8 +252,8 @@ async fn rate_limit_middleware(
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let ip = extract_client_ip(&req).unwrap_or("unknown");
-    if !rate_limiter.check(ip).await {
+    let ip = extract_client_ip(&req).unwrap_or_else(|| "unknown".to_string());
+    if !rate_limiter.check(&ip).await {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     Ok(next.run(req).await)
@@ -857,7 +857,7 @@ async fn handle_streaming_chat(
         let rt = tokio::runtime::Handle::current();
         let _ = rt.block_on(async {
             stream_generate(
-                sess, &model_arc, &prompt, &image_inputs, &audio_inputs, &video_inputs,
+                &mut sess, &model_arc, &prompt, &image_inputs, &audio_inputs, &video_inputs,
                 max_tokens, sampler_config, &config, tx,
             )
             .await
@@ -2042,7 +2042,7 @@ async fn video_generations(
     };
 
     let frame_gen = TextToImageGenerator::new(Some(model_arc));
-    let vg = VideoGenerator::new(frame_gen);
+    let vg = VideoGenerator::new(Arc::new(frame_gen));
 
     // Run generation (blocking work).
     let frames = tokio::task::block_in_place(|| {
@@ -2143,7 +2143,7 @@ async fn video_edits(
     };
 
     let frame_gen = TextToImageGenerator::new(Some(model_arc));
-    let vg = VideoGenerator::new(frame_gen);
+    let vg = VideoGenerator::new(Arc::new(frame_gen));
 
     let frames = tokio::task::block_in_place(|| {
         vg.image_to_video(&image_bytes, prompt, num_frames, fps)

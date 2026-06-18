@@ -146,15 +146,15 @@ impl GraphBackend for CoreMlBackend {
         inputs: &[TensorId],
     ) -> Result<RegionExecutionReceipt, String> {
         let idx = region.slot as usize;
-        let gen = region.generation;
+        let generation = region.generation;
 
         if idx >= self.compiled_regions.len()
             || self.compiled_regions[idx].is_none()
-            || self.region_generations.get(idx).copied().unwrap_or(0) != gen
+            || self.region_generations.get(idx).copied().unwrap_or(0) != generation
         {
             return Err(format!(
                 "CoreMlBackend: stale or invalid region handle slot={} gen={}",
-                idx, gen,
+                idx, generation,
             ));
         }
 

@@ -13,9 +13,11 @@ fn main() {
     // macOS workaround: unset MallocStackLogging inherited from Xcode/LLDB
     // to suppress "can't turn off malloc stack logging because it was not enabled"
     // on stderr during process exit, which corrupts terminal output.
-    std::env::remove_var("MallocStackLogging");
-    std::env::remove_var("MallocStackLoggingNoCompact");
-    let k: usize = std::env::var("TRIBUNUS_NATIVE_K");
+    unsafe {
+        std::env::set_var("MallocStackLogging", "0");
+        std::env::set_var("MallocStackLoggingNoCompact", "0");
+    }
+    let k: usize = std::env::var("TRIBUNUS_NATIVE_K")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3840);

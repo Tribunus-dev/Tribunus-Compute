@@ -34,6 +34,6 @@ pub fn inject_audio_features(hidden: &Array, audio_features: &Array) -> Result<A
 
     // Concatenate audio features before text tokens so cross-attention can
     // attend to audio context.
-    ops::concatenate(&[audio_features, hidden], 0)
+    ops::concatenate(&[audio_features, hidden])
         .map_err(|e| format!("concatenate audio features: {:?}", e))
 }

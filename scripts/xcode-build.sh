@@ -13,8 +13,8 @@ set -euo pipefail
  # before any subprocess (cmake, ninja, omp threads) inherits it.
  # This suppresses "can't turn off malloc stack logging because it was not enabled"
  # on stderr during process shutdown.
- export MallocStackLogging=
- export MallocStackLoggingNoCompact=
+ export MallocStackLogging=0
+ export MallocStackLoggingNoCompact=0
 
 cd "$SRCROOT"
 

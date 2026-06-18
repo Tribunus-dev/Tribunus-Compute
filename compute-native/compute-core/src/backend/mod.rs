@@ -358,12 +358,12 @@ impl MlxBackend {
     /// slot and generation.
     fn get(&self, handle: TensorHandle) -> Result<&Array, String> {
         let slot = handle.slot as usize;
-        let gen = handle.generation;
+        let generation = handle.generation;
         match self.arrays.get(slot) {
-            Some(Some(arr)) if gen == self.generations[slot] => Ok(arr),
+            Some(Some(arr)) if generation == self.generations[slot] => Ok(arr),
             _ => Err(format!(
                 "MlxBackend: invalid tensor handle (slot={}, gen={})",
-                slot, gen,
+                slot, generation,
             )),
         }
     }
@@ -371,12 +371,12 @@ impl MlxBackend {
     /// Get an immutable reference to a quantized weight array at `handle`.
     fn get_weight(&self, handle: QuantizedWeightHandle) -> Result<&Array, String> {
         let slot = handle.slot as usize;
-        let gen = handle.generation;
+        let generation = handle.generation;
         match self.weight_arrays.get(slot) {
-            Some(Some(arr)) if gen == self.weight_generations[slot] => Ok(arr),
+            Some(Some(arr)) if generation == self.weight_generations[slot] => Ok(arr),
             _ => Err(format!(
                 "MlxBackend: invalid weight handle (slot={}, gen={})",
-                slot, gen,
+                slot, generation,
             )),
         }
     }
@@ -793,26 +793,26 @@ impl TensorBackend for MlxBackend {
 
     fn release(&mut self, handle: TensorHandle) -> Result<(), String> {
         let slot = handle.slot as usize;
-        let gen = handle.generation;
+        let generation = handle.generation;
 
         // Validate slot and generation match
         if slot >= self.arrays.len() {
             return Err(format!(
                 "release: invalid handle (slot={}, gen={})",
-                slot, gen
+                slot, generation
             ));
         }
         let current_gen = self.generations[slot];
-        if gen != current_gen {
+        if generation != current_gen {
             return Err(format!(
                 "release: stale handle (slot={}, gen={}, current={})",
-                slot, gen, current_gen,
+                slot, generation, current_gen,
             ));
         }
         if self.arrays[slot].is_none() {
             return Err(format!(
                 "release: handle already released (slot={}, gen={})",
-                slot, gen
+                slot, generation
             ));
         }
 

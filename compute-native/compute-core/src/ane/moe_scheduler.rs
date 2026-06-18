@@ -269,7 +269,8 @@ impl AneMoEScheduler {
             // Extract individual hidden states for these tokens.
             let hidden_slice: Vec<f32> = hidden
                 .try_as_slice::<f32>()
-                .map_err(|e| format!("read hidden: {:?}", e))?;
+                .map_err(|e| format!("read hidden: {:?}", e))?
+                .to_vec();
 
             // For each token routed to this expert, compute the FFN and add
             // its weighted contribution to the output.
@@ -313,7 +314,8 @@ impl AneMoEScheduler {
                 // Read back and accumulate weighted.
                 let out_slice: Vec<f32> = out_arr
                     .try_as_slice::<f32>()
-                    .map_err(|e| format!("expert {} read output: {:?}", expert_idx, e))?;
+                    .map_err(|e| format!("expert {} read output: {:?}", expert_idx, e))?
+                    .to_vec();
 
                 let out_base = t_idx * hidden_size;
                 for h in 0..hidden_size {
@@ -390,7 +392,8 @@ pub fn select_top_k(
 
     let probs_slice: Vec<f32> = routing_probs
         .try_as_slice::<f32>()
-        .map_err(|e| format!("select_top_k read: {:?}", e))?;
+        .map_err(|e| format!("select_top_k read: {:?}", e))?
+        .to_vec();
 
     let mut top_indices = Vec::with_capacity(batch_size * k);
     let mut top_values = Vec::with_capacity(batch_size * k);

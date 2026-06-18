@@ -339,6 +339,7 @@ pub struct SegmentView {
 /// Manages memory-mapped segments backed by on-disk segment files, decoupling
 /// the compilation lifecycle (which produces the segments) from the inference
 /// lifecycle (which consumes them).
+#[derive(Clone)]
 pub struct MappedImage {
     /// Root directory containing the segment files.
     pub image_dir: PathBuf,

@@ -254,6 +254,7 @@ impl AneFusionPass {
             outputs: last.outputs.clone(),
             dependencies: first.dependencies.clone(),
             fusions,
+            fusion_regions: vec![],
             state_effects: (run.start..=run.end)
                 .flat_map(|j| regions[j].state_effects.clone())
                 .collect(),

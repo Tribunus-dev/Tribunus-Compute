@@ -20,6 +20,7 @@ use mlx_rs::error::Result as MlxResult;
 use mlx_rs::ops;
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Array;
+use std::ops::Neg;
 
 // ── Attention Sink Reuse ────────────────────────────────────────────────────
 
@@ -72,8 +73,8 @@ impl SinkState {
         if n_sinks_actual == 0 {
             return Ok(());
         }
-        let sink_k = k_cached.index((..n_sinks_actual as i32, .., ..))?;
-        let sink_v = v_cached.index((..n_sinks_actual as i32, .., ..))?;
+        let sink_k = k_cached.index((..n_sinks_actual as i32, .., ..));
+        let sink_v = v_cached.index((..n_sinks_actual as i32, .., ..));
         self.sink_k = Some(sink_k);
         self.sink_v = Some(sink_v);
         Ok(())
@@ -98,22 +99,22 @@ impl SinkState {
         let window_start = sink_end.max(window_end.saturating_sub(self.adaptive_window as usize));
         debug_assert!(window_start >= sink_end, "window must start after sinks");
         let (window_k, window_v) = if window_start < cached_len {
-            let wk = k_cached.index((window_start as i32.., .., ..))?;
-            let wv = v_cached.index((window_start as i32.., .., ..))?;
+            let wk = k_cached.index((window_start as i32.., .., ..));
+            let wv = v_cached.index((window_start as i32.., .., ..));
             (wk, wv)
         } else {
-            let wk = k_cached.index((0..0, .., ..))?;
-            let wv = v_cached.index((0..0, .., ..))?;
+            let wk = k_cached.index((0..0, .., ..));
+            let wv = v_cached.index((0..0, .., ..));
             (wk, wv)
         };
         let k_full = match (&self.sink_k, window_k.shape()[0] > 0) {
-            (Some(sk), true) => mlx_rs::ops::concatenate(&[sk, &window_k], 0)?,
+            (Some(sk), true) => mlx_rs::ops::concatenate(&[sk, &window_k])?,
             (Some(sk), false) => sk.clone(),
             (None, true) => window_k,
             (None, false) => return Err(mlx_rs::error::Exception::custom("sink_attention: no sinks and no window tokens")),
         };
         let v_full = match (&self.sink_v, window_v.shape()[0] > 0) {
-            (Some(sv), true) => mlx_rs::ops::concatenate(&[sv, &window_v], 0)?,
+            (Some(sv), true) => mlx_rs::ops::concatenate(&[sv, &window_v])?,
             (Some(sv), false) => sv.clone(),
             (None, true) => window_v,
             (None, false) => return Err(mlx_rs::error::Exception::custom("sink_attention: no sinks and no window tokens")),
@@ -136,9 +137,8 @@ impl SinkState {
     pub fn update_adaptive_window(&mut self, attention_weights: &Array) {
         let entropy = if attention_weights.ndim() >= 2 {
             let seq = attention_weights.shape().last().copied().unwrap_or(1);
-            let head_0 = attention_weights.index((0..1, 0..seq as i32)).ok();
-            if let Some(h) = &head_0 {
-                if let Ok(flat) = h.reshape(&[-1]) {
+            let head_0 = attention_weights.index((0..1, 0..seq as i32));
+            if let Ok(flat) = head_0.reshape(&[-1]) {
                     if let Ok(slice) = flat.try_as_slice::<f32>() {
                         let mut e = 0.0f32;
                         for &p in slice.iter() {
@@ -147,7 +147,6 @@ impl SinkState {
                         self.last_entropy = e;
                         e
                     } else { self.last_entropy }
-                } else { self.last_entropy }
             } else { self.last_entropy }
         } else { self.last_entropy };
         let base = (self.adaptive_window as f32).ln().max(1.0);
@@ -248,7 +247,7 @@ pub fn apply_vision_embeddings(
 
     let ids: Vec<u32> = flat_ids
         .try_as_slice::<u32>()
-        .map_err(|e| mlx_rs::error::Exception::format(&format!(
+        .map_err(|e| mlx_rs::error::Exception::custom(format!(
             "apply_vision_embeddings: token_ids as_slice: {:?}", e
         )))?
         .to_vec();
@@ -265,17 +264,11 @@ pub fn apply_vision_embeddings(
     // Get hidden data as mutable slice.
     let mut h_data: Vec<f32> = hidden
         .as_slice::<f32>()
-        .map_err(|e| mlx_rs::error::Exception::format(&format!(
-            "apply_vision_embeddings: hidden as_slice: {:?}", e
-        )))?
         .to_vec();
 
     // Get vision features data.
     let vf_data: Vec<f32> = vision_features
         .as_slice::<f32>()
-        .map_err(|e| mlx_rs::error::Exception::format(&format!(
-            "apply_vision_embeddings: vision_features as_slice: {:?}", e
-        )))?
         .to_vec();
 
     let vf_dim = vision_features.shape().get(1).copied().unwrap_or(1) as usize;
@@ -622,6 +615,8 @@ pub fn run_layer_with_sinks(
 
 // ── Attention implementations ──────────────────────────────────────────────
 
+static T2_PROBE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 fn qmatmul(x: &Array, w: &Array, s: &Array, b: &Array) -> MlxResult<Array> {
     let group_size = if s.shape().len() >= 1 {
         (w.shape()[1] as i32 * 4) / s.shape()[s.shape().len() - 1]
@@ -632,7 +627,6 @@ fn qmatmul(x: &Array, w: &Array, s: &Array, b: &Array) -> MlxResult<Array> {
     // OPT-0006-T2 diagnostic: first-call stride/contiguity probe.
     // Answers: do external (mmap-backed) arrays trigger hidden copies?
     use std::sync::atomic::{AtomicBool, Ordering};
-    static T2_PROBE: AtomicBool = AtomicBool::new(true);
     if T2_PROBE.swap(false, Ordering::Relaxed) {
         let ws = w.shape();
         w.eval()?;
@@ -1112,14 +1106,13 @@ pub fn moe_forward(
         .map_err(|e| format!("moe softmax: {:?}", e))?;
 
     // 2. Top-K indices: argsort descending (negate), take first K
-    let neg_probs = routing_probs
-        .neg()
+    let neg_probs = (&routing_probs).neg()
     ;
     let sorted_idx = ops::argsort_axis(&neg_probs, -1)
         .map_err(|e| format!("moe argsort: {:?}", e))?;
     let top_k_indices = sorted_idx
         .index((.., ..(top_k as i32)))
-        .map_err(|e| format!("moe slice top-k indices: {:?}", e))?;
+        ;
 
     // 3. Gather top-K routing weights via take_along_axis
     let top_k_weights = ops::indexing::take_along_axis(
@@ -1148,10 +1141,11 @@ pub fn moe_forward(
     let mut expert_tokens: Vec<Vec<(usize, f32)>> = vec![Vec::new(); num_experts];
     for t in 0..seq_len {
         for p in 0..top_k_usize {
-            let e = flat_indices[t * top_k_usize + p] as usize;
-            let w = flat_weights[t * top_k_usize + p];
+            let idx = (t as usize) * top_k_usize + p;
+            let e = flat_indices[idx] as usize;
+            let w = flat_weights[idx];
             if e < num_experts && w > 0.0f32 {
-                expert_tokens[e].push((t, w));
+                expert_tokens[e].push((t as usize, w));
             }
         }
     }
@@ -1206,22 +1200,33 @@ pub fn moe_forward(
             let row_idx = i as i32;
             let t_idx = t as i32;
             let row = weighted
-                .index((row_idx, ..))
-                .map_err(|e| format!("moe expert {} row index: {:?}", e_idx, e))?;
+                .index((row_idx, ..));
             let existing_row = output
-                .index((t_idx, ..))
-                .map_err(|e| format!("moe expert {} existing: {:?}", e_idx, e))?;
+                .index((t_idx, ..));
             let combined_row = existing_row
                 .add(&row)
                 .map_err(|e| format!("moe expert {} add row: {:?}", e_idx, e))?;
-            let row_starts: Vec<i32> = vec![t_idx, 0];
-            let row_ends: Vec<i32> = vec![t_idx + 1, hidden_size_i32];
             let reshaped = combined_row
                 .reshape(&[1, hidden_size_i32])
                 .map_err(|e| format!("moe expert {} reshape row: {:?}", e_idx, e))?;
-            output = output
-                .slice_update(&reshaped, &row_starts, &row_ends)
-                .map_err(|e| format!("moe expert {} scatter row: {:?}", e_idx, e))?;
+            // Build output by concatenating [before, updated_row, after]
+            let before: Array = if t_idx > 0 {
+                output
+                    .index((..t_idx, ..))
+            } else {
+                Array::zeros::<f32>(&[0, hidden_size_i32])
+                    .map_err(|e| format!("moe before zeros: {:?}", e))?
+            };
+            let after: Array = if t_idx + 1 < seq_len {
+                output
+                    .index(((t_idx + 1).., ..))
+            } else {
+                Array::zeros::<f32>(&[0, hidden_size_i32])
+                    .map_err(|e| format!("moe after zeros: {:?}", e))?
+            };
+            let parts = [&before, &reshaped, &after];
+            output = mlx_rs::ops::concatenate(&parts)
+                .map_err(|e| format!("moe expert {} concat: {:?}", e_idx, e))?;
         }
     }
 

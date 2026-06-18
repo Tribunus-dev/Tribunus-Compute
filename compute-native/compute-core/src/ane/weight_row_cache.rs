@@ -20,6 +20,7 @@
 
 use crate::arena::Arena;
 use mlx_rs::Array;
+use mlx_rs::ops::indexing::IndexOp;
 
 // ---------------------------------------------------------------------------
 // SlotAllocator
@@ -289,7 +290,7 @@ impl WeightRowCache {
         // The lm_head is typically stored as quantized int4/int8 weights.
         // For the cache we dequantize and store as FP16.
         // Use the index operation to extract the specific column.
-        let row = lm_head.index((.., tid))?; // shape [hidden_size, 1]
+        let row = lm_head.index((.., tid as i32)); // shape [hidden_size, 1]
         let row_flat = row.reshape(&[hs as i32])?;
 
         // Eval and read back as f32 for FP16 storage.

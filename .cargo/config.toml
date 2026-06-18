@@ -1,0 +1,6 @@
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-args=-mmacosx-version-min=26.5"]
+
+[env]
+MallocStackLogging = "0"
+MallocStackLoggingNoCompact = "0"

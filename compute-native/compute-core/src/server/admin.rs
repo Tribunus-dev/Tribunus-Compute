@@ -20,7 +20,7 @@ use serde::Serialize;
 use serde_json::json;
 use tokio::sync::Mutex;
 
-use crate::cache::evolkv::{CalibrationSet, EvolKV, LayerBudget};
+use crate::cache::evolkv::{CalibrationSet, EvolKV};
 use crate::server::routes::AppState;
 
 // ---------------------------------------------------------------------------
@@ -91,7 +91,7 @@ async fn admin_status(
 ) -> JsonResponse<serde_json::Value> {
     // ── Hardware ───────────────────────────────────────────────────────
     let hw = crate::scheduling::HardwareConfig::detect();
-    let chip = hw.chip;
+    let chip = format!("{} cores/{} GB", hw.cpu_cores, hw.total_ram_gb);
     let ram_mb = crate::gpu_memory::total_physical_ram_mb();
 
     // ── Models ─────────────────────────────────────────────────────────
@@ -113,7 +113,7 @@ async fn admin_status(
 
     // ── Model cache ────────────────────────────────────────────────────
     let cache_info = {
-        let mut cache = state.model_cache.lock().await;
+        let cache = state.model_cache.lock().await;
         json!({
             "memory_status": cache.memory_status(),
             "entry_count": cache.entry_count(),
@@ -174,7 +174,6 @@ async fn admin_status(
     let adapters = state.adapters.lock().await;
     let adapter_names: Vec<&String> = adapters.keys().collect();
     let active_adapter = state.active_adapter.lock().await;
-    drop(adapters);
 
     // ─── Rate limiter ──────────────────────────────────────────────────
     let rl_info = json!({

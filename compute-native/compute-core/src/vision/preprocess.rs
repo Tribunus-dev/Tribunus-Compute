@@ -61,12 +61,6 @@ pub fn preprocess_image(path_or_url: &str, config: &VisionArchitecture) -> Resul
 /// Load raw image bytes from a local path or remote URL.
 fn load_image_bytes(path_or_url: &str) -> Result<Vec<u8>, String> {
     if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
-        // Use a simple HTTP GET via ureq or std net.
-        // This is a lightweight inline implementation to avoid pulling in
-        // a heavy HTTP client dependency.
-        let url = path_or_url
-            .parse::<std::net::TcpStream>()
-            .map_err(|e| format!("invalid URL: {}", e))?;
         // For simplicity, we use `ureq` if available, else fallback to curl.
         // The actual implementation uses a minimal HTTP client.
         // SAFE: URLs come from trusted model input.

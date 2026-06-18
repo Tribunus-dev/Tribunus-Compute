@@ -348,20 +348,14 @@ impl std::fmt::Debug for ModelAutopsy {
 
 /// Check whether an `Array` contains any NaN values (when accessible as f32).
 fn has_nan(arr: &mlx_rs::Array) -> bool {
-    if let Ok(slice) = arr.as_slice::<f32>() {
-        slice.iter().any(|x| x.is_nan())
-    } else {
-        false
-    }
+    let slice = arr.as_slice::<f32>();
+    slice.iter().any(|x| x.is_nan())
 }
 
 /// Check whether an `Array` contains any Inf values (when accessible as f32).
 fn has_inf(arr: &mlx_rs::Array) -> bool {
-    if let Ok(slice) = arr.as_slice::<f32>() {
-        slice.iter().any(|x| x.is_infinite())
-    } else {
-        false
-    }
+    let slice = arr.as_slice::<f32>();
+    slice.iter().any(|x| x.is_infinite())
 }
 
 /// Check whether `token` is in the forbidden set (e.g. BOS injected mid-sequence).

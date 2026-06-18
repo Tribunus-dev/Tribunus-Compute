@@ -44,7 +44,7 @@ impl TokenBucket {
                 Ordering::Release,
                 Ordering::Acquire,
             ) {
-                Ok(()) => return true,
+        Ok(_) => return true,
                 Err(_) => continue,
             }
         }

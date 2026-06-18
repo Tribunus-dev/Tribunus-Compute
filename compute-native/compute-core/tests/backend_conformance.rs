@@ -127,7 +127,7 @@ fn stale_handle_rejected_after_release() {
     let mut be = fixture_backend();
     let h = create_2x3_f32(&mut be);
     let slot = h.slot;
-    let gen = h.generation;
+    let generation = h.generation;
 
     be.release(h).expect("first release");
 
@@ -145,7 +145,7 @@ fn stale_handle_rejected_after_release() {
     let h2 = create_2x3_f32(&mut be);
     // Same slot MAY be reused but generation must differ
     if h2.slot == slot {
-        assert_ne!(h2.generation, gen, "reused slot must have new generation");
+        assert_ne!(h2.generation, generation, "reused slot must have new generation");
     }
 
     be.release(h2).expect("release h2");
