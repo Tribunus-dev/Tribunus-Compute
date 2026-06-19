@@ -7,12 +7,19 @@
 #[cfg(target_os = "macos")]
 #[cfg(all(target_os = "macos", feature = "mlx-backend"))]
 pub mod accelerate;
+/// Accelerate CPU execution lane — arena-view-based ops on CPU-accessible
+/// memory (zero-copy, no FFI). Pure Rust fallback with no OS dependency.
+#[cfg(feature = "mlx-backend")]
+pub mod accelerate_lane;
 #[cfg(target_os = "macos")]
 #[cfg(all(target_os = "macos", feature = "mlx-backend"))]
 pub mod accelerate_ffi;
 #[cfg(target_os = "macos")]
 #[cfg(all(target_os = "macos", feature = "mlx-backend"))]
 pub mod coreml;
+/// Core ML execution lane — compiled subgraph on ANE.
+#[cfg(all(target_os = "macos", feature = "mlx-backend"))]
+pub mod coreml_lane;
 pub mod evaluation;
 pub mod authority;
 pub mod graph;
@@ -34,6 +41,12 @@ pub mod tensor_registry;
 /// Tensor residency tracking — auditable contract for where a tensor lives.
 #[cfg(any(feature = "mlx-backend", feature = "candle-cpu", feature = "intel", feature = "tensix"))]
 pub mod residency;
+/// Unified execution arena — single mmap-backed memory region for all lanes.
+#[cfg(any(feature = "mlx-backend", feature = "candle-cpu", feature = "intel", feature = "tensix"))]
+pub mod unified_arena;
+/// PlacementSet and hazard tracking — op placement legality and cross-lane sync.
+#[cfg(any(feature = "mlx-backend", feature = "candle-cpu", feature = "intel", feature = "tensix"))]
+pub mod placement;
 
 #[cfg(feature = "mlx-backend")]
 use mlx_rs::ops;
