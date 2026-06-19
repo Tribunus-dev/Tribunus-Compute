@@ -10,6 +10,8 @@ pub mod request;
 pub mod scheduler;
 pub mod slot;
 pub mod saved_request;
+pub mod token_budget;
+pub use token_budget::*;
 
 pub use scheduler::Scheduler;
 pub use saved_request::SavedRequest;
