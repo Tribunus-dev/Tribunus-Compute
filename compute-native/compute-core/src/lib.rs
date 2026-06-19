@@ -55,6 +55,7 @@ pub mod compute_ir;
 pub mod compute_lane;
 pub mod compute_service;
 pub mod config;
+pub mod config_namespace;
 #[cfg(feature = "mlx-backend")]
 pub mod contracts;
 pub mod crash_breadcrumb;
@@ -80,6 +81,8 @@ pub mod engine_receipts;
 pub mod errors;
 #[cfg(feature = "mlx-backend")]
 pub mod executor;
+#[cfg(feature = "mlx-backend")]
+pub mod executor_projection;
 pub mod experiment;
 #[cfg(feature = "mlx-backend")]
 pub mod external_array;
@@ -152,6 +155,8 @@ pub mod primitives;
 pub mod profile_compiler;
 #[cfg(feature = "mlx-backend")]
 pub mod profiled_executor;
+#[cfg(feature = "mlx-backend")]
+pub mod profiled_model;
 #[cfg(any(feature = "mlx-backend", feature = "candle-cpu", feature = "intel", feature = "tensix"))]
 pub mod projection_identity;
 #[cfg(any(feature = "mlx-backend", feature = "candle-cpu"))]
@@ -193,6 +198,9 @@ pub mod session;
 pub mod sidecar;
 #[cfg(feature = "mlx-backend")]
 pub mod speculative;
+
+#[cfg(feature = "mlx-backend")]
+pub mod supervisor_crash;
 
 #[cfg(feature = "storage-adapters")]
 pub mod storage_adapters;

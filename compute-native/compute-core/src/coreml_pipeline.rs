@@ -212,6 +212,17 @@ pub fn build_and_compile(
     compile_mlpackage(&pkg_path, output_dir, region_id, compute_units, "CoreML9")
 }
 
+/// Return the expected `.modelc` directory name (relative path) for a given
+/// island identifier.
+///
+/// This is the naming convention used internally by [`compile_mlpackage`] when
+/// writing compiled output to `output_dir / {island_id}.modelc / …`.  Callers
+/// that populate [`AneFusedIsland::modelc_relpath`][crate::config::AneFusedIsland]
+/// SHOULD use this function so the path matches the compile output location.
+pub fn modelc_relpath_for_island_id(island_id: &str) -> String {
+    format!("{}.modelc", island_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

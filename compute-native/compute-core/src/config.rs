@@ -321,17 +321,6 @@ pub struct ExecutionSpec {
     pub quantization: Option<QuantizationMeta>,
 }
 
-/// Selected namespace root for text model tensors.
-#[derive(Clone, Debug, Serialize)]
-pub struct NamespaceBinding {
-    pub root: String,
-    /// How the root was discovered.
-    pub discovery: String,
-    /// Where lm_head.weight lives (may alias embed_tokens if tied).
-    pub lm_head_key: String,
-    pub lm_head_aliased: bool,
-}
-
 /// A layer's complete specification.
 #[derive(Clone, Debug, Serialize)]
 pub struct LayerSpec {
@@ -630,13 +619,15 @@ impl ModelExecutionPlan {
                 i += 1;
             }
             if layer_indices.len() >= 2 {
+                let island_id = format!(
+                    "ane_fused_layer{}-{}",
+                    layer_indices[0],
+                    layer_indices.last().unwrap()
+                );
+                let modelc_path = format!("{}.modelc", island_id);
                 islands.push(AneFusedIsland {
-                    island_id: format!(
-                        "ane_fused_layer{}-{}",
-                        layer_indices[0],
-                        layer_indices.last().unwrap()
-                    ),
-                    modelc_relpath: String::new(),
+                    island_id,
+                    modelc_relpath: modelc_path,
                     layer_indices,
                     compute_units: "cpuAndNeuralEngine".to_string(),
                     function_name: "main".to_string(),
@@ -1279,44 +1270,8 @@ fn quantized_linear(
     }
 }
 
-// ── Namespace Resolver ─────────────────────────────────────────────────────
-
-/// Anchor tensors that must exist under the text model root.
-const ANCHORS: &[&str] = &[
-    "embed_tokens.weight",
-    "norm.weight",
-    "layers.0.input_layernorm.weight",
-    "layers.0.self_attn.q_proj.weight",
-];
-
-/// Discover the text model namespace by probing candidate prefixes.
-/// Candidates are checked in order; first to match all anchors wins.
-pub fn resolve_namespace(tensor_names: &[String]) -> Option<NamespaceBinding> {
-    let candidates = &["language_model.model", "model"];
-
-    for &candidate in candidates {
-        let all_found = ANCHORS.iter().all(|anchor| {
-            let full = format!("{}.{}", candidate, anchor);
-            tensor_names.iter().any(|n| n == &full)
-        });
-        if all_found {
-            let lm_head_key = format!("{}.lm_head.weight", candidate);
-            let embed_key = format!("{}.embed_tokens.weight", candidate);
-            let lm_head_exists = tensor_names.iter().any(|n| n == &lm_head_key);
-            return Some(NamespaceBinding {
-                root: candidate.to_string(),
-                discovery: format!("matched {} anchors under '{}'", ANCHORS.len(), candidate),
-                lm_head_key: if lm_head_exists {
-                    lm_head_key
-                } else {
-                    embed_key
-                },
-                lm_head_aliased: !lm_head_exists,
-            });
-        }
-    }
-    None
-}
+// Re-exported from config_namespace module.
+pub use crate::config_namespace::*;
 
 // ── Raw JSON parsing to normalized types ───────────────────────────────────
 
