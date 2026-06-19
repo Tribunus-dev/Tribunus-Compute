@@ -23,6 +23,9 @@ pub mod source;
 pub mod hw_assessment;
 pub mod hw_bench_suite;
 pub mod compile_hw;
+pub mod subgraph_mil;
+#[cfg(all(target_os = "macos", feature = "mlx-backend"))]
+pub mod compile_coreml;
 #[cfg(feature = "tensix")]
 pub mod tensix;
 #[cfg(feature = "tensix")]
