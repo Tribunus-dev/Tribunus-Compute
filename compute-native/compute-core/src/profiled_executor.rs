@@ -441,11 +441,34 @@ impl LoadedProfiledModel {
             Ok(arc)
         };
 
+        /// Detect tensor namespace root from the manifest's tensor table.
+        fn detect_ns(table: &[crate::compute_image::manifest::TensorEntry]) -> String {
+            // Pick the first global tensor's prefix before "embed_tokens" or ".layers."
+            for entry in table {
+                if entry.name.contains(".embed_tokens.") || entry.name.contains(".embed_tokens.weight") {
+                    if let Some(idx) = entry.name.rfind(".embed_tokens") {
+                        return entry.name[..idx].to_string();
+                    }
+                }
+            }
+            // Fallback: try to find any tensor with ".layers.0." in name
+            for entry in table {
+                if let Some(idx) = entry.name.rfind(".layers.0.") {
+                    return entry.name[..idx].to_string();
+                }
+            }
+            "model".to_string()
+        }
+
+        let ns = detect_ns(&reader.manifest.tensor_table);
+        let ns_str = ns.clone();
+        eprintln!("[detect-ns] detected namespace root: '{}'", ns);
+
         // Load global tensors
-        let emb_w = load_tensor("language_model.model.embed_tokens.weight")?;
-        let emb_s = load_tensor("language_model.model.embed_tokens.scales")?;
-        let emb_b = load_tensor("language_model.model.embed_tokens.biases")?;
-        let fn_w = load_tensor("language_model.model.norm.weight")?;
+        let emb_w = load_tensor(&format!("{}.embed_tokens.weight", ns))?;
+        let emb_s = load_tensor(&format!("{}.embed_tokens.scales", ns))?;
+        let emb_b = load_tensor(&format!("{}.embed_tokens.biases", ns))?;
+        let fn_w = load_tensor(&format!("{}.norm.weight", ns))?;
 
         // RoPE tables are derived from the architecture rather than loaded
         // from the manifest. This avoids falling back to 1-element placeholders
@@ -456,7 +479,7 @@ impl LoadedProfiledModel {
         // Load layer weights
         let mut layers = Vec::new();
         for (l, layer_plan) in reader.manifest.execution_plan.layers.iter().enumerate() {
-            let base = format!("language_model.model.layers.{}", l);
+            let base = format!("{}.layers.{}", ns, l);
 
             let input_layernorm = load_tensor(&format!("{}.input_layernorm.weight", base))?;
             let post_attention_layernorm =
@@ -809,6 +832,8 @@ impl AneDmaPrefetcher {
 ///
 /// The ANE manages the prefetch DMA, so it doesn't consume GPU cycles.
 pub struct LayerWeightStreamer {
+    /// Detected tensor namespace root.
+    pub ns: String,
     /// Path to the model's compiled segment files
     model_path: PathBuf,
     /// The execution plan (layer count, shapes, etc.)
@@ -831,6 +856,20 @@ pub struct LayerWeightStreamer {
 }
 
 impl LayerWeightStreamer {
+    /// Detect tensor namespace root from the compiled image reader's tensor table.
+    fn detect_ns_from_reader(reader: &CompiledImageReader) -> String {
+        for entry in &reader.manifest.tensor_table {
+            if entry.name.contains(".embed_tokens.weight") {
+                if let Some(idx) = entry.name.rfind(".embed_tokens") {
+                    let ns = &entry.name[..idx];
+                    return ns.to_string();
+                }
+            }
+        }
+        "model".to_string()
+    }
+
+
     /// Create a new weight streamer.
     ///
     /// `model_path` — path to the compiled model directory containing segment files.
@@ -843,12 +882,14 @@ impl LayerWeightStreamer {
         mapped_image: Arc<MappedImage>,
         reader: Arc<CompiledImageReader>,
     ) -> Result<Self, String> {
+        let detected_ns = Self::detect_ns_from_reader(&reader);
         let io_buffer = Arena::new(4 * 1024 * 1024, 1, mlx_rs::Dtype::Uint8)
             .map_err(|e| format!("weight streamer io arena: {}", e))?;
 
         let ane_prefetcher = AneDmaPrefetcher::new().ok();
 
         Ok(Self {
+            ns: detected_ns,
             model_path: PathBuf::from(model_path),
             plan,
             active_weights: HashMap::new(),
@@ -902,7 +943,7 @@ impl LayerWeightStreamer {
     /// Load a single layer's weights from its segment file in the mapped image.
     /// Uses mmap for zero-copy where possible.
     fn load_layer(&self, layer_idx: u32) -> Result<LayerWeights, String> {
-        let base = format!("language_model.model.layers.{}", layer_idx);
+        let base = format!("{}.layers.{}", self.ns, layer_idx);
 
         let load_tensor = |name: &str| -> Result<Arc<Array>, String> {
             let entry = self.reader.manifest.tensor_table
