@@ -10,10 +10,15 @@
 //! bounded residency, and output parity. No-copy Metal buffers remain v2.
 
 pub mod compile;
+pub mod quant;
+pub mod diag;
+pub mod hf;
 pub mod manifest;
 pub mod plan;
 pub mod segment;
+pub mod pipeline;
 pub mod verify;
+pub mod source;
 #[cfg(feature = "tensix")]
 pub mod tensix;
 #[cfg(feature = "tensix")]

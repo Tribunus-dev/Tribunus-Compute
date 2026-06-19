@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 pub mod operation_route;
 
 // ── Layer 1: Raw Manifest ──────────────────────────────────────────────────
@@ -1200,6 +1200,43 @@ pub fn compile(
     }
 
     spec
+}
+
+/// Filter the compiled spec to only include bindings for tensors that exist
+/// in the source model's tensor map. This makes the compiler dynamic — it
+/// adapts to model architectures that omit optional tensors (e.g., Q/K norms
+/// in Qwen2.5, biases in newer architectures).
+pub fn filter_spec_to_existing(
+    spec: &mut ExecutionSpec,
+    existing_tensor_names: &HashSet<String>,
+) {
+    // Global tensors: remove bindings for tensors that don't exist
+    spec.global_tensors.retain(|b| {
+        if existing_tensor_names.contains(&b.name) {
+            true
+        } else {
+            eprintln!(
+                "[dynamic-compile] skipping missing global tensor: {}",
+                b.name
+            );
+            false
+        }
+    });
+
+    // Layer tensors: check per-layer bindings
+    for layer in spec.layers.iter_mut() {
+        layer.tensors.retain(|b| {
+            if existing_tensor_names.contains(&b.name) {
+                true
+            } else {
+                eprintln!(
+                    "[dynamic-compile] skipping missing layer tensor: {}",
+                    b.name
+                );
+                false
+            }
+        });
+    }
 }
 
 fn norm_binding(root: &str, layer: u32, name: &str, role: TensorRole, dim: u32) -> TensorBinding {

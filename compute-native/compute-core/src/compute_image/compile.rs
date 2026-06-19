@@ -461,7 +461,12 @@ pub(crate) fn load_source(
 
     let namespace = config::resolve_namespace(&all_names)
         .ok_or_else(|| crate::Error::from_reason("namespace not resolved"))?;
-    let spec = config::compile(&arch, &namespace, quant.as_ref());
+    let mut spec = config::compile(&arch, &namespace, quant.as_ref());
+
+    // Dynamically filter out bindings for tensors that don't exist in the
+    // source model (e.g., Q/K norms that Qwen2.5 lacks).
+    let all_names_set: std::collections::HashSet<String> = all_names.into_iter().collect();
+    config::filter_spec_to_existing(&mut spec, &all_names_set);
 
     let tensor_meta = source_tensors
         .iter()
@@ -568,7 +573,7 @@ pub fn parse_hf_source(source: &str) -> Option<(&str, &str)> {
 }
 
 /// Download a single file from HuggingFace Hub to a destination directory.
-fn download_hf_file(
+pub(crate) fn download_hf_file(
     hub_id: &str,
     filename: &str,
     revision: &str,
@@ -621,7 +626,7 @@ fn download_hf_file(
 }
 
 /// Parse the safetensors index to get the list of shard files.
-fn fetch_shard_list(
+pub(crate) fn fetch_shard_list(
     hub_id: &str,
     revision: &str,
     temp_dir: &Path,
@@ -956,7 +961,7 @@ pub(crate) fn emit_binding_set(
 /// Deterministic manifest fingerprint.  We hash only the semantic fields
 /// (ignoring compiler timestamps and other transient metadata) so that two
 /// compilations of identical inputs produce the same hash.
-fn compute_manifest_hash(manifest: &Manifest) -> String {
+pub(crate) fn compute_manifest_hash(manifest: &Manifest) -> String {
     #[derive(Serialize)]
     struct Fingerprint<'a> {
         image_version: &'a str,
@@ -1157,7 +1162,7 @@ fn dtype_to_array(bytes: &[u8], dtype: &str, shape: &[u32]) -> crate::Result<Arr
 /// Standard 4-bit NormalFloat (NF4) codebook from the QLoRA paper.
 /// These are the 16 quantiles of a standard normal distribution,
 /// symmetric around zero, with equal area under the curve per interval.
-const NF4_CODEBOOK: [f32; 16] = [
+pub(crate) const NF4_CODEBOOK: [f32; 16] = [
     -1.0, -0.8480, -0.5698, -0.3940, -0.2419, -0.1057,
     0.0, 0.1057, 0.2419, 0.3940, 0.5698, 0.8480,
     1.0, 1.2588, 1.5862, 2.0,
@@ -1165,7 +1170,7 @@ const NF4_CODEBOOK: [f32; 16] = [
 
 /// Find the nearest NF4 codebook index for a given normalized value.
 /// Returns index in [0, 15].
-fn quantize_nf4_value(value: f32) -> u8 {
+pub(crate) fn quantize_nf4_value(value: f32) -> u8 {
     let mut best_idx: u8 = 0;
     let mut best_dist: f32 = (value - NF4_CODEBOOK[0]).abs();
     for (i, &level) in NF4_CODEBOOK.iter().enumerate().skip(1) {
@@ -1181,7 +1186,7 @@ fn quantize_nf4_value(value: f32) -> u8 {
 /// Apply NF4 block quantization to a single group of F32 values.
 /// Returns (packed_u32_words, scale_absmax, bias_zero_point).
 /// For NF4: bias is always 0.0 (symmetric quantization).
-fn quantize_nf4_group(values: &[f32]) -> (Vec<u32>, f32, f32) {
+pub(crate) fn quantize_nf4_group(values: &[f32]) -> (Vec<u32>, f32, f32) {
     if values.is_empty() {
         return (vec![0u32; 1], 0.0, 0.0);
     }
@@ -1212,7 +1217,7 @@ fn quantize_nf4_group(values: &[f32]) -> (Vec<u32>, f32, f32) {
 
 /// Apply 8-bit affine block quantization to a single group of F32 values.
 /// Returns (packed_u8_bytes, scale, bias).
-fn quantize_af8_group(values: &[f32]) -> (Vec<u8>, f32, f32) {
+pub(crate) fn quantize_af8_group(values: &[f32]) -> (Vec<u8>, f32, f32) {
     if values.is_empty() {
         return (vec![0u8; 1], 0.0, 0.0);
     }
@@ -1241,7 +1246,7 @@ fn quantize_af8_group(values: &[f32]) -> (Vec<u8>, f32, f32) {
 /// weight tensor bytes to packed quantized form and adding companion
 /// scale/bias tensors. The TensorBinding packed_shape fields are also set
 /// so the existing `emit_quantized_binding` pipeline writes the triplets.
-fn apply_quantize_to_loaded(
+pub(crate) fn apply_quantize_to_loaded(
     loaded: &mut LoadedSource,
     qmode: CompileQuantMode,
 ) -> crate::Result<()> {
@@ -1386,7 +1391,7 @@ fn apply_quantize_to_loaded(
 }
 
 /// Apply NF4 quantization to a weight tensor and update the loaded source.
-fn apply_nf4_quantize(
+pub(crate) fn apply_af8_quantize(
     loaded: &mut LoadedSource,
     weight_name: &str,
     f32_vals: &[f32],
@@ -1533,7 +1538,7 @@ fn apply_nf4_quantize(
 }
 
 /// Apply 8-bit affine quantization to a weight tensor and update the loaded source.
-fn apply_af8_quantize(
+pub(crate) fn apply_nf4_quantize(
     loaded: &mut LoadedSource,
     weight_name: &str,
     f32_vals: &[f32],
@@ -1656,7 +1661,7 @@ fn apply_af8_quantize(
 }
 
 /// Fast half-precision (FP16) to F32 conversion.
-fn half_to_f32(bits: u16) -> f32 {
+pub(crate) fn half_to_f32(bits: u16) -> f32 {
     // FP16 format: 1 sign + 5 exponent + 10 mantissa
     let sign = ((bits >> 15) & 0x1) as f32;
     let exp = (bits >> 10) & 0x1f;
