@@ -6173,6 +6173,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tensix-backend"
+version = "0.1.0"
+dependencies = [
+ "tensix-ffi",
+ "tribunus-compute-core",
+]
+
+[[package]]
+name = "tensix-ffi"
+version = "0.1.0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"

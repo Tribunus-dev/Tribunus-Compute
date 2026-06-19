@@ -54,7 +54,10 @@ impl PhysicalBlock {
     pub fn touch(&self) {
         use std::time::{SystemTime, UNIX_EPOCH};
         self.last_access_ns.store(
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64,
             Ordering::Relaxed,
         );
     }
@@ -68,7 +71,9 @@ impl PhysicalBlock {
     }
 
     pub fn dec_ref(&self) -> u64 {
-        self.refcount.fetch_sub(1, Ordering::AcqRel).saturating_sub(1)
+        self.refcount
+            .fetch_sub(1, Ordering::AcqRel)
+            .saturating_sub(1)
     }
 
     pub fn inc_ref(&self) -> u64 {
@@ -85,9 +90,9 @@ impl PhysicalBlock {
 pub struct BlockTableEntry {
     pub logical: LogicalBlockIdx,
     pub physical: PhysicalBlockId,
-    pub token_count: u64,    // number of valid tokens in this block
-    pub prefix_hash: u64,    // content hash for prefix matching
-    pub is_dirty: bool,      // whether this block was modified since last sync
+    pub token_count: u64, // number of valid tokens in this block
+    pub prefix_hash: u64, // content hash for prefix matching
+    pub is_dirty: bool,   // whether this block was modified since last sync
 }
 
 /// A request's complete block table (virtual address space for KV cache).
@@ -97,7 +102,11 @@ pub struct BlockTable {
 }
 
 impl BlockTable {
-    pub fn new() -> Self { BlockTable { entries: Vec::new() } }
+    pub fn new() -> Self {
+        BlockTable {
+            entries: Vec::new(),
+        }
+    }
 
     pub fn push(&mut self, entry: BlockTableEntry) {
         self.entries.push(entry);
@@ -111,7 +120,9 @@ impl BlockTable {
         self.entries.iter_mut().find(|e| e.logical == logical)
     }
 
-    pub fn len(&self) -> usize { self.entries.len() }
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
 
     pub fn total_physical_blocks(&self) -> usize {
         self.entries.len()
@@ -125,7 +136,9 @@ impl BlockTable {
         self.entries.last()
     }
 
-    pub fn entries(&self) -> &[BlockTableEntry] { &self.entries }
+    pub fn entries(&self) -> &[BlockTableEntry] {
+        &self.entries
+    }
 }
 
 /// Convert tokens to number of blocks needed (ceiling division).

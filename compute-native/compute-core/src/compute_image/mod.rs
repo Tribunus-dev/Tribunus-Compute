@@ -14,6 +14,7 @@ pub mod quant;
 pub mod diag;
 pub mod hf;
 pub mod manifest;
+pub mod kv_plan;
 pub mod plan;
 pub mod segment;
 pub mod pipeline;
@@ -73,6 +74,13 @@ pub use manifest::{
     validate_physical_dtype,
     validate_tensor_for_mapped_abi,
     validate_tensor_layout,
+};
+
+pub use kv_plan::{
+    KvCachePlan,
+    KVDtype,
+    KvLayout,
+    PrefixCompatibilityKey,
 };
 
 pub use compile::{

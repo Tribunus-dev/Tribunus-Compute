@@ -2,8 +2,8 @@
 //! Each backend (MLX, Candle, Tensix) can store KV blocks in its own
 //! memory domain. The arena tracks which backend owns which block.
 
-use crate::kv_arena::block::{BackendAffinity, PhysicalBlockId};
 use crate::backend::residency::MemoryDomain;
+use crate::kv_arena::block::{BackendAffinity, PhysicalBlockId};
 
 /// Maps a physical block to its backend residency info.
 #[derive(Clone, Debug)]

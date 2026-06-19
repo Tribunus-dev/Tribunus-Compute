@@ -26,39 +26,48 @@ pub enum PhaseKind {
 #[derive(Clone, Debug)]
 pub struct TokenWorkUnit {
     pub request_id: String,
+    pub sequence_id: Option<u64>,  // from KVArena admission
     pub phase: PhaseKind,
+    pub compute_image_phase: Option<String>,  // ComputeImage phase identifier
     pub token_span: u32,          // number of tokens in this work unit
     pub kv_blocks_needed: u32,    // blocks to allocate before dispatching
     pub priority: u32,            // lower = higher priority
     pub deadline: Instant,        // deadline for SLO enforcement
     pub backend_route: Option<String>, // "mlx", "candle-cpu", "tensix"
     pub speculative_parent: Option<String>, // if this is verification, parent request id
+    pub receipt_sink: Option<String>,  // callback endpoint or accumulator for execution receipts
 }
 
 impl TokenWorkUnit {
     pub fn new_prefill(request_id: &str, token_span: u32) -> Self {
         TokenWorkUnit {
             request_id: request_id.to_string(),
+            sequence_id: None,
             phase: PhaseKind::Prefill,
+            compute_image_phase: None,
             token_span,
             kv_blocks_needed: needed_blocks(token_span),
             priority: 1,
             deadline: Instant::now() + std::time::Duration::from_secs(30),
             backend_route: None,
             speculative_parent: None,
+            receipt_sink: None,
         }
     }
 
     pub fn new_decode(request_id: &str) -> Self {
         TokenWorkUnit {
             request_id: request_id.to_string(),
+            sequence_id: None,
             phase: PhaseKind::Decode,
+            compute_image_phase: None,
             token_span: 1,
             kv_blocks_needed: 0,
             priority: 2,
             deadline: Instant::now() + std::time::Duration::from_secs(30),
             backend_route: None,
             speculative_parent: None,
+            receipt_sink: None,
         }
     }
 }
@@ -161,13 +170,16 @@ impl TokenBudgetScheduler {
     pub fn enqueue_decode(&mut self, request_id: &str, priority: u32) {
         let unit = TokenWorkUnit {
             request_id: request_id.to_string(),
+            sequence_id: None,
             phase: PhaseKind::Decode,
+            compute_image_phase: None,
             token_span: 1,
             kv_blocks_needed: 0,
             priority,
             deadline: Instant::now() + std::time::Duration::from_secs(30),
             backend_route: None,
             speculative_parent: None,
+            receipt_sink: None,
         };
         self.run_queue.push_back(unit);
     }
@@ -184,4 +196,58 @@ impl TokenBudgetScheduler {
 
     pub fn pending_count(&self) -> usize { self.run_queue.len() }
     pub fn active_count(&self) -> usize { self.active_requests.len() }
+}
+
+// ---------------------------------------------------------------------------
+// ReceiptCollector — accumulates execution receipts from dispatched work units
+// ---------------------------------------------------------------------------
+
+/// A record of a completed work unit execution.
+#[derive(Clone, Debug)]
+pub struct ExecutionReceipt {
+    pub request_id: String,
+    pub phase: String,
+    pub compute_image_phase: Option<String>,
+    pub backend_route: Option<String>,
+    pub token_count: u32,
+    pub elapsed_ns: u64,
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+/// Accumulates execution receipts from dispatched work units for
+/// observability and feedback into the scheduling loop.
+#[derive(Clone, Debug, Default)]
+pub struct ReceiptCollector {
+    pub receipts: Vec<ExecutionReceipt>,
+}
+
+impl ReceiptCollector {
+    pub fn new() -> Self {
+        Self {
+            receipts: Vec::new(),
+        }
+    }
+
+    /// Record a single execution receipt.
+    pub fn record(&mut self, receipt: ExecutionReceipt) {
+        self.receipts.push(receipt);
+    }
+
+    /// Produce a compact human-readable summary of all accumulated receipts.
+    pub fn summary(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        let total = self.receipts.len();
+        let successes = self.receipts.iter().filter(|r| r.success).count();
+        let failures = total - successes;
+        let total_ns: u64 = self.receipts.iter().map(|r| r.elapsed_ns).sum();
+        let total_tokens: u32 = self.receipts.iter().map(|r| r.token_count).sum();
+        let _ = writeln!(
+            out,
+            "ReceiptCollector: {} receipts ({} ok, {} fail), {} tokens in {} ns",
+            total, successes, failures, total_tokens, total_ns
+        );
+        out
+    }
 }

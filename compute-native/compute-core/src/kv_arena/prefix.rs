@@ -52,7 +52,10 @@ pub struct PrefixCacheIndex {
 
 impl PrefixCacheIndex {
     pub fn new() -> Self {
-        PrefixCacheIndex { index: HashMap::new(), hits: HashMap::new() }
+        PrefixCacheIndex {
+            index: HashMap::new(),
+            hits: HashMap::new(),
+        }
     }
 
     /// Look up a prefix hash. Returns the physical block id if found.
@@ -77,12 +80,18 @@ impl PrefixCacheIndex {
         self.hits.remove(hash);
     }
 
-    pub fn len(&self) -> usize { self.index.len() }
+    pub fn len(&self) -> usize {
+        self.index.len()
+    }
 
     pub fn hit_rate(&self) -> f64 {
         let total: u64 = self.hits.values().sum();
         let hits: u64 = self.hits.values().filter(|&&v| v > 0).count() as u64;
-        if total == 0 { 0.0 } else { hits as f64 / total as f64 }
+        if total == 0 {
+            0.0
+        } else {
+            hits as f64 / total as f64
+        }
     }
 
     pub fn clear(&mut self) {

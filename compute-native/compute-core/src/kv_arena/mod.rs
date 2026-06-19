@@ -8,6 +8,7 @@ pub mod refcount;
 
 use backend::ResidencyTable;
 use block::{tokens_to_blocks, BackendAffinity, PhysicalBlock, PhysicalBlockId};
+use crate::compute_image::kv_plan::KvCachePlan;
 use prefix::{PrefixCacheIndex, PrefixHash};
 
 /// Globally-unique sequence identifier, assigned monotonically.
@@ -136,26 +137,36 @@ pub struct KvBlockArena {
     pub prefix_cache: PrefixCacheIndex,
     pub residency: ResidencyTable,
     pub logical_tables: Vec<LogicalBlockTable>,
+    pub eviction_policy: String,
+    pub cow_policy: String,
 }
 
 impl KvBlockArena {
     /// Create a new arena with the given block size, capacity, and backend affinity.
     pub fn new(block_size: usize, capacity: usize, backend: BackendAffinity) -> Self {
-        Self {
-            blocks: Vec::with_capacity(capacity),
-            free_list: Vec::new(),
-            block_size,
-            capacity,
-            backend,
-            prefix_cache: PrefixCacheIndex::new(),
-            residency: ResidencyTable::new(),
-            logical_tables: Vec::new(),
-        }
+        let plan = KvCachePlan { block_tokens: block_size as u32, max_blocks: capacity as u32, ..KvCachePlan::default() };
+        Self::from_plan(&plan, backend)
     }
 
     /// Create a new arena with prefix caching enabled (same as `new` — caching is always on).
     pub fn new_with_cache(block_size: usize, capacity: usize, backend: BackendAffinity) -> Self {
         Self::new(block_size, capacity, backend)
+    }
+
+    /// Create a new arena from a compiled KvCachePlan.
+    pub fn from_plan(plan: &KvCachePlan, backend: BackendAffinity) -> Self {
+        KvBlockArena {
+            blocks: Vec::with_capacity(plan.max_blocks as usize),
+            free_list: Vec::new(),
+            block_size: plan.block_tokens as usize,
+            capacity: plan.max_blocks as usize,
+            backend,
+            prefix_cache: PrefixCacheIndex::new(),
+            residency: ResidencyTable::new(),
+            logical_tables: Vec::new(),
+            eviction_policy: plan.eviction_policy.clone(),
+            cow_policy: plan.cow_policy.clone(),
+        }
     }
 
     /// Try to allocate a physical block.
@@ -275,16 +286,29 @@ impl KvBlockArena {
     /// Returns `Some(PhysicalBlockId)` of the evicted block, or `None`
     /// if no block is eligible for eviction.
     pub fn evict_one(&mut self) -> Option<PhysicalBlockId> {
-        // Find the LRU block with refcount == 0 that isn't already in the free list.
         // (Blocks in the free list are already recycled and don't need eviction.)
-        let idx = self
-            .blocks
+        let eligible = || {
+            self.blocks
             .iter()
             .enumerate()
             .filter(|(_, b)| b.is_completely_free())
             .filter(|(i, _)| !self.free_list.contains(i))
+        };
+
+        let idx = match self.eviction_policy.as_str() {
+            "fifo" => eligible().min_by_key(|(i, _)| *i).map(|(i, _)| i)?,
+            "lru_refcount" => eligible()
+                .min_by_key(|(_, b)| {
+                    let rc = b.refcount.load(std::sync::atomic::Ordering::Acquire);
+                    let ts = b.last_access_ns.load(std::sync::atomic::Ordering::Acquire);
+                    (rc, ts)
+                })
+                .map(|(i, _)| i)?,
+            // "lru" is the default
+            _ => eligible()
             .min_by_key(|(_, b)| b.last_access_ns.load(std::sync::atomic::Ordering::Acquire))
-            .map(|(i, _)| i)?;
+                .map(|(i, _)| i)?,
+        };
 
         let block = &self.blocks[idx];
         self.prefix_cache.remove(&PrefixHash(block.id.0 as u64));

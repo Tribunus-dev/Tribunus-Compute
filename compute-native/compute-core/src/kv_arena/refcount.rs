@@ -1,7 +1,7 @@
 //! Copy-on-write refcounting and LRU eviction for KV cache blocks.
 
-use std::collections::VecDeque;
 use crate::kv_arena::block::PhysicalBlock;
+use std::collections::VecDeque;
 
 /// Eviction policy selector.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,8 +32,8 @@ impl CowManager {
     /// the caller must allocate a fresh block for writing.
     pub fn prepare_write(block: &PhysicalBlock) -> bool {
         if block.refcount.load(std::sync::atomic::Ordering::Acquire) > 1 {
-            block.dec_ref();  // release our shared reference
-            true  // caller must COW
+            block.dec_ref(); // release our shared reference
+            true // caller must COW
         } else {
             false // exclusive ownership, safe to write
         }
@@ -42,13 +42,16 @@ impl CowManager {
 
 /// LRU tracker for eviction decisions.
 pub struct LruTracker {
-    queue: VecDeque<u32>,  // physical block IDs in LRU order
+    queue: VecDeque<u32>, // physical block IDs in LRU order
     capacity: usize,
 }
 
 impl LruTracker {
     pub fn new(capacity: usize) -> Self {
-        LruTracker { queue: VecDeque::with_capacity(capacity), capacity }
+        LruTracker {
+            queue: VecDeque::with_capacity(capacity),
+            capacity,
+        }
     }
 
     pub fn touch(&mut self, block_id: u32) {
@@ -74,5 +77,7 @@ impl LruTracker {
         }
     }
 
-    pub fn len(&self) -> usize { self.queue.len() }
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
 }
