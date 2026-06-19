@@ -192,7 +192,7 @@ async fn main() {
         }
     } else {
         None
-    rate_limiter::TokenRateLimiter,
+
     };
 
     // 1. Run system benchmark
@@ -288,9 +288,9 @@ async fn main() {
     let auth = Arc::new(ApiKeyValidator::new());
     auth.load_from_env();
 
-    let token_rate_limiter = Arc::new(TokenRateLimiter::new(
-        cfg.server.rate_limit_tokens_per_sec,
+    let token_rate_limiter = Arc::new(RateLimiter::new(
         cfg.server.rate_limit_burst,
+        cfg.server.rate_limit_tokens_per_sec,
     ));
 
     let state = AppState {

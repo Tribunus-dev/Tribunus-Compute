@@ -60,7 +60,7 @@ impl CoreMlModel {
 
     /// Load a compiled Core ML model from disk with the given compute unit policy.
     pub fn load(path: &str) -> Result<Self, String> {
-        Self::load_with_compute_units(path, CoreMlComputeUnits::CpuAndGpu)
+        Self::load_with_compute_units(path, CoreMlComputeUnits::CpuAndNeuralEngine)
     }
 
     /// Load with explicit compute unit policy.

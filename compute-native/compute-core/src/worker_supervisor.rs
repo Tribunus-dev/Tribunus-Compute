@@ -15,7 +15,6 @@ use crate::engine_policy::{DeadlineGuard, ExecutionPolicy};
 use crate::profiled_executor::{LoadedProfiledModel, ProfiledInferenceSession};
 use crate::streaming::{generation_channel, GenerationEvent, GenerationHandle, GenerationSender};
 use crate::worker_crash_ledger::WorkerCrashLedger;
-pub use crate::supervisor_crash::*;
 use crate::worker_protocol::{
     Frame, HeartbeatPayload, HostCommand, MessageKind, PolicySnapshotPayload, ProtocolValidator,
     ResearchTraceBatchPayload, StartGenerationPayload, TokenPayload, WorkerEvent,
@@ -27,6 +26,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::path::PathBuf;
+use crate::supervisor_crash::CrashRecoveryState;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;

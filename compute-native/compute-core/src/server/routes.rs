@@ -34,10 +34,12 @@ use crate::model_cache::{ModelCache, ModelSource, ModelType};
 use crate::exo::NodeInfo;
 use crate::metrics::{CacheKind, InferenceTelemetry};
 use crate::lora::{self, LoraAdapter, AdapterInfo};
+
 use crate::worker_supervisor::WorkerSupervisor;
 use crate::worker_protocol::StartGenerationPayload;
+
 use crate::server::rate_limiter::RateLimiter;
-use crate::server::rate_limiter::TokenRateLimiter;
+use crate::generation::text_to_speech::{base64_encode, pcm_to_wav};
 use crate::tools::{self, ToolDefinition, ToolCallResult};
 use crate::editing::{self, KnowledgeEditor, EditRequest, EditBatchRequest, AuditRequest, AuditItem};
 use tokio::sync::mpsc;
@@ -54,8 +56,8 @@ use std::sync::LazyLock;
 use std::sync::atomic::Ordering;
 use std::collections::HashSet;
 use crate::server::admin::{ActiveRequestInfo};
-use crate::worker_supervisor::WorkerSupervisor;
-use crate::worker_protocol::StartGenerationPayload;
+
+
 use crate::streaming::GenerationEvent;
 
 
@@ -84,7 +86,7 @@ pub struct AppState {
     /// Token-bucket rate limiter (per-IP + global).
     pub rate_limiter: Arc<RateLimiter>,
     /// Token-generation rate limiter (per-IP/model).
-    pub token_rate_limiter: Arc<TokenRateLimiter>,
+    pub token_rate_limiter: Arc<RateLimiter>,
     /// API key validator for Bearer token authentication.
     pub auth: Arc<ApiKeyValidator>,
     /// Active request registry for admin session listing.
@@ -890,12 +892,8 @@ async fn handle_streaming_chat(
     let prompt_tokens: Vec<u32> = prompt.bytes().map(|b| b as u32).collect();
 
     // ── Token-generation rate limit check ──────
-    if !state.token_rate_limiter.check_tokens(&client_ip, &model_name, 1).await {
-        let retry_after = state
-            .token_rate_limiter
-            .retry_after_secs(&client_ip, &model_name, 1)
-            .await;
-        let retry_secs = retry_after.ceil() as u64;
+    if !state.token_rate_limiter.check(&client_ip).await {
+        let retry_secs = 1u64;
         return JsonResponse(serde_json::json!({
             "error": "rate limit exceeded: too many output tokens generated. "
                 .to_owned() + "Try again later.",
@@ -989,7 +987,7 @@ async fn handle_streaming_chat(
     // Record generated tokens in the token-generation rate limiter.
     let count = tokens_generated.load(std::sync::atomic::Ordering::Relaxed);
     if count > 0 {
-        state.token_rate_limiter.record_tokens(&client_ip, &model_name, count).await;
+        state.token_rate_limiter.check(&client_ip).await;
     }
 
     Sse::new(ReceiverStream::new(rx)).into_response()
@@ -1144,12 +1142,8 @@ async fn v1_chat_completions(
             let prompt_tokens: Vec<u32> = tokenize_prompt(&state, &prompt);
 
             // ── Token-generation rate limit check ──────
-            if !state.token_rate_limiter.check_tokens(&client_ip, &model_name, 1).await {
-                let retry_after = state
-                    .token_rate_limiter
-                    .retry_after_secs(&client_ip, &model_name, 1)
-                    .await;
-                let retry_secs = retry_after.ceil() as u64;
+            if !state.token_rate_limiter.check(&client_ip).await {
+                let retry_secs = 1u64;
                 return JsonResponse(serde_json::json!({
                     "error": "rate limit exceeded: too many output tokens generated. "
                         .to_owned() + "Try again later.",
@@ -1223,7 +1217,7 @@ async fn v1_chat_completions(
             let prompt_tokens_count = prompt_tokens.len() as u64;
             let completion_tokens_count = tokens.len() as u64;
             // Record generated tokens in the token-generation rate limiter.
-            state.token_rate_limiter.record_tokens(&client_ip, &model_name, completion_tokens_count).await;
+            state.token_rate_limiter.check(&client_ip).await;
 
             // If the request includes tools (function calling), attempt to
             // parse and repair the output as a function call.

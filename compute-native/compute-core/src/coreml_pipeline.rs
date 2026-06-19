@@ -196,7 +196,7 @@ pub fn build_matmul_region(
 
     let tmp = tempfile::tempdir().map_err(|e| format!("tempdir: {}", e))?;
     let pkg_path = mlpackage::write_mlpackage(prog, tmp.path(), &meta)?;
-    compile_mlpackage(&pkg_path, output_dir, region_id, "cpuAndGPU", "CoreML9")
+    compile_mlpackage(&pkg_path, output_dir, region_id, "cpuAndNeuralEngine", "CoreML9")
 }
 
 /// Build, write, and compile a MIL program from a pre-built [`mil_spec::Program`].
@@ -208,7 +208,7 @@ pub fn build_and_compile(
     compute_units: &str,
 ) -> Result<CoreMlIslandReceipt, String> {
     let tmp = tempfile::tempdir().map_err(|e| format!("tempdir: {}", e))?;
-    let pkg_path = mlpackage::write_mlpackage(program, tmp.path(), meta)?;
+    let pkg_path = mlpackage::write_mlpackage(program, tmp.path(), &meta)?;
     compile_mlpackage(&pkg_path, output_dir, region_id, compute_units, "CoreML9")
 }
 
@@ -274,7 +274,7 @@ mod tests {
             &pkg_path,
             tmp.path(),
             "known-answer",
-            "cpuAndGPU",
+            "cpuAndNeuralEngine",
             "CoreML9",
         )
         .expect("coremlcompiler must accept .mlpackage");
