@@ -124,6 +124,7 @@ impl ConcurrencyPlan {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AssessmentReceipt {
     pub target_device: String,
+    pub concurrency_plan: Option<ConcurrencyPlan>,
     pub device_family: String,
     pub has_unified_memory: bool,
     pub max_threadgroup_size: u32,

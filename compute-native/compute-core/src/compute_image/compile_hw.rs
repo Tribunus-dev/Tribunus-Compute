@@ -426,6 +426,7 @@ pub fn run_hardware_assessment() -> AssessmentReceipt {
         supports_fp16: probe.supports_f16,
         supports_bf16: probe.supports_bf16,
         selections: Vec::new(),
+        concurrency_plan: None,
         benchmark_results: Vec::new(),
         placement_reports: Vec::new(),
         assessment_duration_ms: 0,
@@ -634,6 +635,7 @@ pub fn run_hardware_assessment() -> AssessmentReceipt {
     eprintln!("[hw-assessment] effective throughput: {:.0} ops/sec", concurrency.estimated_total_throughput);
 
     AssessmentReceipt {
+        concurrency_plan: Some(concurrency),
         selections,
         benchmark_results: results,
         placement_reports: placements,
