@@ -58,4 +58,10 @@ impl ApiKeyValidator {
         let mut keys = self.keys.write().expect("RwLock poisoned");
         keys.remove(key);
     }
+
+    /// Check if any API keys are configured.
+    pub fn is_empty(&self) -> bool {
+        let keys = self.keys.read().expect("RwLock poisoned");
+        keys.is_empty()
+    }
 }

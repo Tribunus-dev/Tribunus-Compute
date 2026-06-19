@@ -275,6 +275,10 @@ async fn auth_middleware(
     req: Request,
     next: Next,
 ) -> Result<impl IntoResponse, StatusCode> {
+    // If no API keys are configured, skip auth entirely (dev mode).
+    if state.auth.is_empty() {
+        return Ok(next.run(req).await);
+    }
     let auth = req
         .headers()
         .get("Authorization")
