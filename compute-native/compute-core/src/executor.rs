@@ -9,6 +9,7 @@ use crate::ane::hot_row_predictor::HotRowPredictor;
 use crate::ane::moe_scheduler::{AneMoEScheduler, ExpertWeights};
 use crate::ane::weight_row_cache::WeightRowCache;
 use crate::backend::routing::BackendId;
+use crate::backend::{MlxBackend, QuantizedWeightHandle, TensorHandle};
 use crate::config::operation_route::OperationRoute;
 use crate::config::{EpiloguePlan, LayerPlan, ProloguePlan};
 use crate::grammar::{GrammarFSM, GrammarTokenizer};
@@ -818,9 +819,11 @@ fn qmatmul(x: &Array, w: &Array, s: &Array, b: &Array) -> MlxResult<Array> {
     // Build descriptor and executor for this projection.
     let logical_in_features = in_features as u32;
     let logical_out_features = w.shape()[0] as u32;
-    let executor = ProjectionExecutor {
-        mode: RuntimeMode::Safe,
-    };
+    let mut backend = MlxBackend::new();
+    let x_h = backend.alloc(x.clone());
+    let w_h = backend.alloc_weight(w.clone());
+    let s_h = backend.alloc(s.clone());
+    let b_h = backend.alloc(b.clone());
     let qmatmul_desc = QuantizedProjectionDescriptor {
         family: ProjectionFamily::OProj,
         logical_in_features,
@@ -845,7 +848,12 @@ fn qmatmul(x: &Array, w: &Array, s: &Array, b: &Array) -> MlxResult<Array> {
         let ws = w.shape();
         w.eval()?;
         let t_ext_start = std::time::Instant::now();
-        let r1 = executor.run_projection(x, w, s, b, &probe_desc)?;
+        let r1_h = {
+            let mut executor = ProjectionExecutor { backend: &mut backend, mode: RuntimeMode::Safe };
+            executor.run_projection(x_h, w_h, s_h, b_h, &probe_desc)
+                .map_err(|e| mlx_rs::error::Exception::custom(format!("{e}")))?
+        };
+        let r1 = backend.get(r1_h).map_err(|e| mlx_rs::error::Exception::custom(e))?.clone();
         let _ = r1.eval()?;
         let t_ext = t_ext_start.elapsed();
         let ws_str: Vec<String> = ws.iter().map(|d| d.to_string()).collect();
@@ -864,8 +872,16 @@ fn qmatmul(x: &Array, w: &Array, s: &Array, b: &Array) -> MlxResult<Array> {
                 .map_err(|e| mlx_rs::error::Exception::custom(format!("b as_slice: {:?}", e)))?
                 .to_vec();
             let bc = Array::from_slice(&b_vec, &b.shape());
+            let wc_h = backend.alloc_weight(wc);
+            let sc_h = backend.alloc(sc);
+            let bc_h = backend.alloc(bc);
             let t_copy_start = std::time::Instant::now();
-            let r2 = executor.run_projection(x, &wc, &sc, &bc, &probe_desc)?;
+            let r2_h = {
+                let mut executor = ProjectionExecutor { backend: &mut backend, mode: RuntimeMode::Safe };
+                executor.run_projection(x_h, wc_h, sc_h, bc_h, &probe_desc)
+                    .map_err(|e| mlx_rs::error::Exception::custom(format!("{e}")))?
+            };
+            let r2 = backend.get(r2_h).map_err(|e| mlx_rs::error::Exception::custom(e))?.clone();
             let _ = r2.eval()?;
             let t_copy = t_copy_start.elapsed();
             let wss: Vec<String> = ws.iter().map(|d| d.to_string()).collect();
@@ -887,7 +903,13 @@ fn qmatmul(x: &Array, w: &Array, s: &Array, b: &Array) -> MlxResult<Array> {
     }
 
     // Route through ProjectionExecutor which applies safe-mode dispatch.
-    executor.run_projection(x, w, s, b, &qmatmul_desc)
+    let result_h = {
+        let mut executor = ProjectionExecutor { backend: &mut backend, mode: RuntimeMode::Safe };
+        executor.run_projection(x_h, w_h, s_h, b_h, &qmatmul_desc)
+            .map_err(|e| mlx_rs::error::Exception::custom(format!("{e}")))?
+    };
+    let result = backend.get(result_h).map_err(|e| mlx_rs::error::Exception::custom(e))?.clone();
+    Ok(result)
 }
 /// Wrapper around qmatmul that conditionally emits a projection attribution
 /// event when `TRIBUNUS_PROJECTION_ATTRIBUTION=1`.
@@ -1478,9 +1500,11 @@ pub fn run_epilogue(
     let normed = primitives::rms_norm(hidden, final_norm, rms_norm_eps)?;
 
     // Tied output projection: quantized matmul with embedding weights
-    let executor = ProjectionExecutor {
-        mode: RuntimeMode::Safe,
-    };
+    let mut backend = MlxBackend::new();
+    let normed_h = backend.alloc(normed.clone());
+    let output_weight_h = backend.alloc_weight(output_weight.clone());
+    let output_scales_h = backend.alloc(output_scales.clone());
+    let output_biases_h = backend.alloc(output_biases.clone());
     let logical_in_features = normed.shape()[1] as u32;
     let logical_out_features = output_weight.shape()[0] as u32;
     let n_groups = if output_scales.shape().len() >= 1 {
@@ -1507,24 +1531,28 @@ pub fn run_epilogue(
         layer_index: 0,
         weight_materialization: MaterializationClass::MlxOwned,
     };
-    let logits = if tie_word_embeddings {
-        executor.run_projection(
-            &normed,
-            output_weight,
-            output_scales,
-            output_biases,
-            &lm_head_desc,
-        )?
-    } else {
-        // Non-tied: use dedicated lm_head tensor if available
-        executor.run_projection(
-            &normed,
-            output_weight,
-            output_scales,
-            output_biases,
-            &lm_head_desc,
-        )?
+    let logits_h = {
+        let mut executor = ProjectionExecutor { backend: &mut backend, mode: RuntimeMode::Safe };
+        if tie_word_embeddings {
+            executor.run_projection(
+                normed_h,
+                output_weight_h,
+                output_scales_h,
+                output_biases_h,
+                &lm_head_desc,
+            ).map_err(|e| mlx_rs::error::Exception::custom(format!("{e}")))?
+        } else {
+            // Non-tied: use dedicated lm_head tensor if available
+            executor.run_projection(
+                normed_h,
+                output_weight_h,
+                output_scales_h,
+                output_biases_h,
+                &lm_head_desc,
+            ).map_err(|e| mlx_rs::error::Exception::custom(format!("{e}")))?
+        }
     };
+    let logits = backend.get(logits_h).map_err(|e| mlx_rs::error::Exception::custom(e))?.clone();
 
     // Final logit softcapping
     let logits = if let Some(cap) = plan.final_logit_softcapping {

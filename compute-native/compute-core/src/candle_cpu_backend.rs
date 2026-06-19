@@ -14,7 +14,7 @@ use std::time::Instant;
 use candle_core::{DType, Device, Tensor};
 
 use crate::backend::{
-    BackendCapabilities, EvaluationReceipt, MatmulOp, QuantizedMatmulOp, QuantizedWeightHandle,
+    authority, BackendCapabilities, EvaluationReceipt, MatmulOp, QuantizedMatmulOp, QuantizedWeightHandle,
     ReadbackReceipt, RmsNormOp, RoPEOp, TensorBackend, TensorHandle,
 };
 use crate::backend::DType as BackendDType;
@@ -286,21 +286,17 @@ impl TensorBackend for CandleCpuBackend {
             .map_err(|e| format!("b to_vec1: {e}"))?;
 
         // Dequantize: packed int4 (8 nibbles per u32) -> f32 [n_out, k]
-        let mut w_f32 = vec![0.0f32; n_out * k];
-        for row in 0..n_out {
-            for g in 0..n_groups {
-                let scale = scales_f32[row * n_groups + g];
-                let bias = biases_f32[row * n_groups + g];
-                let start = g * gs;
-                let end = (start + gs).min(k);
-                for elem_idx in start..end {
-                    let word_idx = row * packed_cols + elem_idx / 8;
-                    let lane = elem_idx % 8;
-                    let qval = (w_u32[word_idx] >> (lane * 4)) & 0xF;
-                    w_f32[row * k + elem_idx] = (qval as f32) * scale + bias;
-                }
-            }
-        }
+        // Use shared authority dequantize utility.
+        let w_f32 = authority::dequantize_int4_weights(
+            &w_u32,
+            &scales_f32,
+            &biases_f32,
+            n_out,
+            k,
+            n_groups,
+            packed_cols,
+            gs,
+        );
 
         // Build dequantized weight tensor [n_out, k] then transpose to [k, n_out]
         let w_deq = Tensor::from_slice(&w_f32, (n_out, k), &Device::Cpu)

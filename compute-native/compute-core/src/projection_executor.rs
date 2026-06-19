@@ -1,15 +1,17 @@
 //! Central projection dispatch for quantized matmuls.
 //!
 //! All quantized matmul calls must go through [`ProjectionExecutor`], which
-//! enforces a typed [`QuantizedProjectionDescriptor`], chooses the backend
-//! (MLX fused, MLX authority/dequantize path, or hard error), and applies
-//! the current [`RuntimeMode`] policy.
+//! enforces a typed [`QuantizedProjectionDescriptor`] and dispatches to the
+//! configured [`TensorBackend`] implementation.
+//!
+//! The executor is backend-agnostic — it never calls MLX or candle directly.
+//! It translates the descriptor into a [`QuantizedMatmulOp`] and delegates to
+//! the backend's [`TensorBackend::quantized_matmul`].
 
-use mlx_rs::error::Result as MlxResult;
-use mlx_rs::Array;
-
+use crate::backend::{
+    DType as BackendDType, QuantizedMatmulOp, QuantizedWeightHandle, TensorBackend, TensorHandle,
+};
 use crate::crash_breadcrumb;
-use crate::log_debug;
 use serde::Serialize;
 use std::cell::RefCell;
 use crate::projection_identity::ProjectionFamily;
@@ -58,19 +60,6 @@ pub enum StorageDtype {
     I8,
 }
 
-/// Current runtime mode affecting dispatch decisions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimeMode {
-    /// Safe mode: no fused MLX int4 for FFN projections, no mapped no-copy
-    /// for quantized weights — use the authority (dequantize + matmul) path.
-    Safe,
-    /// Qualified mode: operations permitted only after a crash-free parity
-    /// probe has passed for this exact shape class.
-    Qualified,
-    /// Experimental mode: all paths enabled.
-    Experimental,
-}
-
 /// A record of which backend was used for a single quantized projection.
 #[derive(Debug, Clone, Serialize)]
 pub struct RouteRecord {
@@ -78,7 +67,7 @@ pub struct RouteRecord {
     pub layer: u32,
     /// Projection family name (e.g. "GateProj", "UpProj", "DownProj", "QProj", "KProj", "VProj", "OProj").
     pub projection: String,
-    /// Backend that executed this projection ("mlx_fused", "mlx_authority", or "accelerate").
+    /// Backend that executed this projection.
     pub backend: String,
     /// Quantization bit width.
     pub bits: u8,
@@ -109,34 +98,60 @@ pub fn drain_route_receipts() -> Vec<RouteRecord> {
     ROUTE_RECEIPTS.with_borrow_mut(|r| std::mem::take(r))
 }
 
+// ── Re-exports ─────────────────────────────────────────────────────────────
+
+/// Runtime mode affecting dispatch decisions.
+///
+/// Re-exported from `projection_identity` for convenience.
+pub use crate::projection_identity::RuntimeMode;
+
 // ── ProjectionExecutor ─────────────────────────────────────────────────────
 
 /// Central dispatcher for all quantized projections.
-pub struct ProjectionExecutor {
+///
+/// Holds a mutable reference to a [`TensorBackend`] implementation and
+/// delegates all quantized matmul work through the trait.
+///
+/// The executor should be scoped to a single call via a block so the
+/// mutable borrow on the backend is released after the projection runs:
+///
+/// ```ignore
+/// let result_h = {
+///     let mut executor = ProjectionExecutor { backend: &mut backend, mode: RuntimeMode::Safe };
+///     executor.run_projection(x_h, w_h, s_h, b_h, &desc)?
+/// };
+/// ```
+pub struct ProjectionExecutor<'a> {
+    /// Backend to dispatch operations through.
+    pub backend: &'a mut dyn TensorBackend,
     /// Current runtime mode (affects dispatch decisions).
     pub mode: RuntimeMode,
 }
 
-impl ProjectionExecutor {
-    /// Execute one quantized projection. Returns the result Array (not eval'd).
+impl ProjectionExecutor<'_> {
+    /// Execute one quantized projection.
+    ///
+    /// Translates the descriptor into a [`QuantizedMatmulOp`] and delegates
+    /// to [`TensorBackend::quantized_matmul`].
     pub fn run_projection(
-        &self,
-        x: &Array,
-        w: &Array,
-        s: &Array,
-        b: &Array,
+        &mut self,
+        x: TensorHandle,
+        w: QuantizedWeightHandle,
+        s: TensorHandle,
+        b: TensorHandle,
         desc: &QuantizedProjectionDescriptor,
-    ) -> MlxResult<Array> {
+    ) -> Result<TensorHandle, String> {
         // Write crash breadcrumb before entering native code.
         let pid = std::process::id();
-        let x_shape: Vec<i32> = x.shape().iter().map(|&d| d as i32).collect();
-        let w_shape: Vec<i32> = w.shape().iter().map(|&d| d as i32).collect();
+        let x_shape = self.backend.shape(x)?;
+        let w_shape = self.backend.shape(s)?;
+        let caps = self.backend.backend_capabilities();
         crash_breadcrumb::before_native(
             pid,
             desc.layer_index,
             "decode",
             desc.family.as_str(),
-            "mlx",
+            &caps.backend_name,
             match desc.weight_materialization {
                 MaterializationClass::MlxOwned => "mlx-owned",
                 MaterializationClass::MappedReadOnly => "mapped-readonly",
@@ -149,168 +164,50 @@ impl ProjectionExecutor {
         );
 
         let start = std::time::Instant::now();
-        let result = match self.mode {
-            RuntimeMode::Safe => self.run_safe(x, w, s, b, desc),
-            RuntimeMode::Qualified => self.run_qualified(x, w, s, b, desc),
-            RuntimeMode::Experimental => self.run_experimental(x, w, s, b, desc),
-        };
+        let result = self.dispatch(x, w, s, b, desc);
 
         let elapsed_us = start.elapsed().as_micros() as u64;
         crash_breadcrumb::after_native(pid, elapsed_us);
         result
     }
 
-    /// Safe-mode dispatch: avoids fused MLX kernels that are known to
-    /// segfault for certain shapes, and refuses mapped no-copy weights.
-    fn run_safe(
-        &self,
-        x: &Array,
-        w: &Array,
-        s: &Array,
-        b: &Array,
+    /// Build a [`QuantizedMatmulOp`] from the descriptor and delegate to the backend.
+    fn dispatch(
+        &mut self,
+        x: TensorHandle,
+        w: QuantizedWeightHandle,
+        s: TensorHandle,
+        b: TensorHandle,
         desc: &QuantizedProjectionDescriptor,
-    ) -> MlxResult<Array> {
-        // Safe mode rules:
-        // 1. No fused MLX quantized_matmul for FFN projections (gate/up/down)
-        //    with logical_in_features > 2048 — use authority path.
-        // 2. No mapped no-copy weights for quantized projections — must be
-        //    copied-safe or MLX-owned.
-        let needs_authority = match desc.family {
-            ProjectionFamily::GateProj
-            | ProjectionFamily::UpProj
-            | ProjectionFamily::DownProj => desc.logical_in_features > 2048,
-            _ => false,
+    ) -> Result<TensorHandle, String> {
+        let m = desc.logical_in_features;
+        let n = desc.logical_out_features;
+        let k = m;
+
+        let input_dtype = BackendDType::F32;
+
+        let weight_dtype = match desc.storage_dtype {
+            StorageDtype::U32 => BackendDType::U32,
+            StorageDtype::U8 => BackendDType::U8,
+            StorageDtype::I8 => BackendDType::I8,
         };
 
-        if needs_authority || desc.weight_materialization == MaterializationClass::MappedReadOnly
-        {
-            let result = quantized_matmul_authority(x, w, s, b, desc.group_size as i32);
-            record_route(desc, "mlx_authority");
-            result
-        } else {
-            let result = mlx_rs::ops::quantized_matmul(
-                x,
-                w,
-                s,
-                b,
-                true,
-                desc.group_size as i32,
-                desc.bits as i32,
-            );
-            record_route(desc, "mlx_fused");
-            result
-        }
+        let op = QuantizedMatmulOp {
+            m,
+            n,
+            k,
+            input_dtype,
+            weight_dtype,
+            scale_dtype: BackendDType::F32,
+            bias_dtype: BackendDType::F32,
+            output_dtype: BackendDType::F32,
+            group_size: desc.group_size,
+            bits: desc.bits,
+            transpose: true,
+        };
+
+        let result = self.backend.quantized_matmul(&op, x, w, s, b)?;
+        record_route(desc, &self.backend.backend_capabilities().backend_name);
+        Ok(result)
     }
-
-    /// Qualified-mode dispatch: same as safe for now; extended later with
-    /// parity-gated paths.
-    fn run_qualified(
-        &self,
-        x: &Array,
-        w: &Array,
-        s: &Array,
-        b: &Array,
-        desc: &QuantizedProjectionDescriptor,
-    ) -> MlxResult<Array> {
-        self.run_safe(x, w, s, b, desc)
-    }
-
-    /// Experimental-mode dispatch: use fused MLX quantized_matmul
-    /// unconditionally.
-    fn run_experimental(
-        &self,
-        x: &Array,
-        w: &Array,
-        s: &Array,
-        b: &Array,
-        desc: &QuantizedProjectionDescriptor,
-    ) -> MlxResult<Array> {
-        let result = mlx_rs::ops::quantized_matmul(
-            x,
-            w,
-            s,
-            b,
-            true,
-            desc.group_size as i32,
-            desc.bits as i32,
-        );
-        record_route(desc, "mlx_fused");
-        result
-    }
-}
-
-// ── Authority quantized matmul ────────────────────────────────────────
-
-/// Authority path for quantized matmul: dequantize packed U32 int4 weights
-/// to f32 using correct nibble extraction, then call regular MLX matmul.
-/// Avoids MLX fused quantized_matmul which segfaults for certain shapes.
-fn quantized_matmul_authority(
-    x: &Array,
-    w: &Array,
-    s: &Array,
-    b: &Array,
-    group_size: i32,
-) -> MlxResult<Array> {
-    log_debug!("[infer] op=authority x_shape={:?}", x.shape());
-    let x_shape = x.shape();
-    let w_shape = w.shape();
-    let s_shape = s.shape();
-
-    let m = x_shape[0] as usize;
-    let k = x_shape[1] as usize;
-    let n_out = w_shape[0] as usize;
-    let n_groups = s_shape[s_shape.len() - 1] as usize;
-    let packed_cols = w_shape[1] as usize;
-
-    // Force evaluation of external/mmap-backed tensors before reading.
-    // try_as_slice requires the tensor to be evaluated on the current device.
-    w.eval()?;
-    s.eval()?;
-    b.eval()?;
-
-    // Read packed weight (U32)
-    let w_u32: Vec<u32> = w
-        .try_as_slice::<u32>()
-        .map_err(|e| {
-            mlx_rs::error::Exception::custom(format!("authority: w slice: {:?}", e))
-        })?
-        .to_vec();
-
-    let scales: Vec<f32> = s
-        .try_as_slice::<f32>()
-        .map_err(|e| {
-            mlx_rs::error::Exception::custom(format!("authority: s slice: {:?}", e))
-        })?
-        .to_vec();
-    let biases: Vec<f32> = b
-        .try_as_slice::<f32>()
-        .map_err(|e| {
-            mlx_rs::error::Exception::custom(format!("authority: b slice: {:?}", e))
-        })?
-        .to_vec();
-
-    // Dequantize: packed U32 int4 (8 nibbles per u32) -> f32 [n_out, k]
-    let gs = group_size as usize;
-    let mut w_f32 = vec![0.0f32; n_out * k];
-    for row in 0..n_out {
-        for g in 0..n_groups {
-            let scale = scales[row * n_groups + g];
-            let bias = biases[row * n_groups + g];
-            let start = g * gs;
-            let end = (start + gs).min(k);
-            for elem_idx in start..end {
-                let word_idx = row * packed_cols + elem_idx / 8;
-                let lane = elem_idx % 8;
-                let qval = (w_u32[word_idx] >> (lane * 4)) & 0xF;
-                w_f32[row * k + elem_idx] = (qval as f32) * scale + bias;
-            }
-        }
-    }
-
-    // Dequantized weight: [n_out, k], transpose to [k, n_out] for matmul
-    let w_arr = Array::from_slice(&w_f32, &[n_out as i32, k as i32]);
-    let wt = mlx_rs::ops::transpose_axes(&w_arr, &[1, 0])?;
-    let result = mlx_rs::ops::matmul(x, &wt)?;
-    result.eval()?;
-    Ok(result)
 }

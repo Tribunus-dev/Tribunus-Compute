@@ -14,6 +14,7 @@ pub mod accelerate_ffi;
 #[cfg(all(target_os = "macos", feature = "mlx-backend"))]
 pub mod coreml;
 pub mod evaluation;
+pub mod authority;
 pub mod graph;
 #[cfg(feature = "mlx-backend")]
 pub mod flex_dispatch;
@@ -348,7 +349,7 @@ impl MlxBackend {
     }
 
     /// Allocate a slot for `arr` and return the handle.
-    fn alloc(&mut self, arr: Array) -> TensorHandle {
+    pub fn alloc(&mut self, arr: Array) -> TensorHandle {
         if let Some(idx) = self.free_list.pop() {
             self.generations[idx] += 1;
             self.arrays[idx] = Some(arr);
@@ -369,7 +370,7 @@ impl MlxBackend {
 
     /// Get an immutable reference to the array at `handle`, validating
     /// slot and generation.
-    fn get(&self, handle: TensorHandle) -> Result<&Array, String> {
+    pub fn get(&self, handle: TensorHandle) -> Result<&Array, String> {
         let slot = handle.slot as usize;
         let generation = handle.generation;
         match self.arrays.get(slot) {
@@ -382,7 +383,7 @@ impl MlxBackend {
     }
 
     /// Get an immutable reference to a quantized weight array at `handle`.
-    fn get_weight(&self, handle: QuantizedWeightHandle) -> Result<&Array, String> {
+    pub fn get_weight(&self, handle: QuantizedWeightHandle) -> Result<&Array, String> {
         let slot = handle.slot as usize;
         let generation = handle.generation;
         match self.weight_arrays.get(slot) {
@@ -391,6 +392,17 @@ impl MlxBackend {
                 "MlxBackend: invalid weight handle (slot={}, gen={})",
                 slot, generation,
             )),
+        }
+    }
+
+    /// Allocate a slot for a quantized weight `arr` and return the handle.
+    pub fn alloc_weight(&mut self, arr: Array) -> QuantizedWeightHandle {
+        let idx = self.weight_arrays.len();
+        self.weight_arrays.push(Some(arr));
+        self.weight_generations.push(1);
+        QuantizedWeightHandle {
+            slot: idx as u32,
+            generation: 1,
         }
     }
 }

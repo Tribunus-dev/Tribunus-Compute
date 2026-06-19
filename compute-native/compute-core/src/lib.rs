@@ -53,7 +53,6 @@ pub mod compute_image_v0;
 pub mod compute_ir;
 pub mod compute_lane;
 pub mod compute_service;
-#[cfg(feature = "mlx-backend")]
 pub mod config;
 #[cfg(feature = "mlx-backend")]
 pub mod contracts;
@@ -150,9 +149,9 @@ pub mod primitives;
 pub mod profile_compiler;
 #[cfg(feature = "mlx-backend")]
 pub mod profiled_executor;
-#[cfg(feature = "mlx-backend")]
+#[cfg(any(feature = "mlx-backend", feature = "candle-cpu"))]
 pub mod projection_identity;
-#[cfg(feature = "mlx-backend")]
+#[cfg(any(feature = "mlx-backend", feature = "candle-cpu"))]
 pub mod projection_executor;
 #[cfg(feature = "mlx-backend")]
 pub mod projection_tests;
@@ -161,7 +160,6 @@ pub mod quantization;
 pub mod quantized;
 pub mod receipt;
 pub mod ring;
-#[cfg(feature = "mlx-backend")]
 pub mod readiness_gates;
 pub mod receipts;
 #[cfg(feature = "mlx-backend")]

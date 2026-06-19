@@ -192,6 +192,7 @@ impl QuantizedEmbedding {
             RuntimeMode, StorageDtype,
         };
         use crate::projection_identity::ProjectionFamily;
+        use crate::backend::{MlxBackend, QuantizedWeightHandle, TensorHandle};
 
         let reg = ARRAY_REGISTRY.read();
         let w = reg
@@ -221,9 +222,11 @@ impl QuantizedEmbedding {
             64
         };
 
-        let executor = ProjectionExecutor {
-            mode: RuntimeMode::Safe,
-        };
+        let mut backend = MlxBackend::new();
+        let x_h = backend.alloc(x.clone());
+        let w_h = backend.alloc_weight(w.clone());
+        let s_h = backend.alloc(s.clone());
+        let b_h = backend.alloc(b.clone());
 
         let desc = QuantizedProjectionDescriptor {
             family: ProjectionFamily::LmHead,
@@ -237,7 +240,16 @@ impl QuantizedEmbedding {
             weight_materialization: MaterializationClass::MlxOwned,
         };
 
-        executor.run_projection(x, &w, &s, &b, &desc)
+        let result_h = {
+            let mut executor = ProjectionExecutor { backend: &mut backend, mode: RuntimeMode::Safe };
+            executor.run_projection(x_h, w_h, s_h, b_h, &desc)
+                .map_err(|e| mlx_rs::error::Exception::custom(format!("{e}")))?
+        };
+
+        let result = backend.get(result_h)
+            .map_err(|e| mlx_rs::error::Exception::custom(e))?
+            .clone();
+        Ok(result)
     }
 }
 

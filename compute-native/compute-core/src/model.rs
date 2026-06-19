@@ -12,6 +12,7 @@ use crate::projection_executor::{
 use crate::projection_identity::ProjectionFamily;
 use mlx_rs::error::Result as MlxResult;
 use mlx_rs::Array;
+use crate::backend::{MlxBackend, QuantizedWeightHandle, TensorHandle};
 
 /// Convert a safetensors TensorView to an mlx_rs Array.
 pub(crate) fn tensor_view_to_array(tv: &safetensors::tensor::TensorView) -> Array {
@@ -91,9 +92,8 @@ pub fn run_sliding_layer_arrays(
     )?;
     let x = x.add(&attn_out)?;
     let normed = primitives::rms_norm(&x, w.ffn_norm, 1e-6)?;
-    let executor = ProjectionExecutor {
-        mode: RuntimeMode::Safe,
-    };
+
+    let mut backend = MlxBackend::new();
 
     let gate_desc = QuantizedProjectionDescriptor {
         family: ProjectionFamily::GateProj,
@@ -106,7 +106,17 @@ pub fn run_sliding_layer_arrays(
         layer_index: 0,
         weight_materialization: MaterializationClass::MlxOwned,
     };
-    let gate = executor.run_projection(&normed, w.gw, w.gs, w.gb, &gate_desc)?;
+    let normed_h = backend.alloc(normed.clone());
+    let gw_h = backend.alloc_weight(w.gw.clone());
+    let gs_h = backend.alloc(w.gs.clone());
+    let gb_h = backend.alloc(w.gb.clone());
+    let gate_h = {
+        let mut executor = ProjectionExecutor { backend: &mut backend, mode: RuntimeMode::Safe };
+        executor
+            .run_projection(normed_h, gw_h, gs_h, gb_h, &gate_desc)
+            .map_err(|e| mlx_rs::error::Exception::custom(format!("{e}")))?
+    };
+    let gate = backend.get(gate_h).map_err(|e| mlx_rs::error::Exception::custom(e))?.clone();
 
     let up_desc = QuantizedProjectionDescriptor {
         family: ProjectionFamily::UpProj,
@@ -119,7 +129,17 @@ pub fn run_sliding_layer_arrays(
         layer_index: 0,
         weight_materialization: MaterializationClass::MlxOwned,
     };
-    let up = executor.run_projection(&normed, w.uw, w.us, w.ub, &up_desc)?;
+    let normed_h = backend.alloc(normed.clone());
+    let uw_h = backend.alloc_weight(w.uw.clone());
+    let us_h = backend.alloc(w.us.clone());
+    let ub_h = backend.alloc(w.ub.clone());
+    let up_h = {
+        let mut executor = ProjectionExecutor { backend: &mut backend, mode: RuntimeMode::Safe };
+        executor
+            .run_projection(normed_h, uw_h, us_h, ub_h, &up_desc)
+            .map_err(|e| mlx_rs::error::Exception::custom(format!("{e}")))?
+    };
+    let up = backend.get(up_h).map_err(|e| mlx_rs::error::Exception::custom(e))?.clone();
 
     let gated = primitives::gelu_tanh(&gate)?.multiply(&up)?;
 
@@ -134,7 +154,17 @@ pub fn run_sliding_layer_arrays(
         layer_index: 0,
         weight_materialization: MaterializationClass::MlxOwned,
     };
-    let ffn_out = executor.run_projection(&gated, w.dw, w.ds, w.db, &down_desc)?;
+    let gated_h = backend.alloc(gated);
+    let dw_h = backend.alloc_weight(w.dw.clone());
+    let ds_h = backend.alloc(w.ds.clone());
+    let db_h = backend.alloc(w.db.clone());
+    let ffn_out_h = {
+        let mut executor = ProjectionExecutor { backend: &mut backend, mode: RuntimeMode::Safe };
+        executor
+            .run_projection(gated_h, dw_h, ds_h, db_h, &down_desc)
+            .map_err(|e| mlx_rs::error::Exception::custom(format!("{e}")))?
+    };
+    let ffn_out = backend.get(ffn_out_h).map_err(|e| mlx_rs::error::Exception::custom(e))?.clone();
 
     x.add(&ffn_out)
 }
@@ -167,9 +197,8 @@ pub fn run_full_layer_arrays(
     )?;
     let x = x.add(&attn_out)?;
     let normed = primitives::rms_norm(&x, w.ffn_norm, 1e-6)?;
-    let executor = ProjectionExecutor {
-        mode: RuntimeMode::Safe,
-    };
+
+    let mut backend = MlxBackend::new();
 
     let gate_desc = QuantizedProjectionDescriptor {
         family: ProjectionFamily::GateProj,
@@ -182,7 +211,17 @@ pub fn run_full_layer_arrays(
         layer_index: 0,
         weight_materialization: MaterializationClass::MlxOwned,
     };
-    let gate = executor.run_projection(&normed, w.gw, w.gs, w.gb, &gate_desc)?;
+    let normed_h = backend.alloc(normed.clone());
+    let gw_h = backend.alloc_weight(w.gw.clone());
+    let gs_h = backend.alloc(w.gs.clone());
+    let gb_h = backend.alloc(w.gb.clone());
+    let gate_h = {
+        let mut executor = ProjectionExecutor { backend: &mut backend, mode: RuntimeMode::Safe };
+        executor
+            .run_projection(normed_h, gw_h, gs_h, gb_h, &gate_desc)
+            .map_err(|e| mlx_rs::error::Exception::custom(format!("{e}")))?
+    };
+    let gate = backend.get(gate_h).map_err(|e| mlx_rs::error::Exception::custom(e))?.clone();
 
     let up_desc = QuantizedProjectionDescriptor {
         family: ProjectionFamily::UpProj,
@@ -195,7 +234,17 @@ pub fn run_full_layer_arrays(
         layer_index: 0,
         weight_materialization: MaterializationClass::MlxOwned,
     };
-    let up = executor.run_projection(&normed, w.uw, w.us, w.ub, &up_desc)?;
+    let normed_h = backend.alloc(normed.clone());
+    let uw_h = backend.alloc_weight(w.uw.clone());
+    let us_h = backend.alloc(w.us.clone());
+    let ub_h = backend.alloc(w.ub.clone());
+    let up_h = {
+        let mut executor = ProjectionExecutor { backend: &mut backend, mode: RuntimeMode::Safe };
+        executor
+            .run_projection(normed_h, uw_h, us_h, ub_h, &up_desc)
+            .map_err(|e| mlx_rs::error::Exception::custom(format!("{e}")))?
+    };
+    let up = backend.get(up_h).map_err(|e| mlx_rs::error::Exception::custom(e))?.clone();
 
     let gated = primitives::gelu_tanh(&gate)?.multiply(&up)?;
 
@@ -210,7 +259,17 @@ pub fn run_full_layer_arrays(
         layer_index: 0,
         weight_materialization: MaterializationClass::MlxOwned,
     };
-    let ffn_out = executor.run_projection(&gated, w.dw, w.ds, w.db, &down_desc)?;
+    let gated_h = backend.alloc(gated);
+    let dw_h = backend.alloc_weight(w.dw.clone());
+    let ds_h = backend.alloc(w.ds.clone());
+    let db_h = backend.alloc(w.db.clone());
+    let ffn_out_h = {
+        let mut executor = ProjectionExecutor { backend: &mut backend, mode: RuntimeMode::Safe };
+        executor
+            .run_projection(gated_h, dw_h, ds_h, db_h, &down_desc)
+            .map_err(|e| mlx_rs::error::Exception::custom(format!("{e}")))?
+    };
+    let ffn_out = backend.get(ffn_out_h).map_err(|e| mlx_rs::error::Exception::custom(e))?.clone();
 
     x.add(&ffn_out)
 }

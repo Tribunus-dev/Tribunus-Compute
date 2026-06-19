@@ -8,32 +8,45 @@ use crate::projection_identity::ProjectionFamily;
 use crate::primitives;
 use mlx_rs::error::Result as MlxResult;
 use mlx_rs::Array;
+use crate::backend::{MlxBackend, QuantizedWeightHandle, TensorHandle};
 
 /// Helper: run one attention projection through [`ProjectionExecutor`]
 /// with the correct descriptor derived from tensors.
 fn run_attention_projection(
-    executor: &ProjectionExecutor,
-    x: &Array,
-    w: &Array,
-    s: &Array,
-    b: &Array,
+    backend: &mut MlxBackend,
+    x: TensorHandle,
+    w: QuantizedWeightHandle,
+    s: TensorHandle,
+    b: TensorHandle,
     family: ProjectionFamily,
     hidden_size: u32,
     out_features: u32,
 ) -> MlxResult<Array> {
-    let group_size = (w.shape()[1] as i32 * 4) / s.shape()[1];
+    let (group_size, physical_weight_shape) = {
+        let w_arr = backend.get_weight(w).map_err(|e| mlx_rs::error::Exception::custom(e))?;
+        let s_arr = backend.get(s).map_err(|e| mlx_rs::error::Exception::custom(e))?;
+        let gs = (w_arr.shape()[1] as i32 * 4) / s_arr.shape()[1];
+        let pws = vec![w_arr.shape()[0] as u32, w_arr.shape()[1] as u32];
+        (gs as u32, pws)
+    };
     let desc = QuantizedProjectionDescriptor {
         family,
         logical_in_features: hidden_size,
         logical_out_features: out_features,
         bits: 8,
-        group_size: group_size as u32,
+        group_size,
         storage_dtype: StorageDtype::U32,
-        physical_weight_shape: vec![w.shape()[0] as u32, w.shape()[1] as u32],
+        physical_weight_shape,
         layer_index: 0,
         weight_materialization: MaterializationClass::MlxOwned,
     };
-    executor.run_projection(x, w, s, b, &desc)
+    let result_h = {
+        let mut executor = ProjectionExecutor { backend: &mut *backend, mode: RuntimeMode::Safe };
+        executor.run_projection(x, w, s, b, &desc)
+            .map_err(|e| mlx_rs::error::Exception::custom(format!("{e}")))?
+    };
+    let result = backend.get(result_h).map_err(|e| mlx_rs::error::Exception::custom(e))?.clone();
+    Ok(result)
 }
 
 pub fn sliding_attention(
@@ -61,13 +74,27 @@ pub fn sliding_attention(
     let n_tokens = x.shape()[0];
     let n_rep = n_heads / n_kv_heads;
     let hidden_size = x.shape()[1] as u32;
-    let executor = ProjectionExecutor { mode: RuntimeMode::Safe };
 
-    let q = run_attention_projection(&executor, x, qw, qs, qb, ProjectionFamily::QProj, hidden_size, n_heads * head_dim)?
+    let mut backend = MlxBackend::new();
+    let x_h = backend.alloc(x.clone());
+    let qw_h = backend.alloc_weight(qw.clone());
+    let qs_h = backend.alloc(qs.clone());
+    let qb_h = backend.alloc(qb.clone());
+    let kw_h = backend.alloc_weight(kw.clone());
+    let ks_h = backend.alloc(ks.clone());
+    let kb_h = backend.alloc(kb.clone());
+    let vw_h = backend.alloc_weight(vw.clone());
+    let vs_h = backend.alloc(vs.clone());
+    let vb_h = backend.alloc(vb.clone());
+    let ow_h = backend.alloc_weight(ow.clone());
+    let os_h = backend.alloc(os.clone());
+    let ob_h = backend.alloc(ob.clone());
+
+    let q = run_attention_projection(&mut backend, x_h, qw_h, qs_h, qb_h, ProjectionFamily::QProj, hidden_size, n_heads * head_dim)?
         .reshape(&[n_tokens, n_heads as i32, head_dim as i32])?;
-    let k = run_attention_projection(&executor, x, kw, ks, kb, ProjectionFamily::KProj, hidden_size, n_kv_heads * head_dim)?
+    let k = run_attention_projection(&mut backend, x_h, kw_h, ks_h, kb_h, ProjectionFamily::KProj, hidden_size, n_kv_heads * head_dim)?
         .reshape(&[n_tokens, n_kv_heads as i32, head_dim as i32])?;
-    let v = run_attention_projection(&executor, x, vw, vs, vb, ProjectionFamily::VProj, hidden_size, n_kv_heads * head_dim)?
+    let v = run_attention_projection(&mut backend, x_h, vw_h, vs_h, vb_h, ProjectionFamily::VProj, hidden_size, n_kv_heads * head_dim)?
         .reshape(&[n_tokens, n_kv_heads as i32, head_dim as i32])?;
 
     let q = primitives::rms_norm_scale_free(&q.reshape(&[-1, head_dim as i32])?, 1e-6)?
@@ -105,7 +132,8 @@ pub fn sliding_attention(
     let out = attn
         .matmul(&vt)?
         .reshape(&[n_tokens, (n_heads * head_dim) as i32])?;
-    run_attention_projection(&executor, &out, ow, os, ob, ProjectionFamily::OProj, hidden_size, hidden_size)?
+    let out_h = backend.alloc(out);
+    run_attention_projection(&mut backend, out_h, ow_h, os_h, ob_h, ProjectionFamily::OProj, hidden_size, hidden_size)?
         .reshape(&[n_tokens, -1])
 }
 
@@ -130,11 +158,22 @@ pub fn full_attention(
     let n_tokens = x.shape()[0];
     let n_rep = n_heads / n_kv_heads;
     let hidden_size = x.shape()[1] as u32;
-    let executor = ProjectionExecutor { mode: RuntimeMode::Safe };
 
-    let q = run_attention_projection(&executor, x, qw, qs, qb, ProjectionFamily::QProj, hidden_size, n_heads * head_dim)?
+    let mut backend = MlxBackend::new();
+    let x_h = backend.alloc(x.clone());
+    let qw_h = backend.alloc_weight(qw.clone());
+    let qs_h = backend.alloc(qs.clone());
+    let qb_h = backend.alloc(qb.clone());
+    let kw_h = backend.alloc_weight(kw.clone());
+    let ks_h = backend.alloc(ks.clone());
+    let kb_h = backend.alloc(kb.clone());
+    let ow_h = backend.alloc_weight(ow.clone());
+    let os_h = backend.alloc(os.clone());
+    let ob_h = backend.alloc(ob.clone());
+
+    let q = run_attention_projection(&mut backend, x_h, qw_h, qs_h, qb_h, ProjectionFamily::QProj, hidden_size, n_heads * head_dim)?
         .reshape(&[n_tokens, n_heads as i32, head_dim as i32])?;
-    let k = run_attention_projection(&executor, x, kw, ks, kb, ProjectionFamily::KProj, hidden_size, n_kv_heads * head_dim)?
+    let k = run_attention_projection(&mut backend, x_h, kw_h, ks_h, kb_h, ProjectionFamily::KProj, hidden_size, n_kv_heads * head_dim)?
         .reshape(&[n_tokens, n_kv_heads as i32, head_dim as i32])?;
 
     let q = primitives::rms_norm_scale_free(&q.reshape(&[-1, head_dim as i32])?, 1e-6)?
@@ -166,7 +205,8 @@ pub fn full_attention(
     let out = attn
         .matmul(&vt)?
         .reshape(&[n_tokens, (n_heads * head_dim) as i32])?;
-    run_attention_projection(&executor, &out, ow, os, ob, ProjectionFamily::OProj, hidden_size, hidden_size)?
+    let out_h = backend.alloc(out);
+    run_attention_projection(&mut backend, out_h, ow_h, os_h, ob_h, ProjectionFamily::OProj, hidden_size, hidden_size)?
         .reshape(&[n_tokens, -1])
 }
 

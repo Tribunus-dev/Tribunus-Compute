@@ -26,6 +26,7 @@ use crate::projection_executor::{
     MaterializationClass, StorageDtype, RuntimeMode,
 };
 use crate::projection_identity::ProjectionFamily;
+use crate::backend::{MlxBackend, QuantizedWeightHandle, TensorHandle};
 
 // ---------------------------------------------------------------------------
 // SlotAllocator
@@ -420,10 +421,19 @@ impl WeightRowCache {
             layer_index: 0,
             weight_materialization: MaterializationClass::MlxOwned,
         };
-        let executor = ProjectionExecutor { mode: RuntimeMode::Safe };
-        let logits = executor
-            .run_projection(hidden, &w, &s, &b, &desc)
-            .map_err(|e| format!("hybrid_lm_head run_projection: {:?}", e))?;
+        let mut backend = MlxBackend::new();
+        let hidden_h = backend.alloc(hidden.clone());
+        let w_h = backend.alloc_weight(w);
+        let s_h = backend.alloc(s);
+        let b_h = backend.alloc(b);
+        let logits_h = {
+            let mut executor = ProjectionExecutor { backend: &mut backend, mode: RuntimeMode::Safe };
+            executor
+                .run_projection(hidden_h, w_h, s_h, b_h, &desc)
+                .map_err(|e| format!("hybrid_lm_head run_projection: {:?}", e))?
+        };
+        let logits = backend.get(logits_h)
+            .map_err(|e| format!("hybrid_lm_head get: {:?}", e))?.clone();
 
         // logits shape: [1, vocab_size]
         logits.eval().map_err(|e| format!("hybrid_lm_head eval: {}", e))?;

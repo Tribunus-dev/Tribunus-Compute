@@ -11,6 +11,7 @@ use crate::projection_executor::{
     ProjectionExecutor, QuantizedProjectionDescriptor,
     MaterializationClass, StorageDtype, RuntimeMode,
 };
+use crate::backend::{MlxBackend, QuantizedWeightHandle, TensorHandle};
 use crate::session::SamplerConfig;
 use mlx_rs::Array;
 use std::collections::HashMap;
@@ -920,17 +921,28 @@ impl ImageRuntime {
                 layer_index: 0,
                 weight_materialization: MaterializationClass::MlxOwned,
             };
-            let executor = ProjectionExecutor {
-                mode: RuntimeMode::Safe,
+            let mut backend = MlxBackend::new();
+            let x_h = backend.alloc(final_hidden);
+            let w_h = backend.alloc_weight(ew);
+            let s_h = backend.alloc(es);
+            let b_h = backend.alloc(eb);
+            let result_h = {
+                let mut executor = ProjectionExecutor {
+                    backend: &mut backend,
+                    mode: RuntimeMode::Safe,
+                };
+                executor
+                    .run_projection(x_h, w_h, s_h, b_h, &desc)
+                    .map_err(|e| {
+                        crate::Error::from_reason(format!(
+                            "lm_head projection: {:?}",
+                            e
+                        ))
+                    })?
             };
-            executor
-                .run_projection(&final_hidden, &ew, &es, &eb, &desc)
-            .map_err(|e| {
-                crate::Error::from_reason(format!(
-                    "lm_head projection: {:?}",
-                    e
-                ))
-            })?
+            backend.get(result_h)
+                .map_err(|e| crate::Error::from_reason(format!("lm_head result: {:?}", e)))?
+                .clone()
         };
         out.eval().map_err(|e| {
             crate::Error::from_reason(format!("final eval: {:?}", e))

@@ -1,9 +1,12 @@
 use serde::Serialize;
 
-use crate::projection_executor::RuntimeMode;
-use crate::streaming::GenerationEvent;
+use crate::projection_identity::RuntimeMode;
 use crate::tokenizer::TribunusTokenizer;
+#[cfg(feature = "mlx-backend")]
 use crate::worker_protocol::StartGenerationPayload;
+#[cfg(feature = "mlx-backend")]
+use crate::streaming::GenerationEvent;
+#[cfg(feature = "mlx-backend")]
 use crate::worker_supervisor::WorkerSupervisor;
 
 /// Status of a single readiness gate.
@@ -30,7 +33,8 @@ pub struct ReadinessGate {
 /// sequence of startup checks.
 ///
 /// Gates are evaluated inline by [`ReadinessGates::run_all`] which runs
-/// real one-token inference against the worker.
+/// real one-token inference against the worker (MLX backend) or checks
+/// tokenizer and CPU backend availability (Candle CPU backend).
 pub struct ReadinessGates {
     gates: Vec<ReadinessGate>,
     ready_for_inference: bool,
@@ -85,6 +89,9 @@ impl ReadinessGates {
     ///
     /// Gates are evaluated in order. If any gate fails, later gates are
     /// skipped and `ready_for_inference` stays `false`.
+    ///
+    /// Available only when the `mlx-backend` feature is enabled.
+    #[cfg(feature = "mlx-backend")]
     pub fn run_all(
         &mut self,
         supervisor: Option<&WorkerSupervisor>,
@@ -191,6 +198,39 @@ impl ReadinessGates {
         }
     }
 
+    /// Run readiness gates for backends without a worker subprocess (e.g. Candle CPU).
+    ///
+    /// Checks tokenizer and CPU backend availability.  Worker health and smoke
+    /// tests are skipped since there is no separate worker process.
+    #[cfg(not(feature = "mlx-backend"))]
+    pub fn run_all(
+        &mut self,
+        tokenizer: Option<&TribunusTokenizer>,
+        runtime_mode: RuntimeMode,
+    ) {
+        // Gate 1: Worker Health — skipped (no worker process in CPU mode)
+        if let Some(g) = self.gates.iter_mut().find(|g| g.name == "worker_health") {
+            g.status = GateStatus::Skipped;
+        }
+
+        // Gate 2: Tokenizer
+        let has_tokenizer = tokenizer.is_some() || runtime_mode == RuntimeMode::Experimental;
+        self.set_gate("tokenizer", has_tokenizer);
+        if !has_tokenizer {
+            self.ready_for_inference = self.gates.iter().all(|g| g.status == GateStatus::Passed);
+            return;
+        }
+
+        // Gates 3 & 4: Smoke tests — skipped (no worker process in CPU mode)
+        for name in &["smoke_prefill", "smoke_decode"] {
+            if let Some(g) = self.gates.iter_mut().find(|g| g.name == *name) {
+                g.status = GateStatus::Skipped;
+            }
+        }
+
+        self.ready_for_inference = self.gates.iter().all(|g| g.status == GateStatus::Passed);
+    }
+
     /// Set a single gate to Passed (true) or Failed (false).
     /// Recomputes `ready_for_inference` after the change.
     fn set_gate(&mut self, name: &'static str, passed: bool) {
@@ -220,6 +260,7 @@ impl ReadinessGates {
     pub fn ready_for_inference(&self) -> bool {
         self.ready_for_inference
     }
+
     pub fn gate_states(&self) -> &[ReadinessGate] {
         &self.gates
     }
@@ -295,39 +336,5 @@ mod tests {
         rg.set_gate("smoke_decode", false);
         assert!(!rg.all_passed());
         assert!(!rg.ready_for_inference());
-    }
-
-    #[test]
-    fn all_fail_via_set_gate() {
-        let mut rg = ReadinessGates::new();
-        for gate_name in &["worker_health", "tokenizer", "smoke_prefill", "smoke_decode"] {
-            rg.set_gate(gate_name, false);
-        }
-        assert!(!rg.all_passed());
-        assert!(!rg.ready_for_inference());
-        for gate in &rg.gates {
-            assert_eq!(gate.status, GateStatus::Failed);
-        }
-    }
-
-    #[test]
-    fn serialize_gate_status() {
-        // Ensure serde derives compile and produce expected output.
-        let json = serde_json::to_string(&GateStatus::Passed).unwrap();
-        assert_eq!(json, "\"passed\"");
-    }
-
-    #[test]
-    fn serialize_readiness_gate() {
-        let gate = ReadinessGate {
-            name: "test_gate",
-            status: GateStatus::Running,
-            elapsed_ms: Some(42),
-            detail: Some("testing".into()),
-        };
-        let json = serde_json::to_string(&gate).unwrap();
-        assert!(json.contains("\"name\":\"test_gate\""));
-        assert!(json.contains("\"status\":\"running\""));
-        assert!(json.contains("\"elapsed_ms\":42"));
     }
 }

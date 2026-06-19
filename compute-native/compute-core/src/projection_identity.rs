@@ -8,6 +8,23 @@
 
 use std::fmt;
 
+// ── RuntimeMode ───────────────────────────────────────────────────────────
+
+/// Current runtime mode affecting dispatch decisions.
+///
+/// Shared between MLX backend and Candle CPU backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeMode {
+    /// Safe mode: no fused int4 for FFN projections, no mapped no-copy
+    /// for quantized weights — use the authority (dequantize + matmul) path.
+    Safe,
+    /// Qualified mode: operations permitted only after a crash-free parity
+    /// probe has passed for this exact shape class.
+    Qualified,
+    /// Experimental mode: all paths enabled.
+    Experimental,
+}
+
 // ── ProjectionFamily ───────────────────────────────────────────────────────
 
 /// The seven projection families in a Gemma 4 decoder layer.
@@ -158,6 +175,7 @@ impl ProjectionContext {
 
 /// Convert an MLX [`mlx_rs::Dtype`] to the wire-format storage dtype string
 /// (short names: `"U8"`, `"F32"`, etc.).
+#[cfg(feature = "mlx-backend")]
 pub fn dtype_to_storage(d: &mlx_rs::Dtype) -> &'static str {
     match d {
         mlx_rs::Dtype::Bool => "Bool",

@@ -1,31 +1,50 @@
+#[cfg(feature = "mlx-backend")]
 use std::collections::HashMap;
+#[cfg(feature = "mlx-backend")]
 use std::collections::HashSet;
 use std::sync::Arc;
+#[cfg(feature = "mlx-backend")]
 use std::path::PathBuf;
 use tokio::signal;
 use tokio::sync::Mutex;
+#[cfg(feature = "mlx-backend")]
 use tribunus_compute_core::exo::ExoNode;
-use tribunus_compute_core::logging::{log_debug, log_error, log_info, log_warn};
+use tribunus_compute_core::logging::{log_info, log_warn};
+#[cfg(feature = "mlx-backend")]
 use tribunus_compute_core::lora::LoraAdapter;
+#[cfg(feature = "mlx-backend")]
 use tribunus_compute_core::metrics::InferenceTelemetry;
+#[cfg(feature = "mlx-backend")]
 use tribunus_compute_core::model_cache::ModelCache;
+#[cfg(feature = "mlx-backend")]
 use tribunus_compute_core::engine_policy::ExecutionPolicy;
+#[cfg(feature = "mlx-backend")]
 use tribunus_compute_core::worker_supervisor::WorkerSupervisor;
+#[cfg(feature = "mlx-backend")]
 use tribunus_compute_core::scheduling::HardwareConfig;
+#[cfg(feature = "mlx-backend")]
 use tribunus_compute_core::server::admin::ActiveRequestInfo;
 
+#[cfg(feature = "mlx-backend")]
 use tribunus_compute_core::server::{
     auth::ApiKeyValidator,
     benchmark,
     models::{recommend_models, ModelRegistry},
     rate_limiter::RateLimiter,
-    routes::create_router,
-    routes::AppState,
 };
+#[cfg(not(feature = "mlx-backend"))]
+use tribunus_compute_core::server::{benchmark, models::{recommend_models, ModelRegistry}};
+#[cfg(feature = "mlx-backend")]
+use tribunus_compute_core::server::routes::create_router;
+#[cfg(feature = "mlx-backend")]
+use tribunus_compute_core::server::routes::AppState;
+#[cfg(not(feature = "mlx-backend"))]
+use tribunus_compute_core::server::cpu::{create_cpu_router, CpuAppState};
+#[cfg(feature = "mlx-backend")]
 use uuid::Uuid;
 use tribunus_compute_core::tokenizer::TribunusTokenizer;
 use tribunus_compute_core::readiness_gates::ReadinessGates;
-use tribunus_compute_core::projection_executor::RuntimeMode;
+use tribunus_compute_core::projection_identity::RuntimeMode;
 
 #[tokio::main]
 async fn main() {
@@ -71,8 +90,11 @@ async fn main() {
         eprintln!("  --port <n>           Server port (default: 11434)");
         eprintln!("  --host <addr>        Bind address (default: 0.0.0.0)");
         eprintln!("  --model-path <dir>   Path to model directory (ComputeImage)");
+        #[cfg(feature = "mlx-backend")]
         eprintln!("  --exo                Enable EXO clustering mode");
+        #[cfg(feature = "mlx-backend")]
         eprintln!("  --exo-port <n>       Port for EXO communication (default: 52415)");
+        #[cfg(feature = "mlx-backend")]
         eprintln!("  --no-worker          Coordinator-only node (no local inference)");
         eprintln!("  --code-mode          Optimize for code completion latency");
         eprintln!();
@@ -82,7 +104,9 @@ async fn main() {
         eprintln!("  TRIBUNUS_HOST          Bind address");
         eprintln!("  TRIBUNUS_LOG_LEVEL     Log verbosity (info, debug, warn)");
         eprintln!("  TRIBUNUS_MODEL_PATH    Model directory path");
+        #[cfg(feature = "mlx-backend")]
         eprintln!("  TRIBUNUS_EXO_ENABLED   Enable EXO clustering (true/false)");
+        #[cfg(feature = "mlx-backend")]
         eprintln!("  TRIBUNUS_EXO_PORT      Port for EXO communication");
         std::process::exit(0);
     }
@@ -101,15 +125,21 @@ async fn main() {
     let port = cfg.server.port;
     let host = cfg.server.host.clone();
     let model_path = cfg.model.model_path.clone();
+    #[cfg(feature = "mlx-backend")]
     let exo_mode = cfg.cluster.exo_enabled;
+    #[cfg(feature = "mlx-backend")]
     let exo_port = cfg.cluster.exo_port;
 
     // Runtime-only flags (not stored in config)
+    #[cfg(feature = "mlx-backend")]
     let mut no_worker = false;
+    #[cfg(feature = "mlx-backend")]
     let mut code_mode = false;
     for arg in &args {
         match arg.as_str() {
+            #[cfg(feature = "mlx-backend")]
             "--no-worker" => no_worker = true,
+            #[cfg(feature = "mlx-backend")]
             "--code-mode" => code_mode = true,
             _ => {}
         }
@@ -117,6 +147,9 @@ async fn main() {
 
     log_info!("Tribunus Compute Server v0.1.0");
 
+    // ── MLX backend startup path ────────────────────────────────────────
+    #[cfg(feature = "mlx-backend")]
+    {
     // 0b. Auto-detect hardware and configure for maximum throughput
     let hw = HardwareConfig::detect();
     log_info!("=== Hardware Detected ===");
@@ -301,6 +334,82 @@ async fn main() {
         })
         .await
         .unwrap();
+    }
+
+    // ── Candle CPU startup path ──────────────────────────────────────
+    #[cfg(not(feature = "mlx-backend"))]
+    {
+    log_info!("Backend: Candle CPU");
+
+    // 1. Run system benchmark
+    log_info!("Benchmarking system...");
+    let bench = benchmark::run_benchmark();
+    log_info!("  Chip: {}", bench.chip);
+    log_info!("  RAM: {} GB", bench.ram_gb);
+
+    // 2. Create model registry with recommendations
+    let mut registry = ModelRegistry::new();
+    for model in recommend_models(&bench.chip, bench.ram_gb, "chat") {
+        registry.register(model);
+    }
+    log_info!("  Recommended {} models", registry.list().len());
+
+    // ── Tokenizer ────────────────────────────────────────────────────
+    let tokenizer = model_path.as_ref().and_then(|mpath| {
+        let dir = std::path::Path::new(mpath);
+        match TribunusTokenizer::from_dir(dir) {
+            Ok(tok) => {
+                log_info!("  Tokenizer loaded");
+                Some(Arc::new(tok))
+            }
+            Err(e) => {
+                log_warn!("  No tokenizer found: {}", e);
+                None
+            }
+        }
+    });
+
+    // ── Readiness gates (CPU path: no worker) ────────────────────────
+    let runtime_mode = match cfg.server.runtime_mode.as_str() {
+        "qualified" => RuntimeMode::Qualified,
+        "experimental" => RuntimeMode::Experimental,
+        _ => RuntimeMode::Safe,
+    };
+    let mut gates = ReadinessGates::new();
+    gates.run_all(tokenizer.as_deref(), runtime_mode);
+    log_info!("Readiness gates summary: {}", gates.summary());
+    let gates = Arc::new(Mutex::new(gates));
+
+    // 3. Start server
+    let state = CpuAppState {
+        gates,
+        tokenizer,
+    };
+
+    let app = create_cpu_router(state);
+    let addr = format!("{}:{}", host, port);
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to bind to {}: {}", addr, e));
+    log_info!("Server running on http://{}", addr);
+    log_info!("  Backend: Candle CPU");
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            // Wait for SIGINT (Ctrl-C) or SIGTERM
+            signal::ctrl_c().await.ok();
+            #[cfg(unix)]
+            {
+                let mut term = signal::unix::signal(signal::unix::SignalKind::terminate()).ok();
+                if let Some(term) = &mut term {
+                    term.recv().await;
+                }
+            }
+            log_info!("\nShutdown signal received, draining...");
+        })
+        .await
+        .unwrap();
+    }
 
     log_info!("Server shut down cleanly.");
 }
