@@ -658,6 +658,16 @@ impl ModelCache {
 /// Map well-known model names to their disk or HuggingFace sources.
 pub fn default_model_sources() -> HashMap<String, ModelSource> {
     let mut m = HashMap::new();
+    // Auto-register model from env vars (populated by --model-path / --dev-mode).
+    if let Ok(path) = std::env::var("TRIBUNUS_MODEL_PATH") {
+        let name = std::env::var("TRIBUNUS_MODEL_NAME").unwrap_or_else(|_| {
+            std::path::Path::new(&path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "model".into())
+        });
+        m.insert(name, ModelSource::ImageDir(path.into()));
+    }
         m.insert(
         "qwen2.5:0.5b".into(),
         ModelSource::ImageDir("compute-native/models/qwen-compiled".into()),
