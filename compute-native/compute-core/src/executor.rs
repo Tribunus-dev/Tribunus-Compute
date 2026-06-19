@@ -14,6 +14,7 @@ use crate::config::operation_route::OperationRoute;
 use crate::config::{EpiloguePlan, LayerPlan, ProloguePlan};
 use crate::kv_cache::KvCache;
 use crate::log_debug;
+use crate::log_warn;
 use crate::primitives;
 use crate::projection_executor::{
     MaterializationClass, ProjectionExecutor, QuantizedProjectionDescriptor, RuntimeMode,
@@ -26,6 +27,24 @@ use mlx_rs::ops;
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Array;
 use std::ops::Neg;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// ── Fallback tracking ──────────────────────────────────────────────────────
+
+/// Global counter of backend fallback events during quantized matmul dispatch.
+/// Incremented each time a primary backend fails and a secondary/tertiary
+/// backend is used as fallback.  Read by compute-engine for observability.
+static FALLBACK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Return the current fallback count.
+pub fn fallback_count() -> u64 {
+    FALLBACK_COUNT.load(Ordering::Relaxed)
+}
+
+/// Reset the fallback counter to zero.
+pub fn reset_fallback_count() {
+    FALLBACK_COUNT.store(0, Ordering::Relaxed);
+}
 
 // ── Attention Sink Reuse ────────────────────────────────────────────────────
 
@@ -802,6 +821,119 @@ pub fn run_layer_with_sinks(
 
 static T2_PROBE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
+// ── Fallback helpers ───────────────────────────────────────────────────────
+
+/// Try one quantized matmul with a fresh MlxBackend in the given mode.
+fn try_qmatmul_mlx(
+    x: &Array,
+    w: &Array,
+    s: &Array,
+    b: &Array,
+    desc: &QuantizedProjectionDescriptor,
+    mode: RuntimeMode,
+) -> MlxResult<Array> {
+    let mut backend = MlxBackend::new();
+    let x_h = backend.alloc(x.clone());
+    let w_h = backend.alloc_weight(w.clone());
+    let s_h = backend.alloc(s.clone());
+    let b_h = backend.alloc(b.clone());
+    let result_h = {
+        let mut executor = ProjectionExecutor { backend: &mut backend, mode };
+        executor
+            .run_projection(x_h, w_h, s_h, b_h, desc)
+            .map_err(|e| mlx_rs::error::Exception::custom(format!("{e}")))?
+    };
+    let result = backend
+        .get(result_h)
+        .map_err(|e| mlx_rs::error::Exception::custom(e))?
+        .clone();
+    Ok(result)
+}
+
+/// Fallback to CandleCpuBackend (CPU dequantize + f32 matmul).
+#[cfg(feature = "candle-cpu")]
+fn try_qmatmul_candle(
+    x: &Array,
+    w: &Array,
+    s: &Array,
+    b: &Array,
+    desc: &QuantizedProjectionDescriptor,
+) -> MlxResult<Array> {
+    use crate::backend::TensorBackend;
+    use crate::candle_cpu_backend::CandleCpuBackend;
+    use candle_core::{Device, Tensor};
+
+    x.eval()?;
+    w.eval()?;
+    s.eval()?;
+    b.eval()?;
+
+    let x_shape: Vec<i32> = x.shape().iter().map(|&d| d as i32).collect();
+    let w_shape: Vec<i32> = w.shape().iter().map(|&d| d as i32).collect();
+    let s_shape: Vec<i32> = s.shape().iter().map(|&d| d as i32).collect();
+    let b_shape: Vec<i32> = b.shape().iter().map(|&d| d as i32).collect();
+
+    let x_data: Vec<f32> = x
+        .try_as_slice::<f32>()
+        .map_err(|e| mlx_rs::error::Exception::custom(format!("fallback read x: {e}")))?
+        .to_vec();
+    let w_data: Vec<u32> = w
+        .try_as_slice::<u32>()
+        .map_err(|e| mlx_rs::error::Exception::custom(format!("fallback read w: {e}")))?
+        .to_vec();
+    let s_data: Vec<f32> = s
+        .try_as_slice::<f32>()
+        .map_err(|e| mlx_rs::error::Exception::custom(format!("fallback read s: {e}")))?
+        .to_vec();
+    let b_data: Vec<f32> = b
+        .try_as_slice::<f32>()
+        .map_err(|e| mlx_rs::error::Exception::custom(format!("fallback read b: {e}")))?
+        .to_vec();
+
+    let mut cb = CandleCpuBackend::new();
+    let cb_x = cb
+        .create_f32(&x_data, &x_shape)
+        .map_err(|e| mlx_rs::error::Exception::custom(format!("fallback create x: {e}")))?;
+    let cb_s = cb
+        .create_f32(&s_data, &s_shape)
+        .map_err(|e| mlx_rs::error::Exception::custom(format!("fallback create s: {e}")))?;
+    let cb_b = cb
+        .create_f32(&b_data, &b_shape)
+        .map_err(|e| mlx_rs::error::Exception::custom(format!("fallback create b: {e}")))?;
+    let w_tensor = Tensor::from_slice(
+        &w_data,
+        w_shape.iter().map(|&d| d as usize).collect::<Vec<_>>(),
+        &Device::Cpu,
+    )
+    .map_err(|e| mlx_rs::error::Exception::custom(format!("fallback create w tensor: {e}")))?;
+    let cb_w = cb.alloc_weight(w_tensor);
+
+    let op = crate::backend::QuantizedMatmulOp {
+        m: desc.logical_in_features,
+        n: desc.logical_out_features,
+        k: desc.logical_in_features,
+        input_dtype: crate::backend::DType::F32,
+        weight_dtype: crate::backend::DType::U32,
+        scale_dtype: crate::backend::DType::F32,
+        bias_dtype: crate::backend::DType::F32,
+        output_dtype: crate::backend::DType::F32,
+        group_size: desc.group_size,
+        bits: desc.bits,
+        transpose: true,
+    };
+
+    let result_h = cb
+        .quantized_matmul(&op, cb_x, cb_w, cb_s, cb_b)
+        .map_err(|e| mlx_rs::error::Exception::custom(format!("fallback quantized_matmul: {e}")))?;
+    let result_shape = cb
+        .shape(result_h)
+        .map_err(|e| mlx_rs::error::Exception::custom(format!("fallback shape: {e}")))?;
+    let result_data = cb
+        .read_f32(result_h)
+        .map_err(|e| mlx_rs::error::Exception::custom(format!("fallback read_f32: {e}")))?;
+    Ok(Array::from_slice(&result_data.data, &result_shape))
+}
+
 fn qmatmul(x: &Array, w: &Array, s: &Array, b: &Array) -> MlxResult<Array> {
     // Correct quantization parameters derived from logical feature dimensions.
     // Packed U32 int4: each uint32 holds 8 logical values (32/4 = 8).
@@ -902,13 +1034,43 @@ fn qmatmul(x: &Array, w: &Array, s: &Array, b: &Array) -> MlxResult<Array> {
     }
 
     // Route through ProjectionExecutor which applies safe-mode dispatch.
-    let result_h = {
-        let mut executor = ProjectionExecutor { backend: &mut backend, mode: RuntimeMode::Safe };
-        executor.run_projection(x_h, w_h, s_h, b_h, &qmatmul_desc)
-            .map_err(|e| mlx_rs::error::Exception::custom(format!("{e}")))?
-    };
-    let result = backend.get(result_h).map_err(|e| mlx_rs::error::Exception::custom(e))?.clone();
-    Ok(result)
+    // ── Fallback chain ────────────────────────────────────────────────
+    // Primary:   MlxBackend in Experimental mode (native fused quantized matmul)
+    // Secondary: MlxBackend in Safe mode (dequantize + f32 matmul authority path)
+    // Tertiary:  CandleCpuBackend (CPU dequantize + f32 matmul)
+
+    match try_qmatmul_mlx(x, w, s, b, &qmatmul_desc, RuntimeMode::Experimental) {
+        Ok(result) => return Ok(result),
+        Err(primary_err) => {
+            log_warn!("[fallback] Primary MLX quantized_matmul failed: {}", primary_err);
+            FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    match try_qmatmul_mlx(x, w, s, b, &qmatmul_desc, RuntimeMode::Safe) {
+        Ok(result) => return Ok(result),
+        Err(secondary_err) => {
+            log_warn!("[fallback] Secondary MLX quantized_matmul (safe) failed: {}", secondary_err);
+            FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // Tertiary: CandleCpuBackend (behind "candle-cpu" feature)
+    #[cfg(feature = "candle-cpu")]
+    {
+        match try_qmatmul_candle(x, w, s, b, &qmatmul_desc) {
+            Ok(result) => return Ok(result),
+            Err(tertiary_err) => {
+                    log_warn!("[fallback] Tertiary Candle CPU quantized_matmul failed: {}", tertiary_err);
+                FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    // All fallbacks exhausted — return an error.
+    Err(mlx_rs::error::Exception::custom(
+        "[fallback] All backends failed for quantized projection".to_string()
+    ))
 }
 /// Wrapper around qmatmul that conditionally emits a projection attribution
 /// event when `TRIBUNUS_PROJECTION_ATTRIBUTION=1`.
@@ -1469,6 +1631,122 @@ pub struct EpilogueResult {
     pub logits: Option<Array>,
 }
 
+// ── Epilogue fallback helpers ──────────────────────────────────────────────
+
+/// Try one epilogue LM head projection with a fresh MlxBackend in the given mode.
+fn try_epilogue_mlx(
+    normed: &Array,
+    output_weight: &Array,
+    output_scales: &Array,
+    output_biases: &Array,
+    desc: &QuantizedProjectionDescriptor,
+    mode: RuntimeMode,
+) -> MlxResult<Array> {
+    let mut backend = MlxBackend::new();
+    let normed_h = backend.alloc(normed.clone());
+    let w_h = backend.alloc_weight(output_weight.clone());
+    let s_h = backend.alloc(output_scales.clone());
+    let b_h = backend.alloc(output_biases.clone());
+    let result_h = {
+        let mut executor = ProjectionExecutor {
+            backend: &mut backend,
+            mode,
+        };
+        executor
+            .run_projection(normed_h, w_h, s_h, b_h, desc)
+            .map_err(|e| mlx_rs::error::Exception::custom(format!("{e}")))?
+    };
+    let result = backend
+        .get(result_h)
+        .map_err(|e| mlx_rs::error::Exception::custom(e))?
+        .clone();
+    Ok(result)
+}
+
+/// Fallback epilogue LM head projection using CandleCpuBackend (CPU dequantize + f32 matmul).
+#[cfg(feature = "candle-cpu")]
+fn try_epilogue_candle(
+    normed: &Array,
+    output_weight: &Array,
+    output_scales: &Array,
+    output_biases: &Array,
+    desc: &QuantizedProjectionDescriptor,
+) -> MlxResult<Array> {
+    use crate::backend::TensorBackend;
+    use crate::candle_cpu_backend::CandleCpuBackend;
+    use candle_core::{Device, Tensor};
+
+    normed.eval()?;
+    output_weight.eval()?;
+    output_scales.eval()?;
+    output_biases.eval()?;
+
+    let x_shape: Vec<i32> = normed.shape().iter().map(|&d| d as i32).collect();
+    let w_shape: Vec<i32> = output_weight.shape().iter().map(|&d| d as i32).collect();
+    let s_shape: Vec<i32> = output_scales.shape().iter().map(|&d| d as i32).collect();
+    let b_shape: Vec<i32> = output_biases.shape().iter().map(|&d| d as i32).collect();
+
+    let x_data: Vec<f32> = normed
+        .try_as_slice::<f32>()
+        .map_err(|e| mlx_rs::error::Exception::custom(format!("ep fallback read x: {e}")))?
+        .to_vec();
+    let w_data: Vec<u32> = output_weight
+        .try_as_slice::<u32>()
+        .map_err(|e| mlx_rs::error::Exception::custom(format!("ep fallback read w: {e}")))?
+        .to_vec();
+    let s_data: Vec<f32> = output_scales
+        .try_as_slice::<f32>()
+        .map_err(|e| mlx_rs::error::Exception::custom(format!("ep fallback read s: {e}")))?
+        .to_vec();
+    let b_data: Vec<f32> = output_biases
+        .try_as_slice::<f32>()
+        .map_err(|e| mlx_rs::error::Exception::custom(format!("ep fallback read b: {e}")))?
+        .to_vec();
+
+    let mut cb = CandleCpuBackend::new();
+    let cb_x = cb
+        .create_f32(&x_data, &x_shape)
+        .map_err(|e| mlx_rs::error::Exception::custom(format!("ep fallback create x: {e}")))?;
+    let cb_s = cb
+        .create_f32(&s_data, &s_shape)
+        .map_err(|e| mlx_rs::error::Exception::custom(format!("ep fallback create s: {e}")))?;
+    let cb_b = cb
+        .create_f32(&b_data, &b_shape)
+        .map_err(|e| mlx_rs::error::Exception::custom(format!("ep fallback create b: {e}")))?;
+    let w_tensor = Tensor::from_slice(
+        &w_data,
+        w_shape.iter().map(|&d| d as usize).collect::<Vec<_>>(),
+        &Device::Cpu,
+    )
+    .map_err(|e| mlx_rs::error::Exception::custom(format!("ep fallback create w tensor: {e}")))?;
+    let cb_w = cb.alloc_weight(w_tensor);
+
+    let op = crate::backend::QuantizedMatmulOp {
+        m: desc.logical_in_features,
+        n: desc.logical_out_features,
+        k: desc.logical_in_features,
+        input_dtype: crate::backend::DType::F32,
+        weight_dtype: crate::backend::DType::U32,
+        scale_dtype: crate::backend::DType::F32,
+        bias_dtype: crate::backend::DType::F32,
+        output_dtype: crate::backend::DType::F32,
+        group_size: desc.group_size,
+        bits: desc.bits,
+        transpose: true,
+    };
+
+    let result_h = cb
+        .quantized_matmul(&op, cb_x, cb_w, cb_s, cb_b)
+        .map_err(|e| mlx_rs::error::Exception::custom(format!("ep fallback quantized_matmul: {e}")))?;
+    let result_shape = cb
+        .shape(result_h)
+        .map_err(|e| mlx_rs::error::Exception::custom(format!("ep fallback shape: {e}")))?;
+    let result_data = cb
+        .read_f32(result_h)
+        .map_err(|e| mlx_rs::error::Exception::custom(format!("ep fallback read_f32: {e}")))?;
+    Ok(Array::from_slice(&result_data.data, &result_shape))
+}
+
 /// Final normalization, tied output projection, softcapping, and token selection.
 ///
 /// Returns an `EpilogueResult` so the caller can explicitly `eval()` the
@@ -1484,7 +1762,7 @@ pub fn run_epilogue(
     output_biases: &Array,
     plan: &EpiloguePlan,
     rms_norm_eps: f32,
-    tie_word_embeddings: bool,
+    _tie_word_embeddings: bool,
     sampler: &SamplerConfig,
 ) -> MlxResult<EpilogueResult> {
     // Shape contract: hidden state is batchless [tokens, hidden_size].
@@ -1499,11 +1777,6 @@ pub fn run_epilogue(
     let normed = primitives::rms_norm(hidden, final_norm, rms_norm_eps)?;
 
     // Tied output projection: quantized matmul with embedding weights
-    let mut backend = MlxBackend::new();
-    let normed_h = backend.alloc(normed.clone());
-    let output_weight_h = backend.alloc_weight(output_weight.clone());
-    let output_scales_h = backend.alloc(output_scales.clone());
-    let output_biases_h = backend.alloc(output_biases.clone());
     let logical_in_features = normed.shape()[1] as u32;
     let logical_out_features = output_weight.shape()[0] as u32;
     let n_groups = if output_scales.shape().len() >= 1 {
@@ -1530,28 +1803,44 @@ pub fn run_epilogue(
         layer_index: 0,
         weight_materialization: MaterializationClass::MlxOwned,
     };
-    let logits_h = {
-        let mut executor = ProjectionExecutor { backend: &mut backend, mode: RuntimeMode::Safe };
-        if tie_word_embeddings {
-            executor.run_projection(
-                normed_h,
-                output_weight_h,
-                output_scales_h,
-                output_biases_h,
-                &lm_head_desc,
-            ).map_err(|e| mlx_rs::error::Exception::custom(format!("{e}")))?
-        } else {
-            // Non-tied: use dedicated lm_head tensor if available
-            executor.run_projection(
-                normed_h,
-                output_weight_h,
-                output_scales_h,
-                output_biases_h,
-                &lm_head_desc,
-            ).map_err(|e| mlx_rs::error::Exception::custom(format!("{e}")))?
+
+    // ── Fallback chain for LM head projection ─────────────────────────
+    // Primary:   MlxBackend Experimental (native fused)
+    // Secondary: MlxBackend Safe (dequantize + f32)
+    // Tertiary:  CandleCpuBackend (CPU dequantize + f32)
+    let logits = match try_epilogue_mlx(&normed, output_weight, output_scales, output_biases, &lm_head_desc, RuntimeMode::Experimental) {
+        Ok(l) => l,
+        Err(e1) => {
+            log_warn!("[fallback] Primary epilogue MLX projection failed: {}", e1);
+            FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+            match try_epilogue_mlx(&normed, output_weight, output_scales, output_biases, &lm_head_desc, RuntimeMode::Safe) {
+                Ok(l) => l,
+                Err(e2) => {
+                    log_warn!("[fallback] Secondary epilogue MLX projection (safe) failed: {}", e2);
+                    FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(feature = "candle-cpu")]
+                    {
+                        match try_epilogue_candle(&normed, output_weight, output_scales, output_biases, &lm_head_desc) {
+                            Ok(l) => l,
+                            Err(e3) => {
+                                log_warn!("[fallback] Tertiary epilogue Candle CPU projection failed: {}", e3);
+                                FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+                                return Err(mlx_rs::error::Exception::custom(
+                                    "[fallback] All epilogue backends failed".to_string(),
+                                ));
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "candle-cpu"))]
+                    {
+                        return Err(mlx_rs::error::Exception::custom(
+                            "[fallback] All epilogue backends failed (no candle-cpu feature)".to_string(),
+                        ));
+                    }
+                }
+            }
         }
     };
-    let logits = backend.get(logits_h).map_err(|e| mlx_rs::error::Exception::custom(e))?.clone();
 
     // Final logit softcapping
     let logits = if let Some(cap) = plan.final_logit_softcapping {

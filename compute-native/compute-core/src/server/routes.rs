@@ -21,7 +21,6 @@ use crate::kv_cache::KvCache;
 use crate::exo::ExoNode;
 use crate::profiled_executor::{AudioInput, LoadedProfiledModel, ProfiledInferenceSession, prefill_with_audio};
 use crate::profiled_executor::{ImageInput, MultiModalInput, VideoInput};
-use crate::generation::text_to_speech::{base64_encode, pcm_to_wav};
 use crate::profiled_executor::EmbedPoolStrategy;
 use crate::readiness_gates::ReadinessGates;
 use crate::tokenizer::TribunusTokenizer;
@@ -38,6 +37,7 @@ use crate::lora::{self, LoraAdapter, AdapterInfo};
 use crate::worker_supervisor::WorkerSupervisor;
 use crate::worker_protocol::StartGenerationPayload;
 use crate::server::rate_limiter::RateLimiter;
+use crate::server::rate_limiter::TokenRateLimiter;
 use crate::tools::{self, ToolDefinition, ToolCallResult};
 use crate::editing::{self, KnowledgeEditor, EditRequest, EditBatchRequest, AuditRequest, AuditItem};
 use tokio::sync::mpsc;
@@ -47,12 +47,16 @@ use axum::middleware::{self, Next};
 use axum::extract::Request;
 use axum::response::Response;
 use axum::response::IntoResponse;
+use axum::Extension;
 use std::convert::Infallible;
 use tokio_stream::wrappers::ReceiverStream;
 use std::sync::LazyLock;
 use std::sync::atomic::Ordering;
 use std::collections::HashSet;
 use crate::server::admin::{ActiveRequestInfo};
+use crate::worker_supervisor::WorkerSupervisor;
+use crate::worker_protocol::StartGenerationPayload;
+use crate::streaming::GenerationEvent;
 
 
 #[derive(Clone)]
@@ -79,6 +83,8 @@ pub struct AppState {
     pub knowledge_editor: Arc<Mutex<Option<KnowledgeEditor>>>,
     /// Token-bucket rate limiter (per-IP + global).
     pub rate_limiter: Arc<RateLimiter>,
+    /// Token-generation rate limiter (per-IP/model).
+    pub token_rate_limiter: Arc<TokenRateLimiter>,
     /// API key validator for Bearer token authentication.
     pub auth: Arc<ApiKeyValidator>,
     /// Active request registry for admin session listing.
@@ -260,7 +266,6 @@ async fn readiness(
         "gates": gates_json,
     })))
 }
-
 /// Middleware: require a valid Bearer token for /v1/* routes.
 /// Returns 401 UNAUTHORIZED when the token is missing or invalid.
 async fn auth_middleware(
@@ -290,13 +295,16 @@ async fn auth_middleware(
 /// Returns 429 Too Many Requests when the bucket is exhausted.
 async fn rate_limit_middleware(
     State(rate_limiter): State<Arc<RateLimiter>>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
     let ip = extract_client_ip(&req).unwrap_or_else(|| "unknown".to_string());
     if !rate_limiter.check(&ip).await {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
+    // Store client IP in request extensions so downstream handlers
+    // (e.g. token-generation rate limiting) can retrieve it.
+    req.extensions_mut().insert(ip);
     Ok(next.run(req).await)
 }
 
@@ -818,6 +826,7 @@ async fn stream_generate(
 /// and returns an SSE response with adaptive chunking.
 async fn handle_streaming_chat(
     State(state): State<AppState>,
+    Extension(client_ip): Extension<String>,
     body: serde_json::Value,
 ) -> axum::response::Response {
     let model_name = body
@@ -880,6 +889,20 @@ async fn handle_streaming_chat(
     // ── Tokenize prompt ──────────────────────────
     let prompt_tokens: Vec<u32> = prompt.bytes().map(|b| b as u32).collect();
 
+    // ── Token-generation rate limit check ──────
+    if !state.token_rate_limiter.check_tokens(&client_ip, &model_name, 1).await {
+        let retry_after = state
+            .token_rate_limiter
+            .retry_after_secs(&client_ip, &model_name, 1)
+            .await;
+        let retry_secs = retry_after.ceil() as u64;
+        return JsonResponse(serde_json::json!({
+            "error": "rate limit exceeded: too many output tokens generated. "
+                .to_owned() + "Try again later.",
+            "retry_after_seconds": retry_secs,
+        })).into_response();
+    }
+
     // ── Dispatch to inference worker ────────────
     let request_id = uuid::Uuid::new_v4().to_string();
     let now_ms = std::time::SystemTime::now()
@@ -919,6 +942,10 @@ async fn handle_streaming_chat(
     // ── Create channel and spawn streaming generation ──────────────────
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(64);
 
+    // Track generated tokens for rate limiting.
+    let tokens_generated = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let tokens_generated_clone = tokens_generated.clone();
+
     // Spawn blocking thread to collect worker events and forward as SSE.
     tokio::task::block_in_place(|| {
         let rt = tokio::runtime::Handle::current();
@@ -926,6 +953,7 @@ async fn handle_streaming_chat(
             loop {
                 match handle.stream.recv() {
                     Some(crate::streaming::GenerationEvent::Token(tok)) => {
+                        tokens_generated_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let text: String = std::iter::once(
                             char::from_u32(tok).unwrap_or(char::REPLACEMENT_CHARACTER)
                         ).collect();
@@ -958,24 +986,32 @@ async fn handle_streaming_chat(
     });
     });
 
+    // Record generated tokens in the token-generation rate limiter.
+    let count = tokens_generated.load(std::sync::atomic::Ordering::Relaxed);
+    if count > 0 {
+        state.token_rate_limiter.record_tokens(&client_ip, &model_name, count).await;
+    }
+
     Sse::new(ReceiverStream::new(rx)).into_response()
 }
 /// Dispatch wrapper for `/v1/chat/completions` that routes to the streaming
 /// or non-streaming handler based on the `stream` field in the request body.
 async fn chat_completions_dispatch(
     State(state): State<AppState>,
+    Extension(client_ip): Extension<String>,
     Json(body): Json<serde_json::Value>,
 ) -> axum::response::Response {
     if body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false) {
-        return handle_streaming_chat(State(state), body).await;
+        return handle_streaming_chat(State(state), Extension(client_ip), body).await;
     }
-    v1_chat_completions(State(state), Json(body)).await.into_response()
+    v1_chat_completions(State(state), Extension(client_ip), Json(body)).await.into_response()
 }
 
 /// `/v1/chat/completions` — OpenAI-compatible chat endpoint with real
 /// inference dispatch.
 async fn v1_chat_completions(
     State(state): State<AppState>,
+    Extension(client_ip): Extension<String>,
     Json(body): Json<serde_json::Value>,
 ) -> JsonResponse<serde_json::Value> {
     let model_name = body
@@ -1107,6 +1143,20 @@ async fn v1_chat_completions(
             let video_inputs = extract_video_inputs(messages);
             let prompt_tokens: Vec<u32> = tokenize_prompt(&state, &prompt);
 
+            // ── Token-generation rate limit check ──────
+            if !state.token_rate_limiter.check_tokens(&client_ip, &model_name, 1).await {
+                let retry_after = state
+                    .token_rate_limiter
+                    .retry_after_secs(&client_ip, &model_name, 1)
+                    .await;
+                let retry_secs = retry_after.ceil() as u64;
+                return JsonResponse(serde_json::json!({
+                    "error": "rate limit exceeded: too many output tokens generated. "
+                        .to_owned() + "Try again later.",
+                    "retry_after_seconds": retry_secs,
+                }));
+            }
+
             // ── Dispatch to inference worker ────────────
             let request_id = uuid::Uuid::new_v4().to_string();
             let now_ms = std::time::SystemTime::now()
@@ -1172,6 +1222,8 @@ async fn v1_chat_completions(
             let output_text = detokenize(&tokens);
             let prompt_tokens_count = prompt_tokens.len() as u64;
             let completion_tokens_count = tokens.len() as u64;
+            // Record generated tokens in the token-generation rate limiter.
+            state.token_rate_limiter.record_tokens(&client_ip, &model_name, completion_tokens_count).await;
 
             // If the request includes tools (function calling), attempt to
             // parse and repair the output as a function call.

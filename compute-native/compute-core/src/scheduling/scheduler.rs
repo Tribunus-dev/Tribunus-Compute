@@ -111,6 +111,11 @@ impl Scheduler {
         self.route_profile = Some(profile);
     }
 
+    /// Return a mutable reference to the scheduler configuration.
+    pub(crate) fn config_mut(&mut self) -> &mut SchedulerConfig {
+        &mut self.config
+    }
+
     /// Set the KV cache allocator for IOSurface-backed arena allocation.
     pub fn set_kv_cache_allocator(&mut self, allocator: Arc<Mutex<IosurfaceAllocator>>) {
         self.kv_cache_allocator = Some(allocator);

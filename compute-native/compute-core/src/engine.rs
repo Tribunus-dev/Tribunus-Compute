@@ -34,6 +34,12 @@ use crate::backend::routing::{
 use crate::backend::{MlxBackend, TensorHandle};
 use crate::hybrid_profile::{HybridExecutor, HybridProfile};
 use crate::scheduling::{Scheduler, SchedulerConfig};
+use crate::compute_image::{
+    clear_mlx_cache,
+    mlx_active_memory_bytes,
+    mlx_cache_memory_bytes,
+    mlx_get_memory_limit,
+};
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -156,6 +162,7 @@ impl std::fmt::Debug for ComputeEngine {
                     .map(|_| "Some(HybridExecutor)"),
             )
             .field("backend_routing", &self.backend_routing)
+            .field("peak_memory_used", &self.peak_memory_used)
             .finish()
     }
 }
@@ -174,6 +181,10 @@ pub struct ComputeEngine {
     hybrid_executor: Option<HybridExecutor>,
     /// Route profile for deterministic backend assignment per slot.
     backend_routing: Option<ComputeRouteProfile>,
+    /// Peak active memory observed during the most recent inference cycle (bytes).
+    peak_memory_used: u64,
+    /// Cumulative number of backend fallback events (read from executor static).
+    fallback_count: u64,
 }
 
 impl ComputeEngine {
@@ -201,6 +212,8 @@ impl ComputeEngine {
             scheduler: None,
             hybrid_executor: None,
             backend_routing: None,
+            peak_memory_used: 0,
+            fallback_count: 0,
         })
     }
 
@@ -210,6 +223,23 @@ impl ComputeEngine {
     /// [`WorkerSupervisor`] and communicates over framed JSON IPC.
     pub fn set_worker_binary_path(&mut self, path: String) {
         self.worker_binary_path = Some(PathBuf::from(path));
+    }
+
+    // -- observability -------------------------------------------------------
+
+    /// Return the cumulative number of backend fallback events.
+    ///
+    /// Reads the live counter from the executor module, which tracks
+    /// every quantized matmul that fell through to a secondary or tertiary
+    /// backend after the primary failed.
+    pub fn fallback_count(&self) -> u64 {
+        crate::executor::fallback_count()
+    }
+
+    /// Reset the fallback counter to zero.
+    pub fn reset_fallback_count(&mut self) {
+        self.fallback_count = 0;
+        crate::executor::reset_fallback_count();
     }
 
     // -- host-side inference (Accelerate / ANE) -----------------------------
@@ -287,6 +317,9 @@ impl ComputeEngine {
 
         // 3. Process the completed batch results (advance tokens, free finished slots).
         scheduler.process_results(&batch);
+
+        // 4. Check MLX memory pressure and take proactive action.
+        self.check_memory_pressure()?;
 
         Ok(())
     }
@@ -585,6 +618,95 @@ impl ComputeEngine {
         self.worker_supervisor = None;
         self.loaded_model = None;
         self.restart_count = 0;
+    }
+
+    /// Check MLX memory pressure and take proactive action.
+    ///
+    /// Queries `mlx_active_memory_bytes`, `mlx_cache_memory_bytes`, and
+    /// `mlx_get_memory_limit` to compute the current memory utilization
+    /// ratio.  Depending on the pressure level:
+    ///
+    /// - > 70%: clears the MLX cache and logs a warning.
+    /// - > 85%: also reduces the scheduler's `max_total_tokens` to curb
+    ///          further growth (force-GC equivalent).
+    /// - > 95%: returns an error to halt generation immediately.
+    ///
+    /// Tracks the peak active memory seen across calls so that
+    /// [`log_peak_memory`](Self::log_peak_memory) can report it later.
+    fn check_memory_pressure(&mut self) -> Result<(), String> {
+        let active = mlx_active_memory_bytes();
+        let _cache = mlx_cache_memory_bytes();
+        let limit = mlx_get_memory_limit();
+
+        // Track peak.
+        if active > self.peak_memory_used {
+            self.peak_memory_used = active;
+        }
+
+        if limit == 0 {
+            return Ok(()); // No limit configured — nothing to compare.
+        }
+
+        let ratio = active as f64 / limit as f64;
+
+        if ratio > 0.95 {
+            eprintln!(
+                "[memory-pressure] CRITICAL: {:.1}% ({}/{}) — stopping generation",
+                ratio * 100.0,
+                active,
+                limit,
+            );
+            return Err(format!(
+                "memory pressure critical: {:.1}% ({}/{})",
+                ratio * 100.0,
+                active,
+                limit,
+            ));
+        }
+
+        if ratio > 0.85 {
+            eprintln!(
+                "[memory-pressure] HIGH: {:.1}% ({}/{}) — reducing max_total_tokens",
+                ratio * 100.0,
+                active,
+                limit,
+            );
+            let freed = clear_mlx_cache();
+            eprintln!("[memory-pressure] cleared {} bytes from MLX cache", freed);
+            if let Some(scheduler) = &mut self.scheduler {
+                let current = scheduler.config_mut().max_total_tokens;
+                let reduced = (current as f64 * 0.85) as usize;
+                scheduler.config_mut().max_total_tokens = reduced;
+                eprintln!(
+                    "[memory-pressure] max_total_tokens reduced: {} -> {}",
+                    current, reduced,
+                );
+            }
+            return Ok(());
+        }
+
+        if ratio > 0.70 {
+            eprintln!(
+                "[memory-pressure] WARNING: {:.1}% ({}/{}) — clearing MLX cache",
+                ratio * 100.0,
+                active,
+                limit,
+            );
+            let freed = clear_mlx_cache();
+            eprintln!("[memory-pressure] cleared {} bytes from MLX cache", freed);
+            return Ok(());
+        }
+
+        Ok(())
+    }
+
+    /// Log the peak memory usage observed during the most recent inference
+    /// cycle.
+    pub fn log_peak_memory(&self) {
+        eprintln!(
+            "[memory-pressure] peak active memory: {} bytes",
+            self.peak_memory_used,
+        );
     }
 
     // -- helpers --------------------------------------------------------------

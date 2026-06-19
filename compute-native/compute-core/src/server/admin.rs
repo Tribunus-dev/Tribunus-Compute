@@ -76,7 +76,7 @@ pub fn admin_router() -> Router<AppState> {
     Router::new()
         .route("/v1/admin/status", get(admin_status))
         .route("/v1/admin/sessions", get(admin_sessions))
-        .route("/v1/admin/cancel/:id", post(admin_cancel))
+        .route("/v1/admin/cancel/{id}", post(admin_cancel))
         .route("/v1/admin/reload", post(admin_reload))
         .route("/v1/admin/evolkv", post(admin_evolkv))
         .route_layer(middleware::from_fn(admin_auth))
@@ -251,7 +251,7 @@ async fn admin_sessions(
 }
 
 // ---------------------------------------------------------------------------
-// Handler: POST /v1/admin/cancel/:id
+// Handler: POST /v1/admin/cancel/{id}
 // ---------------------------------------------------------------------------
 
 /// Cancel a running request by adding its ID to the cancelled set.

@@ -31,6 +31,9 @@ pub mod routing;
 #[cfg(feature = "intel")]
 pub mod intel_level_zero;
 pub mod tensor_registry;
+/// Tensor residency tracking — auditable contract for where a tensor lives.
+#[cfg(any(feature = "mlx-backend", feature = "candle-cpu", feature = "intel", feature = "tensix"))]
+pub mod residency;
 
 #[cfg(feature = "mlx-backend")]
 use mlx_rs::ops;
@@ -309,6 +312,35 @@ pub trait TensorBackend {
 
     /// Describe the capabilities of this backend.
     fn backend_capabilities(&self) -> BackendCapabilities;
+    // ── Residency (auditable tensor tracking) ────────────────────────
+
+    /// Return the residency record for the tensor identified by `handle`.
+    #[cfg(any(feature = "mlx-backend", feature = "candle-cpu", feature = "intel", feature = "tensix"))]
+    fn residency(&self, _handle: TensorHandle) -> Result<residency::TensorResidency, String> {
+        Err("residency tracking not yet implemented".into())
+    }
+
+    /// Record a transfer event for the tensor identified by `handle`.
+    #[cfg(any(feature = "mlx-backend", feature = "candle-cpu", feature = "intel", feature = "tensix"))]
+    fn record_transfer(&mut self, _handle: TensorHandle, _target: residency::BackendId) -> Result<(), String> {
+        Err("residency tracking not yet implemented".into())
+    }
+}
+
+// ── Transfer check helper ──────────────────────────────────────────────────
+
+/// Check whether a transfer is needed when reading `handle` from `from` on
+/// `to`. Returns the [`residency::TransferDecision`] so the scheduler can
+/// plan the mapping and log the event.
+#[cfg(any(feature = "mlx-backend", feature = "candle-cpu", feature = "intel", feature = "tensix"))]
+pub fn check_transfer<T: TensorBackend>(
+    from: &T,
+    _to: &T,
+    handle: TensorHandle,
+) -> Result<residency::TransferDecision, String> {
+    let r = from.residency(handle)?;
+    let decision = r.requires_transfer(residency::BackendId::Unknown);
+    Ok(decision)
 }
 
 #[cfg(feature = "mlx-backend")]

@@ -97,7 +97,7 @@ impl CandleCpuBackend {
     }
 
     /// Allocate a slot for a quantized weight tensor and return the handle.
-    fn alloc_weight(&mut self, t: Tensor) -> QuantizedWeightHandle {
+    pub(crate) fn alloc_weight(&mut self, t: Tensor) -> QuantizedWeightHandle {
         let idx = self.weight_tensors.len();
         self.weight_tensors.push(Some(t));
         self.weight_generations.push(1);

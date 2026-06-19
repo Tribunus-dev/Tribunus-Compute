@@ -192,6 +192,7 @@ async fn main() {
         }
     } else {
         None
+    rate_limiter::TokenRateLimiter,
     };
 
     // 1. Run system benchmark
@@ -287,6 +288,11 @@ async fn main() {
     let auth = Arc::new(ApiKeyValidator::new());
     auth.load_from_env();
 
+    let token_rate_limiter = Arc::new(TokenRateLimiter::new(
+        cfg.server.rate_limit_tokens_per_sec,
+        cfg.server.rate_limit_burst,
+    ));
+
     let state = AppState {
         models: Arc::new(Mutex::new(registry)),
         benchmark: Arc::new(Mutex::new(Some(bench))),
@@ -300,6 +306,7 @@ async fn main() {
         active_adapter: Arc::new(Mutex::new(None)),
         knowledge_editor: Arc::new(Mutex::new(None)),
         rate_limiter: Arc::new(RateLimiter::new(60, 1.0)),
+        token_rate_limiter,
         auth,
         admin_request_registry: Arc::new(Mutex::new(HashMap::new())),
         admin_cancelled_requests: Arc::new(Mutex::new(HashSet::new())),

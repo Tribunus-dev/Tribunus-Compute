@@ -10,10 +10,11 @@
 //! - [`WorkerSupervisor`]: aggregates all components, spawns event and watchdog threads
 
 use crate::contracts::RunInstrumentationContext;
-use crate::profiled_executor::{LoadedProfiledModel, ProfiledInferenceSession};
 use crate::engine_error::{EngineError, EngineErrorCode};
 use crate::engine_policy::{DeadlineGuard, ExecutionPolicy};
+use crate::profiled_executor::{LoadedProfiledModel, ProfiledInferenceSession};
 use crate::streaming::{generation_channel, GenerationEvent, GenerationHandle, GenerationSender};
+use crate::worker_crash_ledger::WorkerCrashLedger;
 use crate::worker_protocol::{
     Frame, HeartbeatPayload, HostCommand, MessageKind, PolicySnapshotPayload, ProtocolValidator,
     ResearchTraceBatchPayload, StartGenerationPayload, TokenPayload, WorkerEvent,
@@ -24,6 +25,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -484,8 +486,8 @@ pub struct ActiveRequest {
     pub public_job_id: String,
     pub stream_sender: GenerationSender,
     pub deadline: DeadlineGuard,
-    /// Deadline instant, stored for [`ActiveRequestRegistry::all_active`].
     pub deadline_at: Instant,
+    pub payload: Option<Value>,
     pub phase: Mutex<String>,
     pub cancellation_requested: AtomicBool,
     pub terminal_recorded: AtomicBool,
@@ -499,6 +501,7 @@ impl ActiveRequest {
         stream_sender: GenerationSender,
         deadline: DeadlineGuard,
         deadline_at: Instant,
+        payload: Option<Value>,
     ) -> Self {
         Self {
             request_id,
@@ -506,6 +509,7 @@ impl ActiveRequest {
             stream_sender,
             deadline,
             deadline_at,
+            payload,
             phase: Mutex::new("pending".into()),
             cancellation_requested: AtomicBool::new(false),
             terminal_recorded: AtomicBool::new(false),
@@ -631,7 +635,15 @@ impl ActiveRequestRegistry {
     /// Check if a request_id exists in the registry.
     pub fn contains(&self, request_id: &str) -> bool {
         self.requests.lock().contains_key(request_id)
+    }    /// Snapshot all active request payloads for crash recovery.
+    pub fn snapshot_payloads(&self) -> Vec<Value> {
+        self.requests
+            .lock()
+            .values()
+            .filter_map(|req| req.payload.clone())
+            .collect()
     }
+
 }
 
 // ── WorkerDiagnosticsCollector ─────────────────────────────────────────────
@@ -678,6 +690,50 @@ impl WorkerDiagnosticsCollector {
     }
 }
 
+// ── CrashRecoveryState ──────────────────────────────────────────────────────
+
+/// Shared state for tracking crash recovery across threads.
+///
+/// The watchdog thread writes to this before marking the runtime faulted;
+/// the supervisor reads from it when attempting recovery.
+pub struct CrashRecoveryState {
+    /// Serialized request payloads captured on crash, to be re-queued.
+    pub pending_payloads: Mutex<Vec<Value>>,
+    /// When the most recent crash was detected (for backoff computation).
+    pub last_crash_time: Mutex<Option<Instant>>,
+    /// Number of consecutive recovery attempts made.
+    pub retry_count: std::sync::atomic::AtomicU32,
+}
+
+impl CrashRecoveryState {
+    pub fn new() -> Self {
+        Self {
+            pending_payloads: Mutex::new(Vec::new()),
+            last_crash_time: Mutex::new(None),
+            retry_count: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    /// Maximum number of automatic recovery attempts before giving up.
+    pub const MAX_RETRIES: u32 = 3;
+
+    /// Exponential backoff in seconds for the nth retry (0-indexed).
+    /// 1st retry: 1s, 2nd: 2s, 3rd: 4s
+    pub fn backoff_seconds(&self) -> u64 {
+        1u64 << self.retry_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Capture active request payloads from the registry into pending state.
+    pub fn capture_payloads(&self, registry: &ActiveRequestRegistry) {
+        *self.pending_payloads.lock() = registry.snapshot_payloads();
+    }
+
+    /// Drain and return the captured payloads.
+    pub fn drain_payloads(&self) -> Vec<Value> {
+        self.pending_payloads.lock().drain(..).collect()
+    }
+}
+
 // ── WorkerSupervisor ───────────────────────────────────────────────────────
 
 /// Host-side supervisor that owns all component handles.
@@ -701,6 +757,16 @@ pub struct WorkerSupervisor {
     pub in_process_session: Option<Arc<std::sync::Mutex<ProfiledInferenceSession>>>,
     /// Model reference kept for in-process inference.
     pub in_process_model: Option<Arc<LoadedProfiledModel>>,
+    /// Worker binary path for re-spawn during crash recovery.
+    pub worker_binary: Option<PathBuf>,
+    /// Model image directory for re-spawn.
+    pub worker_image_dir: Option<PathBuf>,
+    /// Model image hash for re-load after re-spawn.
+    pub worker_image_hash: Option<String>,
+    /// Human-readable worker identifier.
+    pub worker_id: String,
+    /// Shared crash recovery state.
+    pub recovery_state: Arc<CrashRecoveryState>,
 }
 
 impl WorkerSupervisor {
@@ -717,7 +783,7 @@ impl WorkerSupervisor {
         policy: ExecutionPolicy,
         worker_binary: &Path,
         image_dir: &Path,
-        _image_hash: &str,
+        image_hash: &str,
         worker_id: &str,
     ) -> Result<Self, EngineError> {
         let instance_id = Uuid::new_v4().to_string();
@@ -775,6 +841,7 @@ impl WorkerSupervisor {
             policy.stderr_diagnostic_ceiling_bytes,
         ));
         let telemetry = RunInstrumentationContext::new(256);
+        let recovery_state = Arc::new(CrashRecoveryState::new());
 
         // Spawn stderr reader if we captured stderr.
         let diagnostics_handle = stderr.map(|err| {
@@ -862,6 +929,7 @@ impl WorkerSupervisor {
         let watchdog_registry = Arc::clone(&registry);
         let watchdog_diagnostics = Arc::clone(&diagnostics);
         let watchdog_policy = policy.clone();
+        let watchdog_recovery = Arc::clone(&recovery_state);
 
         let watchdog_handle = std::thread::Builder::new()
             .name("worker-watchdog".into())
@@ -873,6 +941,7 @@ impl WorkerSupervisor {
                     &watchdog_registry,
                     &watchdog_diagnostics,
                     &watchdog_policy,
+                    &watchdog_recovery,
                 );
             })
             .expect("failed to spawn watchdog");
@@ -890,6 +959,11 @@ impl WorkerSupervisor {
             diagnostics_handle,
             in_process_session: None,
             in_process_model: None,
+            worker_binary: Some(worker_binary.to_path_buf()),
+            worker_image_dir: Some(image_dir.to_path_buf()),
+            worker_image_hash: Some(image_hash.to_string()),
+            worker_id: worker_id.to_string(),
+            recovery_state,
         })
     }
 
@@ -945,6 +1019,11 @@ impl WorkerSupervisor {
             diagnostics_handle: None,
             in_process_session: Some(session),
             in_process_model: Some(model),
+            worker_binary: None,
+            worker_image_dir: None,
+            worker_image_hash: None,
+            worker_id: "in-process".to_string(),
+            recovery_state: Arc::new(CrashRecoveryState::new()),
         }
     }
 
@@ -1013,6 +1092,89 @@ impl WorkerSupervisor {
         }
     }
 
+    // ── Crash Recovery ────────────────────────────────────────────────────
+
+    /// Attempt to recover from a worker crash by re-spawning the worker,
+    /// re-loading the model, and re-queuing any pending requests.
+    ///
+    /// Uses exponential backoff between retries (1s, 2s, 4s).
+    /// After [`CrashRecoveryState::MAX_RETRIES`] failed attempts, returns
+    /// `WorkerCrashed`.
+    ///
+    /// Recover from a worker crash by re-spawning, re-loading, and
+    /// re-queuing previously captured requests.
+    ///
+    /// This is a convenience that delegates to [`Self::launch_and_handshake`],
+    /// then re-queues payloads captured by [`CrashRecoveryState`] from the
+    /// watchdog's crash detection. Callers should check
+    /// [`CrashRecoveryState::retry_count`] for the limit.
+    ///
+    /// Returns the new [`WorkerSupervisor`] and the number of requests
+    /// re-queued.
+    pub fn recover(
+        policy: ExecutionPolicy,
+        worker_binary: &Path,
+        image_dir: &Path,
+        image_hash: &str,
+        worker_id: &str,
+        recovery_state: &CrashRecoveryState,
+    ) -> Result<(Self, usize), EngineError> {
+        let retry_count = recovery_state
+            .retry_count
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if retry_count >= CrashRecoveryState::MAX_RETRIES {
+            return Err(EngineError::new(
+                EngineErrorCode::WorkerCrashed,
+                format!(
+                    "worker crash recovery limit ({}) exceeded after {} retries",
+                    CrashRecoveryState::MAX_RETRIES,
+                    retry_count,
+                ),
+            ));
+        }
+
+        // Exponential backoff: 2^retry_count seconds (1, 2, 4).
+        let backoff_secs = 1u64 << retry_count;
+        std::thread::sleep(Duration::from_secs(backoff_secs));
+
+        recovery_state
+            .retry_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        // Drains captured payloads for re-queue.
+        let original_payloads = recovery_state.drain_payloads();
+
+        // Spawn a fresh worker via the existing launch method.
+        let new_supervisor =
+            Self::launch_and_handshake(policy, worker_binary, image_dir, image_hash, worker_id)?;
+
+        // Load the model on the fresh worker.
+        new_supervisor.load_model(image_hash)?;
+
+        // Re-queue previously captured requests.
+        let re_queued = original_payloads.len();
+        for payload in &original_payloads {
+            let request_id = payload
+                .get("request_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !request_id.is_empty() {
+                if let Err(e) = new_supervisor.cmd_writer.send_command_with_request(
+                    HostCommand::StartGeneration,
+                    request_id,
+                    payload.clone(),
+                ) {
+                    log_error!("failed to re-queue request {request_id}: {e}");
+                }
+            }
+        }
+
+        // Mark recovery in the ledger.
+WorkerCrashLedger::record(new_supervisor.process_ctrl.pid(), 0, None, None, None);
+
+        Ok((new_supervisor, re_queued))
+    }
+
     // ── Start Generation ─────────────────────────────────────────────────
 
     /// Start a generation request.
@@ -1057,6 +1219,7 @@ impl WorkerSupervisor {
             sender,
             deadline,
             deadline_at,
+            serde_json::to_value(request).ok(),
         );
 
         // Insert into registry FIRST so the worker can be processing and
@@ -1097,10 +1260,7 @@ impl WorkerSupervisor {
                     let first_token = match sess.prefill(&prompt, &model) {
                         Ok(tok) => tok,
                         Err(e) => {
-                            registry.mark_terminal(
-                                &rid,
-                                GenerationEvent::Error(format!("{e}")),
-                            );
+                            registry.mark_terminal(&rid, GenerationEvent::Error(format!("{e}")));
                             return;
                         }
                     };
@@ -1109,8 +1269,9 @@ impl WorkerSupervisor {
                     {
                         let guard = registry.requests.lock();
                         if let Some(active) = guard.get(&rid) {
-                            let _ =
-                                active.stream_sender.try_send(GenerationEvent::Token(first_token));
+                            let _ = active
+                                .stream_sender
+                                .try_send(GenerationEvent::Token(first_token));
                         }
                     }
 
@@ -1565,6 +1726,7 @@ impl WorkerSupervisor {
         registry: &ActiveRequestRegistry,
         diagnostics: &WorkerDiagnosticsCollector,
         policy: &ExecutionPolicy,
+        recovery: &CrashRecoveryState,
     ) {
         let interval = Duration::from_millis(policy.watchdog_interval_ms);
 
@@ -1577,6 +1739,28 @@ impl WorkerSupervisor {
 
             // ── Process alive check ──
             if !process.is_alive() {
+                let pid = process.pid();
+                let exit_status = process.exit_status();
+                let (exit_code, signal) = match exit_status {
+                    Some(status) => (status.code().unwrap_or(-1), {
+                        use std::os::unix::process::ExitStatusExt;
+                        status.signal()
+                    }),
+                    None => (-1, None),
+                };
+                let active_ids: Vec<String> = registry
+                    .all_active()
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect();
+                let request_id = active_ids.first().cloned();
+
+                // Capture pending request payloads for recovery.
+                recovery.capture_payloads(registry);
+
+                // Record the crash in the ledger (recovered will be set after recovery).
+                WorkerCrashLedger::record(pid, exit_code, signal, request_id, None);
+
                 runtime.mark_faulted();
                 diagnostics.append_line("watchdog: worker process is not alive");
                 registry.fail_all("worker process exited");

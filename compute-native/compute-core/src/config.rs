@@ -1888,6 +1888,8 @@ pub struct ServerConfigSection {
     pub host: String,
     pub max_concurrent: u32,
     pub rate_limit_per_min: u32,
+    pub rate_limit_tokens_per_sec: f64,
+    pub rate_limit_burst: u64,
     pub log_level: String,
     pub runtime_mode: String,
 }
@@ -1936,6 +1938,8 @@ impl Default for ServerConfigSection {
             host: "0.0.0.0".into(),
             max_concurrent: 64,
             rate_limit_per_min: 60,
+            rate_limit_tokens_per_sec: 100.0,
+            rate_limit_burst: 1000,
             log_level: "info".into(),
             runtime_mode: "safe".into(),
         }
@@ -2037,6 +2041,16 @@ impl ServerConfig {
         if let Ok(v) = std::env::var("TRIBUNUS_RATE_LIMIT") {
             if let Ok(n) = v.parse::<u32>() {
                 self.server.rate_limit_per_min = n;
+            }
+        }
+        if let Ok(v) = std::env::var("TRIBUNUS_RATE_LIMIT_TOKENS_PER_SEC") {
+            if let Ok(f) = v.parse::<f64>() {
+                self.server.rate_limit_tokens_per_sec = f;
+            }
+        }
+        if let Ok(v) = std::env::var("TRIBUNUS_RATE_LIMIT_BURST") {
+            if let Ok(n) = v.parse::<u64>() {
+                self.server.rate_limit_burst = n;
             }
         }
         if let Ok(v) = std::env::var("TRIBUNUS_LOG_LEVEL") {

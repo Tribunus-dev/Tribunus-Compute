@@ -133,10 +133,7 @@ impl WorkerCrashLedger {
         let mut result: Vec<HashMap<String, serde_json::Value>> = Vec::new();
         for entry in entries.into_iter().rev() {
             let key = (
-                entry
-                    .get("exit_code")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0),
+                entry.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(0),
                 match entry.get("signal") {
                     Some(v) if v.is_null() => None,
                     Some(v) => v.as_i64(),
@@ -187,11 +184,17 @@ mod tests {
 
         let path = crash_file_path();
         let mut contents = String::new();
-        File::open(&path).unwrap().read_to_string(&mut contents).unwrap();
+        File::open(&path)
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
 
         let parsed: HashMap<String, serde_json::Value> =
             serde_json::from_str(contents.trim()).unwrap();
-        assert_eq!(parsed.get("worker_pid").and_then(|v| v.as_u64()), Some(1001));
+        assert_eq!(
+            parsed.get("worker_pid").and_then(|v| v.as_u64()),
+            Some(1001)
+        );
         assert_eq!(parsed.get("exit_code").and_then(|v| v.as_i64()), Some(-6));
         assert_eq!(parsed.get("signal").and_then(|v| v.as_i64()), Some(6));
         assert_eq!(
@@ -231,7 +234,11 @@ mod tests {
         // Write entries directly so we control order precisely.
         let path = crash_file_path();
         fs::create_dir_all(&dir).unwrap();
-        let mut file = OpenOptions::new().create(true).append(true).open(&path).unwrap();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
 
         fn write_entry(file: &mut File, ec: i32, sig: Option<i32>, rid: &str) {
             let record = serde_json::json!({
@@ -248,7 +255,7 @@ mod tests {
 
         // Three distinct (exit_code, signal) combos, one duplicate.
         write_entry(&mut file, 1, None, "a");
-        write_entry(&mut file, 1, None, "b");   // dup of (1, None)
+        write_entry(&mut file, 1, None, "b"); // dup of (1, None)
         write_entry(&mut file, 2, Some(11), "c");
         write_entry(&mut file, 3, Some(6), "d");
         file.sync_all().unwrap();
@@ -262,7 +269,12 @@ mod tests {
         // The duplicate (1, None) at entry "b" is deduped — the first
         // encountered when iterating backwards is "b", then "a" is skipped.
         // The three unique ones come from entries d, c, (b or a).
-        assert_eq!(sigs.len(), 3, "expected 3 unique signatures, got {}", sigs.len());
+        assert_eq!(
+            sigs.len(),
+            3,
+            "expected 3 unique signatures, got {}",
+            sigs.len()
+        );
     }
 
     #[test]
@@ -272,7 +284,11 @@ mod tests {
 
         let path = crash_file_path();
         fs::create_dir_all(&dir).unwrap();
-        let mut file = OpenOptions::new().create(true).append(true).open(&path).unwrap();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
 
         for i in 0..10 {
             let record = serde_json::json!({
@@ -283,7 +299,7 @@ mod tests {
                 "active_request_id": format!("req-{i}"),
                 "last_breadcrumb": null,
             });
-        let line = serde_json::to_string(&record).unwrap();
+            let line = serde_json::to_string(&record).unwrap();
             writeln!(file, "{line}").unwrap();
         }
         file.sync_all().unwrap();
@@ -294,14 +310,8 @@ mod tests {
         let sigs = WorkerCrashLedger::recent_signatures(3);
         assert_eq!(sigs.len(), 3);
         // Most recent entries, reversed, so exit codes 9, 8, 7.
-        assert_eq!(
-            sigs[0].get("exit_code").and_then(|v| v.as_i64()),
-            Some(9)
-        );
-        assert_eq!(
-            sigs[2].get("exit_code").and_then(|v| v.as_i64()),
-            Some(7)
-        );
+        assert_eq!(sigs[0].get("exit_code").and_then(|v| v.as_i64()), Some(9));
+        assert_eq!(sigs[2].get("exit_code").and_then(|v| v.as_i64()), Some(7));
     }
 
     #[test]
