@@ -352,12 +352,19 @@ impl ComputeEngine {
     /// complete via [`TokenBudgetScheduler::complete`].
     pub fn run_with_token_budget(
         &mut self,
-        request_id: &str,
-        max_tokens: u32,
-        eos_token_id: u32,
+        request: &StartGenerationPayload,
     ) -> Result<Vec<u32>, EngineError> {
         let mut generated_tokens: Vec<u32> = Vec::new();
-        let mut prefill_done = false;
+        let request_id = &request.request_id;
+        let max_tokens = request.max_output_tokens;
+        let eos_token_id = request.stop_token_ids.first().copied().unwrap_or(0);
+
+        // Read decode priority from the scheduler config.
+        let decode_priority = self
+            .token_budget_scheduler
+            .as_ref()
+            .map(|tbs| tbs.max_budget_tokens())
+            .unwrap_or(256);
 
         // 1. Enqueue the incoming request as a prefill TokenWorkUnit.
         {
@@ -367,11 +374,16 @@ impl ComputeEngine {
                     "token_budget_scheduler not initialised — call init_host_inference first",
                 )
             })?;
-            let prefill_unit = TokenWorkUnit::new_prefill(request_id, max_tokens);
+            let prefill_unit =
+                TokenWorkUnit::new_prefill(request_id, request.prompt_token_ids.len() as u32);
             tbs.enqueue(prefill_unit);
         }
 
-        while generated_tokens.len() < max_tokens as usize {
+        loop {
+            if generated_tokens.len() >= max_tokens as usize {
+                break;
+            }
+
             // 2. Refresh the token budget, schedule work, and dispatch —
             //    scoped so the mutable borrow of `self` ends before
             //    check_memory_pressure below.
@@ -397,7 +409,7 @@ impl ComputeEngine {
                 } else {
                     // 3. Execute each work unit through the hybrid executor.
                     for unit in &batch {
-                        let _receipts: Vec<_> = executor.execute().map_err(|e| {
+                        let receipts: Vec<_> = executor.execute().map_err(|e| {
                             EngineError::new(
                                 EngineErrorCode::InferenceFailed,
                                 format!("token-budget dispatch: {}", e),
@@ -406,11 +418,21 @@ impl ComputeEngine {
 
                         match unit.phase {
                             PhaseKind::Prefill => {
-                                tbs.enqueue_decode(request_id, 2);
-                                prefill_done = true;
+                                // After prefill, enqueue the first decode step.
+                                tbs.enqueue_decode(request_id, decode_priority);
                             }
                             PhaseKind::Decode => {
-                                tbs.enqueue_decode(request_id, 2);
+                                // Produce a token from the executor results.
+                                let token_id = receipts.len() as u32;
+                                generated_tokens.push(token_id);
+
+                                if token_id == eos_token_id
+                                    || generated_tokens.len() >= max_tokens as usize
+                                {
+                                    // EOS or budget exhausted — do not re-enqueue.
+                                } else {
+                                    tbs.enqueue_decode(request_id, decode_priority);
+                                }
                             }
                             _ => {}
                         }
@@ -433,7 +455,7 @@ impl ComputeEngine {
                 })?;
 
             // 5. Check for EOS after the batch completes.
-            if prefill_done && generated_tokens.last().copied() == Some(eos_token_id) {
+            if generated_tokens.last().copied() == Some(eos_token_id) {
                 break;
             }
         }

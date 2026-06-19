@@ -177,6 +177,11 @@ impl TokenBudgetScheduler {
         self.total_budget_tokens = self.config.max_num_batched_tokens;
     }
 
+    /// Returns the maximum number of tokens per scheduling cycle (from config).
+    pub fn max_budget_tokens(&self) -> u32 {
+        self.config.max_num_batched_tokens
+    }
+
     pub fn pending_count(&self) -> usize { self.run_queue.len() }
     pub fn active_count(&self) -> usize { self.active_requests.len() }
 }
