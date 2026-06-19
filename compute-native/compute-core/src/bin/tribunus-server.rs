@@ -7,9 +7,9 @@ use std::sync::Arc;
 use std::path::PathBuf;
 use tokio::signal;
 use tokio::sync::Mutex;
+use tribunus_compute_core::{log_info, log_warn, log_error};
 #[cfg(feature = "mlx-backend")]
 use tribunus_compute_core::exo::ExoNode;
-use tribunus_compute_core::logging::{log_info, log_warn};
 #[cfg(feature = "mlx-backend")]
 use tribunus_compute_core::lora::LoraAdapter;
 #[cfg(feature = "mlx-backend")]
@@ -185,7 +185,7 @@ async fn main() {
         match ExoNode::start(exo_port, no_worker) {
             Ok(node) => Some(Arc::new(tokio::sync::Mutex::new(node))),
             Err(e) => {
-                log_error!("[exo] Failed to start EXO node: {}", e);
+                tribunus_compute_core::log_error!("[exo] Failed to start EXO node: {}", e);
                 log_warn!("[exo] Continuing without EXO clustering.");
                 None
             }
@@ -246,13 +246,13 @@ async fn main() {
                     Some(Arc::new(sup))
                 }
                 Err(e) => {
-                    log_error!("  Failed to spawn worker: {:?}", e);
+                    tribunus_compute_core::log_error!("  Failed to spawn worker: {:?}", e);
                     log_warn!("  Continuing without worker; chat endpoints will return 503");
                     None
                 }
             }
         } else {
-            log_error!("  Model path does not exist: {}", mpath);
+            tribunus_compute_core::log_error!("  Model path does not exist: {}", mpath);
             None
         }
     } else { None };
