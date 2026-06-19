@@ -1534,6 +1534,23 @@ impl ProfiledInferenceSession {
                     EngineError::new(EngineErrorCode::NumericalFailure, format!("chunk layer {} eval: {}", l, e))
                 })?;
             }
+            // DIAGNOSTIC: materialization checksum after every layer.
+            // Logs layer index, kind, output shape, and a readback checksum.
+            // Isolates the crash between layers.
+            {
+                let h_shape = hidden.shape();
+                let h_elems = h_shape.iter().product::<i32>() as usize;
+                let checksum = match hidden.try_as_slice::<f32>() {
+                    Ok(slice) => {
+                        let n = slice.len().min(100);
+                        let partial_sum: f32 = slice[..n].iter().copied().sum();
+                        partial_sum
+                    },
+                    Err(_) => -1.0f32,
+                };
+                log_debug!("[infer] event=layer_materialize layer={} kind={} shape={:?} elems={} checksum={:.6}",
+                    l, &plan.layers[l].attention_kind, h_shape, h_elems, checksum);
+            }
             self.kv_caches[l].commit_step();
         }
 

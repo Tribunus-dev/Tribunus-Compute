@@ -316,7 +316,9 @@ pub fn dispatch_multiply(
         return a.multiply(b);
     }
     log_debug!("[infer] backend=accelerate op=multiply shape={:?} elems={}", a.shape(), a.shape().iter().product::<i32>());
+    log_debug!("[infer] op=multiply_extract a_shape={:?} b_shape={:?}", a.shape(), b.shape());
     let (shape, a_data) = eval_and_extract(a)?;
+    log_debug!("[infer] op=multiply_extract_b shape={:?}", shape);
     let b_data = match b.try_as_slice::<f32>() {
         Ok(s) => s.to_vec(),
         Err(_) => return a.multiply(b),

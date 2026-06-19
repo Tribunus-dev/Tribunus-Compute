@@ -5,6 +5,7 @@
 //! segments, mapped storage, or test fixtures. The caller is responsible for
 //! calling `eval()` on the result before dropping the weight leases.
 
+use crate::log_debug;
 use crate::config::{EpiloguePlan, LayerPlan, ProloguePlan};
 use crate::kv_cache::KvCache;
 use crate::config::operation_route::OperationRoute;
@@ -587,12 +588,21 @@ pub fn run_layer_with_sinks(
         let normed_ffn = primitives::rms_norm(&hidden_after_attn, ffn_norm, rms_norm_eps)?;
 
         let gate = qmatmul_attributed(&normed_ffn, gw, gs, gb, true, 64, 8, ctx, ProjectionFamily::GateProj, 4)?;
+        gate.eval()?;
+        log_debug!("[infer] op=gate_proj_done layer={}", ctx.layer_index);
         let up = qmatmul_attributed(&normed_ffn, uw, us, ub, true, 64, 8, ctx, ProjectionFamily::UpProj, 5)?;
+        up.eval()?;
+        log_debug!("[infer] op=up_proj_done layer={}", ctx.layer_index);
         let gated = crate::heterogeneous::dispatch_multiply(&mlx_rs::nn::silu(&gate)?, &up, route, island)?;
+        log_debug!("[infer] op=down_proj layer={} gated_shape={:?}", ctx.layer_index, gated.shape());
         let ffn_out = qmatmul_attributed(&gated, dw, ds, db, true, 64, 8, ctx, ProjectionFamily::DownProj, 6)?;
-
+        ffn_out.eval()?;
+        log_debug!("[infer] op=down_proj_done layer={} shape={:?}", ctx.layer_index, ffn_out.shape());
+        log_debug!("[infer] op=ffn_add layer={} ffn_shape={:?}", ctx.layer_index, ffn_out.shape());
         let result = crate::heterogeneous::dispatch_add(residual_ffn, &ffn_out, route, island)?;
+        log_debug!("[infer] op=ffn_eval layer={} result_shape={:?}", ctx.layer_index, result.shape());
         result.eval()?;
+        log_debug!("[infer] op=layer_done layer={} result_shape={:?}", ctx.layer_index, result.shape());
         Ok(result)
     } else {
         // --- Prefill path: full attention, then capture sinks ---
