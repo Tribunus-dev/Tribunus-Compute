@@ -21,6 +21,31 @@ pub struct KernelBenchResult {
     pub compile_time_ms: f64,
 }
 
+/// Per-lane benchmark result for a single op type, used in placement reports.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LaneBenchResult {
+    pub lane: String,       // "mlx", "accelerate", "coreml"
+    pub median_ns: u64,
+    pub min_ns: u64,
+    pub bandwidth_gbps: f64,
+    pub numerical_error: f64,
+}
+
+/// Placement decision for a single op type, comparing all candidate lanes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlacementReport {
+    pub op_type: String,
+    pub shape: Vec<u32>,
+    pub winner: String,                    // which lane won
+    pub winner_latency_ns: u64,
+    pub runner_up: String,
+    pub runner_up_latency_ns: u64,
+    pub ratio: f64,                        // runner_up / winner
+    pub hazard_count: u32,                  // synchronization events needed
+    pub total_transfer_bytes: u64,          // bytes moved between lanes
+    pub lane_results: Vec<LaneBenchResult>,
+}
+
 /// A candidate kernel variant to benchmark.
 #[derive(Clone, Debug)]
 pub struct KernelCandidate {
@@ -62,6 +87,7 @@ pub struct AssessmentReceipt {
     pub supports_bf16: bool,
     pub selections: Vec<KernelSelection>,
     pub benchmark_results: Vec<KernelBenchResult>,
+    pub placement_reports: Vec<PlacementReport>,
     pub assessment_duration_ms: u64,
     pub assessment_timestamp: String,
 }
