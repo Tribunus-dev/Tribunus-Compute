@@ -311,7 +311,7 @@ impl QwenAttention {
 
         // Scaled dot-product attention with FLASH_ATTENTION
         let scale = 1.0 / (self.head_dim as f32).sqrt();
-        let attn_out = fast::scaled_dot_product_attention(&q, &k, &v, Some(scale), None)?;
+        let attn_out = fast::scaled_dot_product_attention(&q, &k, &v, scale, None, None)?;
 
         // Split back: first img_seq tokens are image, rest are text
         let img_out = attn_out.index(&[.., .., ..img_seq, ..])?;

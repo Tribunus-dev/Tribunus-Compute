@@ -113,6 +113,7 @@ impl crate::external_array::ExternalStorage for SegmentSlice {
 pub(crate) fn load_tensor_from_mapped_segment(
     segment: &std::sync::Arc<crate::mapped_image::MappedSegment>,
     entry: &TensorEntry,
+    force_copy: bool,
 ) -> crate::Result<(mlx_rs::Array, CopyClassification)> {
     let mapping = segment.data_slice();
     let offset = entry.offset as usize;
@@ -128,6 +129,16 @@ pub(crate) fn load_tensor_from_mapped_segment(
         )));
     }
     let dims: Vec<i32> = entry.physical_shape.iter().map(|&d| d as i32).collect();
+
+    // When force_copy is true, copy the mapping data into MLX-owned buffers
+    // instead of using the mmap-backed external_array. This avoids potential
+    // segfaults from fused MLX kernels reading mmap pages that Metal may
+    // reposition.
+    if force_copy {
+        let data: Vec<u8> = mapping[offset..end].to_vec();
+        let arr = mlx_rs::Array::from_slice(&data, &dims);
+        return Ok((arr, CopyClassification::CopiedFallback));
+    }
 
     // TODO: wire external_array for true no-copy when mapped ABI is complete
     let storage = Arc::new(SegmentSlice {
@@ -419,7 +430,7 @@ impl LoadedProfiledModel {
             let segment = mapped_image.segments.get(seg_id).ok_or_else(|| {
                 crate::Error::from_reason(format!("segment not found: {}", seg_id))
             })?;
-            let (arr, classification) = load_tensor_from_mapped_segment(segment, entry)?;
+            let (arr, classification) = load_tensor_from_mapped_segment(segment, entry, false)?;
             let byte_len = entry.byte_length;
             match classification {
                 CopyClassification::MappedNoCopy => mapped_weight_bytes += byte_len,
@@ -705,7 +716,7 @@ impl LoadedProfiledModel {
                     let segment = mapped_image.segments.get(seg_id).ok_or_else(|| {
                         format!("segment not found for vision tensor {}: {}", name, seg_id)
                     })?;
-                    let (arr, _classification) = load_tensor_from_mapped_segment(segment, entry)
+                    let (arr, _classification) = load_tensor_from_mapped_segment(segment, entry, false)
                         .map_err(|e| format!("load vision tensor {}: {}", name, e))?;
                     Ok(std::sync::Arc::new(arr))
                 } else {
@@ -902,7 +913,7 @@ impl LayerWeightStreamer {
             let seg_id = &entry.segment;
             let segment = self.mapped_image.segments.get(seg_id)
                 .ok_or_else(|| format!("segment not found: {}", seg_id))?;
-            let (arr, _classification) = load_tensor_from_mapped_segment(segment, entry)
+            let (arr, _classification) = load_tensor_from_mapped_segment(segment, entry, false)
                 .map_err(|e| format!("load {}: {}", name, e))?;
             Ok(Arc::new(arr))
         };

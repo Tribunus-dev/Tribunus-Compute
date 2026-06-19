@@ -1,14 +1,16 @@
-use tribunus_compute_core::logging::{log_info, log_error, log_warn, log_debug};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::path::PathBuf;
 use tokio::signal;
 use tokio::sync::Mutex;
 use tribunus_compute_core::exo::ExoNode;
+use tribunus_compute_core::logging::{log_debug, log_error, log_info, log_warn};
 use tribunus_compute_core::lora::LoraAdapter;
 use tribunus_compute_core::metrics::InferenceTelemetry;
 use tribunus_compute_core::model_cache::ModelCache;
-use tribunus_compute_core::profiled_executor::{LoadedProfiledModel, ProfiledInferenceSession};
+use tribunus_compute_core::engine_policy::ExecutionPolicy;
+use tribunus_compute_core::worker_supervisor::WorkerSupervisor;
 use tribunus_compute_core::scheduling::HardwareConfig;
 use tribunus_compute_core::server::admin::ActiveRequestInfo;
 
@@ -17,8 +19,13 @@ use tribunus_compute_core::server::{
     benchmark,
     models::{recommend_models, ModelRegistry},
     rate_limiter::RateLimiter,
-    routes::{build_kv_caches, create_router, AppState},
+    routes::create_router,
+    routes::AppState,
 };
+use uuid::Uuid;
+use tribunus_compute_core::tokenizer::TribunusTokenizer;
+use tribunus_compute_core::readiness_gates::ReadinessGates;
+use tribunus_compute_core::projection_executor::RuntimeMode;
 
 #[tokio::main]
 async fn main() {
@@ -82,7 +89,9 @@ async fn main() {
 
     // Propagate --config as env var so ServerConfig::load() picks it up
     if let Some(path) = &config_path_override {
-        unsafe { std::env::set_var("TRIBUNUS_CONFIG_PATH", path); }
+        unsafe {
+            std::env::set_var("TRIBUNUS_CONFIG_PATH", path);
+        }
     }
 
     // Load config: defaults -> config.toml -> env vars -> CLI args (highest priority)
@@ -183,26 +192,63 @@ async fn main() {
         }
     }
 
-    let session = if let Some(mpath) = &model_path {
+    let supervisor = if let Some(mpath) = &model_path {
         log_info!("Loading model from {}...", mpath);
         let path = std::path::Path::new(mpath);
-        match LoadedProfiledModel::new(path) {
-            Ok(model) => {
-                let n_layers = model.reader.manifest.execution_plan.layers.len();
-                let kv_caches = build_kv_caches(&model);
-                let mut session = ProfiledInferenceSession::new("server".into(), kv_caches);
-                session.setup_from_model(&model);
-                log_info!("  Model loaded: {} layers", n_layers);
-                Some(Arc::new(Mutex::new(Some(session))))
+        // Validate model path exists, then spawn worker
+        if path.exists() {
+            let worker_binary = std::env::var("TRIBUNUS_WORKER_BINARY")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| {
+                    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("tribunus-compute-worker"))
+                });
+
+            let image_hash = "";
+            let worker_id = Uuid::new_v4().to_string();
+            let policy = tribunus_compute_core::engine_policy::qualification_policy();
+
+            match WorkerSupervisor::launch_and_handshake(policy, &worker_binary, path, image_hash, &worker_id) {
+                Ok(sup) => {
+                    log_info!("  Worker spawned (pid {})", sup.process_ctrl.pid());
+                    Some(Arc::new(sup))
+                }
+                Err(e) => {
+                    log_error!("  Failed to spawn worker: {:?}", e);
+                    log_warn!("  Continuing without worker; chat endpoints will return 503");
+                    None
+                }
+            }
+        } else {
+            log_error!("  Model path does not exist: {}", mpath);
+            None
+        }
+    } else { None };
+
+    // ── Tokenizer ────────────────────────────────────────────────────
+    let tokenizer = model_path.as_ref().and_then(|mpath| {
+        let dir = std::path::Path::new(mpath);
+        match TribunusTokenizer::from_dir(dir) {
+            Ok(tok) => {
+                log_info!("  Tokenizer loaded");
+                Some(Arc::new(tok))
             }
             Err(e) => {
-                log_error!("  Failed to load model: {:?}", e);
-                Some(Arc::new(Mutex::new(None)))
+                log_warn!("  No tokenizer found: {}", e);
+                None
             }
         }
-    } else {
-        Some(Arc::new(Mutex::new(None)))
+    });
+
+    // ── Readiness gates ──────────────────────────────────────────────
+    let runtime_mode = match cfg.server.runtime_mode.as_str() {
+        "qualified" => RuntimeMode::Qualified,
+        "experimental" => RuntimeMode::Experimental,
+        _ => RuntimeMode::Safe,
     };
+    let mut gates = ReadinessGates::new();
+    gates.run_all(supervisor.as_deref(), tokenizer.as_deref(), runtime_mode);
+    log_info!("Readiness gates summary: {}", gates.summary());
+    let gates = Arc::new(Mutex::new(gates));
 
     // 4. Start server
     let auth = Arc::new(ApiKeyValidator::new());
@@ -212,7 +258,9 @@ async fn main() {
         models: Arc::new(Mutex::new(registry)),
         benchmark: Arc::new(Mutex::new(Some(bench))),
         model_cache: Arc::new(Mutex::new(model_cache)),
-        session: session.expect("session must be Some"),
+        supervisor,
+        tokenizer,
+        gates,
         exo_node,
         telemetry: Arc::new(InferenceTelemetry::new()),
         adapters: Arc::new(Mutex::new(HashMap::new())),

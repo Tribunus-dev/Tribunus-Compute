@@ -5,6 +5,11 @@
 
 use crate::attention;
 use crate::primitives;
+use crate::projection_executor::{
+    MaterializationClass, ProjectionExecutor, QuantizedProjectionDescriptor, RuntimeMode,
+    StorageDtype,
+};
+use crate::projection_identity::ProjectionFamily;
 use mlx_rs::error::Result as MlxResult;
 use mlx_rs::Array;
 
@@ -27,12 +32,6 @@ pub(crate) fn tensor_view_to_array(tv: &safetensors::tensor::TensorView) -> Arra
     };
     unsafe { Array::from_raw_data(data.as_ptr() as *const std::ffi::c_void, &shape, dtype) }
 }
-
-fn qmatmul(x: &Array, w: &Array, s: &Array, b: &Array) -> MlxResult<Array> {
-    let group_size = (w.shape()[1] as i32 * 4) / s.shape()[1];
-    mlx_rs::ops::quantized_matmul(x, w, s, b, true, group_size, 8)
-}
-
 pub struct LayerArraysRef<'a> {
     pub attn_norm: &'a Array,
     pub ffn_norm: &'a Array,
@@ -92,13 +91,53 @@ pub fn run_sliding_layer_arrays(
     )?;
     let x = x.add(&attn_out)?;
     let normed = primitives::rms_norm(&x, w.ffn_norm, 1e-6)?;
-    let gate = qmatmul(&normed, w.gw, w.gs, w.gb)?;
-    let up = qmatmul(&normed, w.uw, w.us, w.ub)?;
+    let executor = ProjectionExecutor {
+        mode: RuntimeMode::Safe,
+    };
+
+    let gate_desc = QuantizedProjectionDescriptor {
+        family: ProjectionFamily::GateProj,
+        logical_in_features: arch.hidden_size,
+        logical_out_features: arch.intermediate_size,
+        bits: 4,
+        group_size: 64,
+        storage_dtype: StorageDtype::U32,
+        physical_weight_shape: vec![w.gw.shape()[0] as u32, w.gw.shape()[1] as u32],
+        layer_index: 0,
+        weight_materialization: MaterializationClass::MlxOwned,
+    };
+    let gate = executor.run_projection(&normed, w.gw, w.gs, w.gb, &gate_desc)?;
+
+    let up_desc = QuantizedProjectionDescriptor {
+        family: ProjectionFamily::UpProj,
+        logical_in_features: arch.hidden_size,
+        logical_out_features: arch.intermediate_size,
+        bits: 4,
+        group_size: 64,
+        storage_dtype: StorageDtype::U32,
+        physical_weight_shape: vec![w.uw.shape()[0] as u32, w.uw.shape()[1] as u32],
+        layer_index: 0,
+        weight_materialization: MaterializationClass::MlxOwned,
+    };
+    let up = executor.run_projection(&normed, w.uw, w.us, w.ub, &up_desc)?;
+
     let gated = primitives::gelu_tanh(&gate)?.multiply(&up)?;
-    let ffn_out = qmatmul(&gated, w.dw, w.ds, w.db)?;
+
+    let down_desc = QuantizedProjectionDescriptor {
+        family: ProjectionFamily::DownProj,
+        logical_in_features: arch.intermediate_size,
+        logical_out_features: arch.hidden_size,
+        bits: 4,
+        group_size: 64,
+        storage_dtype: StorageDtype::U32,
+        physical_weight_shape: vec![w.dw.shape()[0] as u32, w.dw.shape()[1] as u32],
+        layer_index: 0,
+        weight_materialization: MaterializationClass::MlxOwned,
+    };
+    let ffn_out = executor.run_projection(&gated, w.dw, w.ds, w.db, &down_desc)?;
+
     x.add(&ffn_out)
 }
-
 pub fn run_full_layer_arrays(
     x: &Array,
     w: &LayerArraysRef<'_>,
@@ -128,10 +167,51 @@ pub fn run_full_layer_arrays(
     )?;
     let x = x.add(&attn_out)?;
     let normed = primitives::rms_norm(&x, w.ffn_norm, 1e-6)?;
-    let gate = qmatmul(&normed, w.gw, w.gs, w.gb)?;
-    let up = qmatmul(&normed, w.uw, w.us, w.ub)?;
+    let executor = ProjectionExecutor {
+        mode: RuntimeMode::Safe,
+    };
+
+    let gate_desc = QuantizedProjectionDescriptor {
+        family: ProjectionFamily::GateProj,
+        logical_in_features: arch.hidden_size,
+        logical_out_features: arch.intermediate_size,
+        bits: 4,
+        group_size: 64,
+        storage_dtype: StorageDtype::U32,
+        physical_weight_shape: vec![w.gw.shape()[0] as u32, w.gw.shape()[1] as u32],
+        layer_index: 0,
+        weight_materialization: MaterializationClass::MlxOwned,
+    };
+    let gate = executor.run_projection(&normed, w.gw, w.gs, w.gb, &gate_desc)?;
+
+    let up_desc = QuantizedProjectionDescriptor {
+        family: ProjectionFamily::UpProj,
+        logical_in_features: arch.hidden_size,
+        logical_out_features: arch.intermediate_size,
+        bits: 4,
+        group_size: 64,
+        storage_dtype: StorageDtype::U32,
+        physical_weight_shape: vec![w.uw.shape()[0] as u32, w.uw.shape()[1] as u32],
+        layer_index: 0,
+        weight_materialization: MaterializationClass::MlxOwned,
+    };
+    let up = executor.run_projection(&normed, w.uw, w.us, w.ub, &up_desc)?;
+
     let gated = primitives::gelu_tanh(&gate)?.multiply(&up)?;
-    let ffn_out = qmatmul(&gated, w.dw, w.ds, w.db)?;
+
+    let down_desc = QuantizedProjectionDescriptor {
+        family: ProjectionFamily::DownProj,
+        logical_in_features: arch.intermediate_size,
+        logical_out_features: arch.hidden_size,
+        bits: 4,
+        group_size: 64,
+        storage_dtype: StorageDtype::U32,
+        physical_weight_shape: vec![w.dw.shape()[0] as u32, w.dw.shape()[1] as u32],
+        layer_index: 0,
+        weight_materialization: MaterializationClass::MlxOwned,
+    };
+    let ffn_out = executor.run_projection(&gated, w.dw, w.ds, w.db, &down_desc)?;
+
     x.add(&ffn_out)
 }
 

@@ -532,6 +532,11 @@ impl ComputeEngine {
             max_output_tokens: budget.effective_output_token_ceiling,
             deadline_ms: budget.deadline.as_millis() as u64,
             request_id,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            seed: None,
+            stop_token_ids: vec![],
         };
 
         let handle = supervisor.start_generation(&payload).map_err(|e| {

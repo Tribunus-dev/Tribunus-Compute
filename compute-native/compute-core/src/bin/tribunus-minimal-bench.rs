@@ -6,11 +6,12 @@ use tribunus_compute_core::profiled_executor::{LoadedProfiledModel, ProfiledInfe
 
 fn main() {
     // Need to set this env var because we patched the manifest
-    unsafe { std::env::set_var("TRIBUNUS_SKIP_MANIFEST_HASH", "1"); }
+    unsafe {
+        std::env::set_var("TRIBUNUS_SKIP_MANIFEST_HASH", "1");
+    }
 
     let image_dir = Path::new("compute-native/models/qwen-compiled");
-    let model = LoadedProfiledModel::new(image_dir)
-        .expect("Failed to load model");
+    let model = LoadedProfiledModel::new(image_dir).expect("Failed to load model");
 
     let n_layers = model.reader.manifest.execution_plan.layers.len();
     let kv_caches: Vec<KvCache> = (0..n_layers)
@@ -42,7 +43,12 @@ fn main() {
     }
     let elapsed = start.elapsed();
     let tok_s = n_gen as f64 / elapsed.as_secs_f64();
-    println!("{} tokens in {:.2}s = {:.1} tok/s", n_gen, elapsed.as_secs_f64(), tok_s);
+    println!(
+        "{} tokens in {:.2}s = {:.1} tok/s",
+        n_gen,
+        elapsed.as_secs_f64(),
+        tok_s
+    );
 }
 
 fn argmax(logits: &[f32]) -> u32 {

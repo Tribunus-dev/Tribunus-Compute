@@ -185,7 +185,7 @@ fn main() -> Result<()> {
     let mut cache = model.init_cache();
     let eos_id = model.config.eos_token_id;
 
-    let mut gen = Generate {
+    let mut generator = Generate {
         model: &mut model,
         cache: &mut cache,
         temp: args.temp,
@@ -201,7 +201,7 @@ fn main() -> Result<()> {
     let gen_start = std::time::Instant::now();
     let mut first_token_time = None;
 
-    for (i, token_result) in gen.by_ref().take(args.max_tokens).enumerate() {
+    for (i, token_result) in generator.by_ref().take(args.max_tokens).enumerate() {
         let token = token_result?;
         let token_id: i32 = token.item();
 

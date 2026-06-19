@@ -100,7 +100,7 @@ impl Qwen2Attention {
 
         // Use MLX SDPA with additive mask — avoids materializing full attention matrix
         let mask_ref = mlx_rs::fast::ScaledDotProductAttentionMask::Array(mask);
-        let out = mlx_rs::fast::scaled_dot_product_attention(q, k, v, self.scale, Some(mask_ref))?;
+        let out = mlx_rs::fast::scaled_dot_product_attention(q, k, v, self.scale, Some(mask_ref), None)?;
 
         let out = out
             .transpose_axes(&[0, 2, 1, 3])?

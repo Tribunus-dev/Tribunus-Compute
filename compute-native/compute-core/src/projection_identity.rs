@@ -23,10 +23,11 @@ pub enum ProjectionFamily {
     GateProj,
     UpProj,
     DownProj,
+    LmHead,
 }
 
 impl ProjectionFamily {
-    /// Wire-format name, e.g. `"q_proj"`, `"gate_proj"`.
+    /// Wire-format name, e.g. "q_proj", "gate_proj".
     pub fn as_str(&self) -> &'static str {
         match self {
             ProjectionFamily::QProj => "q_proj",
@@ -36,6 +37,7 @@ impl ProjectionFamily {
             ProjectionFamily::GateProj => "gate_proj",
             ProjectionFamily::UpProj => "up_proj",
             ProjectionFamily::DownProj => "down_proj",
+            ProjectionFamily::LmHead => "lm_head",
         }
     }
 }
@@ -58,6 +60,7 @@ pub fn family_from_str(s: &str) -> Option<ProjectionFamily> {
         "gate_proj" => Some(ProjectionFamily::GateProj),
         "up_proj" => Some(ProjectionFamily::UpProj),
         "down_proj" => Some(ProjectionFamily::DownProj),
+        "lm_head" => Some(ProjectionFamily::LmHead),
         _ => None,
     }
 }
@@ -72,6 +75,7 @@ pub const PROJECTION_ORDER: &[ProjectionFamily] = &[
     ProjectionFamily::GateProj,
     ProjectionFamily::UpProj,
     ProjectionFamily::DownProj,
+    ProjectionFamily::LmHead,
 ];
 
 /// Return the deterministic invocation index for a projection family.

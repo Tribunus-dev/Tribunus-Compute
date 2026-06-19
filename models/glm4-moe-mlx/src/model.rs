@@ -232,7 +232,7 @@ where
         };
 
         let attn_output = scaled_dot_product_attention(
-            &q, &k, &v, mask, self.rope_theta,
+            &q, &k, &v, None, self.rope_theta, mask,
         )?;
 
         let attn_output = attn_output.reshape(&[B, T, -1])?;

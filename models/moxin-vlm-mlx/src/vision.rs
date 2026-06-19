@@ -120,7 +120,7 @@ impl Module<&Array> for ViTAttention {
             .transpose_axes(&[0, 2, 1, 3])?;
 
         // Bidirectional SDPA (no causal mask)
-        let output = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, None)?;
+        let output = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?;
 
         let output = output
             .transpose_axes(&[0, 2, 1, 3])?

@@ -10,6 +10,7 @@
 //! - [`WorkerSupervisor`]: aggregates all components, spawns event and watchdog threads
 
 use crate::contracts::RunInstrumentationContext;
+use crate::profiled_executor::{LoadedProfiledModel, ProfiledInferenceSession};
 use crate::engine_error::{EngineError, EngineErrorCode};
 use crate::engine_policy::{DeadlineGuard, ExecutionPolicy};
 use crate::streaming::{generation_channel, GenerationEvent, GenerationHandle, GenerationSender};
@@ -55,6 +56,7 @@ pub struct WorkerProcessControl {
     launched_at: Instant,
     exit_status: Mutex<Option<ExitStatus>>,
     killed: AtomicBool,
+    in_process: AtomicBool,
 }
 
 impl WorkerProcessControl {
@@ -66,6 +68,20 @@ impl WorkerProcessControl {
             launched_at: Instant::now(),
             exit_status: Mutex::new(None),
             killed: AtomicBool::new(false),
+            in_process: AtomicBool::new(false),
+        }
+    }
+
+    /// Create a control handle for in-process (no subprocess) mode.
+    /// `is_alive()` always returns `true`; `kill()` is a no-op.
+    pub fn new_in_process() -> Self {
+        Self {
+            child: Mutex::new(None),
+            pid: 0,
+            launched_at: Instant::now(),
+            exit_status: Mutex::new(None),
+            killed: AtomicBool::new(false),
+            in_process: AtomicBool::new(true),
         }
     }
 
@@ -80,6 +96,9 @@ impl WorkerProcessControl {
     /// Check whether the worker process is still alive by trying to reap.
     /// Returns `false` when the process has exited or was already reaped.
     pub fn is_alive(&self) -> bool {
+        if self.in_process.load(Ordering::Relaxed) {
+            return true;
+        }
         let mut guard = self.child.lock();
         match guard.as_mut() {
             Some(child) => match child.try_wait() {
@@ -677,6 +696,11 @@ pub struct WorkerSupervisor {
     pub event_reader_handle: Option<JoinHandle<()>>,
     pub watchdog_handle: Option<JoinHandle<()>>,
     pub diagnostics_handle: Option<JoinHandle<()>>,
+    /// In-process inference session (None = subprocess worker mode).
+    /// When `Some`, `start_generation` runs inference in-process.
+    pub in_process_session: Option<Arc<std::sync::Mutex<ProfiledInferenceSession>>>,
+    /// Model reference kept for in-process inference.
+    pub in_process_model: Option<Arc<LoadedProfiledModel>>,
 }
 
 impl WorkerSupervisor {
@@ -864,7 +888,64 @@ impl WorkerSupervisor {
             event_reader_handle: Some(event_reader_handle),
             watchdog_handle: Some(watchdog_handle),
             diagnostics_handle,
+            in_process_session: None,
+            in_process_model: None,
         })
+    }
+
+    // ── In-Process Constructor ──────────────────────────────────────────
+
+    /// Create a supervisor that runs inference in-process (no subprocess worker).
+    ///
+    /// The model and inference session are held in-process; `start_generation`
+    /// dispatches directly to `ProfiledInferenceSession` instead of sending
+    /// IPC commands. All other methods (`cancel_generation`, `unload_model`,
+    /// etc.) behave as no-ops or return sensible defaults for the in-process
+    /// case.
+    #[cfg(feature = "server")]
+    pub fn in_process(model: Arc<LoadedProfiledModel>) -> Self {
+        use crate::worker_memory::configure_mlx_memory_limits;
+        configure_mlx_memory_limits(6 << 30, 2 << 30); // 6 GiB active, 2 GiB cache
+
+        // Build KV caches and session from the loaded model.
+        let kv_caches = crate::server::routes::build_kv_caches(&model);
+        let mut session = ProfiledInferenceSession::new("in-process".into(), kv_caches);
+        session.setup_from_model(&model);
+        let session = Arc::new(std::sync::Mutex::new(session));
+
+        let runtime_state = Arc::new(WorkerRuntimeState::new("in-process".into()));
+        runtime_state.set_model_loaded();
+        let registry = Arc::new(ActiveRequestRegistry::new());
+        let diagnostics = Arc::new(WorkerDiagnosticsCollector::new(65536));
+        let process_ctrl = Arc::new(WorkerProcessControl::new_in_process());
+        let telemetry = RunInstrumentationContext::new(256);
+        let policy = crate::engine_policy::qualification_policy();
+
+        // Create a stub command writer (writes go to /dev/null, never read).
+        // In-process mode branches before touching cmd_writer in start_generation,
+        // but other methods like unload_model reference it harmlessly.
+        // Spawn a stub process to get a ChildStdin that will never be written to.
+        let stub_child = std::process::Command::new("true")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("failed to spawn stub child for in-process mode");
+        let stdin = stub_child.stdin.unwrap();
+        let cmd_writer = Arc::new(WorkerCommandWriter::new(stdin, "in-process".into()));
+
+        Self {
+            process_ctrl,
+            cmd_writer,
+            runtime_state,
+            registry,
+            diagnostics,
+            telemetry,
+            policy,
+            event_reader_handle: None,
+            watchdog_handle: None,
+            diagnostics_handle: None,
+            in_process_session: Some(session),
+            in_process_model: Some(model),
+        }
     }
 
     // ── Load Model ───────────────────────────────────────────────────────
@@ -982,6 +1063,110 @@ impl WorkerSupervisor {
         // events dispatched before command send returns.
         self.registry.insert(active);
 
+        // ── In-process dispatch ───────────────────────────────────────
+        if let Some(ref session) = self.in_process_session {
+            let session = Arc::clone(session);
+            let model = Arc::clone(
+                self.in_process_model
+                    .as_ref()
+                    .expect("in_process_model must be Some when in_process_session is Some"),
+            );
+            let registry = Arc::clone(&self.registry);
+            let rid = request_id.clone();
+            let rid_for_disconnect = rid.clone();
+            let prompt = request.prompt_token_ids.clone();
+            let max_tokens = request.max_output_tokens;
+
+            std::thread::Builder::new()
+                .name(format!("inproc-gen-{rid}"))
+                .spawn(move || {
+                    let mut sess = match session.lock() {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    };
+
+                    // Send Started event.
+                    {
+                        let guard = registry.requests.lock();
+                        if let Some(active) = guard.get(&rid) {
+                            let _ = active.stream_sender.try_send(GenerationEvent::Started);
+                        }
+                    }
+
+                    // Run prefill.
+                    let first_token = match sess.prefill(&prompt, &model) {
+                        Ok(tok) => tok,
+                        Err(e) => {
+                            registry.mark_terminal(
+                                &rid,
+                                GenerationEvent::Error(format!("{e}")),
+                            );
+                            return;
+                        }
+                    };
+
+                    // Send first token.
+                    {
+                        let guard = registry.requests.lock();
+                        if let Some(active) = guard.get(&rid) {
+                            let _ =
+                                active.stream_sender.try_send(GenerationEvent::Token(first_token));
+                        }
+                    }
+
+                    // Decode loop.
+                    let mut current = first_token;
+                    for _ in 1..max_tokens {
+                        // Check for cancellation before each decode step.
+                        {
+                            let guard = registry.requests.lock();
+                            if let Some(active) = guard.get(&rid) {
+                                if active.cancellation_requested.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                            }
+                        }
+
+                        match sess.decode_one(current, &model) {
+                            Ok(tok) => {
+                                current = tok;
+                                let guard = registry.requests.lock();
+                                if let Some(active) = guard.get(&rid) {
+                                    if active
+                                        .stream_sender
+                                        .try_send(GenerationEvent::Token(tok))
+                                        .is_err()
+                                    {
+                                        break; // Consumer disconnected.
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+
+                    registry.mark_terminal(&rid, GenerationEvent::Done);
+                })
+                .expect("failed to spawn in-process inference thread");
+
+            let mut handle = GenerationHandle::new(public_job_id, stream);
+
+            // Wire disconnect detection.
+            if let Some(disconnect_rx) = handle.stream.take_disconnect_notifier() {
+                let registry = Arc::clone(&self.registry);
+                std::thread::Builder::new()
+                    .name(format!("disconnect-watcher-{rid_for_disconnect}"))
+                    .spawn(move || {
+                        let _ = disconnect_rx.blocking_recv();
+                        registry.request_cancellation(&rid_for_disconnect);
+                    })
+                    .ok();
+            }
+
+            return Ok(handle);
+        }
+
+        // ── Subprocess IPC dispatch ────────────────────────────────────
         let payload = serde_json::to_value(request).map_err(|e| {
             EngineError::new(
                 EngineErrorCode::InternalInvariantViolation,
@@ -1553,6 +1738,11 @@ mod tests {
             max_output_tokens: 8,
             deadline_ms: 30_000,
             request_id: request_id.to_string(),
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            seed: None,
+            stop_token_ids: vec![],
         }
     }
 

@@ -224,8 +224,9 @@ where
             &query,
             &key,
             &value,
-            mask.copied(),
-            SdpaMask::Causal,
+            None,
+            1.0 / (self.head_dim as f32).sqrt(),
+            Some(SdpaMask::Causal),
         )?;
 
         // Reshape and project

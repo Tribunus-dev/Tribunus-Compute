@@ -178,7 +178,7 @@ impl Module<&Array> for PostNetLayer {
             .transpose_axes(&[0, 2, 1, 3])?;
 
         let scale = (self.head_dim as f32).powf(-0.5);
-        let attn = mlx_rs::fast::scaled_dot_product_attention(q, k, v, scale, None)?;
+        let attn = mlx_rs::fast::scaled_dot_product_attention(q, k, v, scale, None, None)?;
 
         let attn = attn
             .transpose_axes(&[0, 2, 1, 3])?

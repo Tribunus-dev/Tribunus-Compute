@@ -23,6 +23,8 @@ use crate::profiled_executor::{AudioInput, LoadedProfiledModel, ProfiledInferenc
 use crate::profiled_executor::{ImageInput, MultiModalInput, VideoInput};
 use crate::generation::text_to_speech::{base64_encode, pcm_to_wav};
 use crate::profiled_executor::EmbedPoolStrategy;
+use crate::readiness_gates::ReadinessGates;
+use crate::tokenizer::TribunusTokenizer;
 use crate::server::auth::ApiKeyValidator;
 use crate::server::benchmark::SystemBenchmark;
 use crate::server::models::{ModelEntry, ModelRegistry};
@@ -33,6 +35,8 @@ use crate::model_cache::{ModelCache, ModelSource, ModelType};
 use crate::exo::NodeInfo;
 use crate::metrics::{CacheKind, InferenceTelemetry};
 use crate::lora::{self, LoraAdapter, AdapterInfo};
+use crate::worker_supervisor::WorkerSupervisor;
+use crate::worker_protocol::StartGenerationPayload;
 use crate::server::rate_limiter::RateLimiter;
 use crate::tools::{self, ToolDefinition, ToolCallResult};
 use crate::editing::{self, KnowledgeEditor, EditRequest, EditBatchRequest, AuditRequest, AuditItem};
@@ -57,8 +61,12 @@ pub struct AppState {
     pub benchmark: Arc<Mutex<Option<SystemBenchmark>>>,
     /// Model cache for dynamic model loading/unloading.
     pub model_cache: Arc<Mutex<ModelCache>>,
-    /// Per-request inference session.
-    pub session: Arc<tokio::sync::Mutex<Option<ProfiledInferenceSession>>>,
+    /// Inference worker supervisor — manages worker process lifecycle.
+    pub supervisor: Option<Arc<WorkerSupervisor>>,
+    /// Real tokenizer for encoding prompts to token IDs.
+    pub tokenizer: Option<Arc<TribunusTokenizer>>,
+    /// Readiness gates — determines whether /v1/chat/completions is available.
+    pub gates: Arc<Mutex<ReadinessGates>>,
     /// EXO cluster node (only set when --exo is enabled).
     pub exo_node: Option<Arc<tokio::sync::Mutex<ExoNode>>>,
     /// Production telemetry aggregator (atomic internals, no lock needed).
@@ -77,6 +85,17 @@ pub struct AppState {
     pub admin_request_registry: Arc<Mutex<HashMap<String, ActiveRequestInfo>>>,
     /// Set of request IDs that have been cancelled via the admin API.
     pub admin_cancelled_requests: Arc<Mutex<HashSet<String>>>,
+}
+
+/// Tokenize a prompt string using the app state's tokenizer if available.
+fn tokenize_prompt(state: &AppState, text: &str) -> Vec<u32> {
+    if let Some(ref tok) = state.tokenizer {
+        match tok.encode(text) {
+            Ok(ids) => return ids,
+            Err(e) => log_error!("tokenizer encode failed: {}, falling back to byte tokenizer", e),
+        }
+    }
+    text.bytes().map(|b| b as u32).collect()
 }
 
 pub fn create_router(state: AppState) -> Router {
@@ -110,6 +129,7 @@ pub fn create_router(state: AppState) -> Router {
 
     Router::new()
         .route("/health", get(health))
+        .route("/ready", get(readiness))
         .route("/api/tags", get(list_models))
         .route("/api/models/{id}", get(get_model))
         .route("/api/benchmark", get(get_benchmark))
@@ -176,9 +196,9 @@ fn cluster_node_count() -> usize {
 async fn health(
     State(state): State<AppState>,
 ) -> (StatusCode, JsonResponse<serde_json::Value>) {
-    let model_loaded = state.session.lock().await.is_some();
+    let worker_alive = state.supervisor.as_ref().map_or(false, |s| s.process_ctrl.is_alive());
     let cache = state.model_cache.lock().await;
-    let is_healthy = model_loaded || cache.has_any();
+    let is_healthy = worker_alive || cache.has_any();
 
     let status = if is_healthy { "ok" } else { "loading" };
     let status_code = if is_healthy { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
@@ -203,7 +223,7 @@ async fn health(
             "memory_usage_pct": mem_pct,
         },
         "model": {
-            "loaded": model_loaded,
+            "worker_alive": worker_alive,
             "cache_entries": cache.entry_count(),
             "cache_usage_mb": cache.used_memory_bytes / 1_048_576,
         },
@@ -218,6 +238,27 @@ async fn health(
     }));
 
     (status_code, response)
+}
+
+/// `/ready` — reports readiness gate status. Returns 200 when all gates pass.
+async fn readiness(
+    State(state): State<AppState>,
+) -> (StatusCode, JsonResponse<serde_json::Value>) {
+    let gates = state.gates.lock().await;
+    let ready = gates.ready_for_inference();
+
+    let gates_json: Vec<serde_json::Value> = gates.gate_states().iter().map(|g| serde_json::json!({
+        "name": g.name,
+        "status": g.status,
+        "detail": g.detail,
+    })).collect();
+
+    let status = if ready { "ready" } else { "not_ready" };
+    let status_code = if ready { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    (status_code, JsonResponse(serde_json::json!({
+        "status": status,
+        "gates": gates_json,
+    })))
 }
 
 /// Middleware: require a valid Bearer token for /v1/* routes.
@@ -836,31 +877,84 @@ async fn handle_streaming_chat(
         }
     }
 
-    // ── Parse sampler config ───────────────────────────────────────────
-    let sampler_config = parse_response_format_from_model(&body, &model_arc).await;
+    // ── Tokenize prompt ──────────────────────────
+    let prompt_tokens: Vec<u32> = prompt.bytes().map(|b| b as u32).collect();
 
-    // ── Create a fresh session for streaming ───────────────────────────
-    let kv_caches = build_kv_caches(&model_arc);
-    let mut sess = ProfiledInferenceSession::new("server".into(), kv_caches);
-    sess.setup_from_model(&model_arc);
-    sess.generated_tokens.clear();
-    sess.phase = InferenceSessionState::Created;
+    // ── Dispatch to inference worker ────────────
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let payload = StartGenerationPayload {
+        prompt_token_ids: prompt_tokens,
+        max_output_tokens: max_tokens as u32,
+        deadline_ms: now_ms + 300_000,
+        request_id: request_id.clone(),
+        temperature: None,
+        top_k: None,
+        top_p: None,
+        seed: None,
+        stop_token_ids: Vec::new(),
+    };
+
+    let supervisor = match state.supervisor.as_ref() {
+        Some(s) => s,
+        None => {
+            return JsonResponse(serde_json::json!({
+                "error": "no worker supervisor available"
+            })).into_response();
+        }
+    };
+    let mut handle = match supervisor.start_generation(&payload) {
+        Ok(h) => h,
+        Err(e) => {
+            return JsonResponse(serde_json::json!({
+                "error": format!("inference dispatch failed: {e}")
+            })).into_response();
+        }
+    };
 
     // ── Create channel and spawn streaming generation ──────────────────
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(64);
-    let config = StreamConfig::default();
 
-    // Run generation in block_in_place so decode_one (blocking MLX) works.
-    // Tokens are batched into SSE events by stream_generate and buffered
-    // in the channel. On handler return the SSE response streams them out.
+    // Spawn blocking thread to collect worker events and forward as SSE.
     tokio::task::block_in_place(|| {
         let rt = tokio::runtime::Handle::current();
         let _ = rt.block_on(async {
-            stream_generate(
-                &mut sess, &model_arc, &prompt, &image_inputs, &audio_inputs, &video_inputs,
-                max_tokens, sampler_config, &config, tx,
-            )
-            .await
+            loop {
+                match handle.stream.recv() {
+                    Some(crate::streaming::GenerationEvent::Token(tok)) => {
+                        let text: String = std::iter::once(
+                            char::from_u32(tok).unwrap_or(char::REPLACEMENT_CHARACTER)
+                        ).collect();
+                        if tx.send(Ok(Event::default().data(text))).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(crate::streaming::GenerationEvent::Chunk(chunk)) => {
+                        if tx.send(Ok(Event::default().data(chunk))).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(crate::streaming::GenerationEvent::Done) => {
+                        let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
+                        break;
+                    }
+                    Some(crate::streaming::GenerationEvent::Error(msg)) => {
+                        let _ = tx.send(Ok(Event::default().data(
+                            format!("{{\"error\":\"{msg}\"}}")
+                        ))).await;
+                        break;
+                    }
+                    Some(crate::streaming::GenerationEvent::Cancelled) => {
+                        let _ = tx.send(Ok(Event::default().data("[CANCELLED]"))).await;
+                        break;
+                    }
+                    _ => continue,
+                }
+            }
     });
     });
 
@@ -1011,42 +1105,73 @@ async fn v1_chat_completions(
                 .unwrap_or((String::new(), Vec::new()));
             let audio_inputs = extract_audio_inputs(messages);
             let video_inputs = extract_video_inputs(messages);
+            let prompt_tokens: Vec<u32> = tokenize_prompt(&state, &prompt);
 
-            // Lock the session mutex and reset for this request.
-            let mut guard = state.session.lock().await;
-            let sess = match guard.as_mut() {
+            // ── Dispatch to inference worker ────────────
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+
+            let payload = StartGenerationPayload {
+                prompt_token_ids: prompt_tokens.clone(),
+                max_output_tokens: max_tokens as u32,
+                deadline_ms: now_ms + 300_000,
+                request_id: request_id.clone(),
+                temperature: body.get("temperature").and_then(|v| v.as_f64()).map(|v| v as f32),
+                top_k: body.get("top_k").and_then(|v| v.as_u64()).map(|v| v as u32),
+                top_p: body.get("top_p").and_then(|v| v.as_f64()).map(|v| v as f32),
+                seed: body.get("seed").and_then(|v| v.as_u64()),
+                stop_token_ids: vec![],
+            };
+
+            let supervisor = match state.supervisor.as_ref() {
                 Some(s) => s,
-        None => {
-            return JsonResponse(serde_json::json!({
-                        "error": "no session available"
-            }));
+                None => {
+                    return JsonResponse(serde_json::json!({
+                        "error": "no worker supervisor available"
+                    }));
                 }
-        };
+            };
+            let mut handle = match supervisor.start_generation(&payload) {
+                Ok(h) => h,
+                Err(e) => {
+                    return JsonResponse(serde_json::json!({
+                        "error": format!("inference dispatch failed: {e}")
+                    }));
+                }
+            };
 
-            // Reset: rebuild KV caches from the model, create a fresh session.
-            let kv_caches = build_kv_caches(&model_arc);
-            let mut new_sess = ProfiledInferenceSession::new("server".into(), kv_caches);
-            new_sess.setup_from_model(&model_arc);
-            new_sess.generated_tokens.clear();
-            new_sess.phase = InferenceSessionState::Created;
-            *sess = new_sess;
+            // ── Collect generated tokens (blocking) ─────
+            let generated = tokio::task::block_in_place(|| {
+                let mut tokens: Vec<u32> = Vec::new();
+                loop {
+                    match handle.stream.recv() {
+                        Some(crate::streaming::GenerationEvent::Token(tok)) => tokens.push(tok),
+                        Some(crate::streaming::GenerationEvent::Done) => break,
+                        Some(crate::streaming::GenerationEvent::Error(msg)) => return Err(msg),
+                        Some(crate::streaming::GenerationEvent::Cancelled) => {
+                            return Err("generation cancelled".to_string());
+                        }
+                        _ => continue,
+                    }
+                }
+                Ok(tokens)
+            });
 
-            // Run inference (blocking MLX work).
-            let output_text = tokio::task::block_in_place(|| {
-                run_inference(sess, &model_arc, &prompt, &image_inputs, &audio_inputs, &video_inputs, max_tokens, sampler_config, Some(state.telemetry.as_ref()))
-        });
-
-            let output_text = match output_text {
+            let tokens = match generated {
                 Ok(t) => t,
                 Err(e) => {
-            return JsonResponse(serde_json::json!({
+                    return JsonResponse(serde_json::json!({
                         "error": e
-            }));
+                    }));
                 }
-        };
+            };
 
-            let prompt_tokens_count = prompt.bytes().len() as u64;
-            let completion_tokens_count = output_text.len() as u64;
+            let output_text = detokenize(&tokens);
+            let prompt_tokens_count = prompt_tokens.len() as u64;
+            let completion_tokens_count = tokens.len() as u64;
 
             // If the request includes tools (function calling), attempt to
             // parse and repair the output as a function call.
@@ -1056,7 +1181,7 @@ async fn v1_chat_completions(
                         ToolCallResult::Valid(call) | ToolCallResult::Repaired(call, _) => {
                             // Execute the tool call and return a tool_calls response.
                             match tools::execute_tool_call(&call) {
-                                Ok(tool_result) => {
+                                Ok(_tool_result) => {
                                     // Return the tool call in OpenAI format.
                                     return JsonResponse(serde_json::json!({
                                         "id": format!("chatcmpl-{:x}", rand_hex()),
@@ -1086,88 +1211,182 @@ async fn v1_chat_completions(
                                     }));
                                 }
                                 Err(exec_err) => {
-                                    // Tool execution failed; retry with error context.
-                                    let retry = tools::retry_with_error(
-                                        sess, &model_arc, messages, &exec_err, &tool, max_tokens,
-                                    );
-                                    return match retry {
-                                        Ok(ToolCallResult::Valid(c) | ToolCallResult::Repaired(c, _)) => {
-                                            JsonResponse(serde_json::json!({
-                                                "id": format!("chatcmpl-{:x}", rand_hex()),
-                                                "object": "chat.completion",
-                                                "model": model_name,
-                                                "choices": [{
-                                                    "index": 0,
-                                                    "message": {
-                                                        "role": "assistant",
-                                                        "content": null,
-                                                        "tool_calls": [{
-                                                            "id": format!("call_{:x}", rand_hex()),
-                                                            "type": "function",
-                                                            "function": {
-                                                                "name": c.name,
-                                                                "arguments": serde_json::to_string(&c.arguments).unwrap_or_default()
-                                                            }
-                                                        }]
-                                                    },
-                                                    "finish_reason": "tool_calls"
-                                                }],
-                                                "usage": {
-                                                    "prompt_tokens": prompt_tokens_count,
-                                                    "completion_tokens": completion_tokens_count,
-                                                    "total_tokens": prompt_tokens_count + completion_tokens_count
-                                                }
-                                            }))
-                                        }
-                                        Ok(ToolCallResult::Unrepairable(retry_err)) | Err(retry_err) => {
-                                            JsonResponse(serde_json::json!({
-                                                "error": format!("tool call failed after retry: {retry_err}")
-                                            }))
+                                    // Tool execution failed; retry with second worker generation.
+                                    let retry_supervisor = match state.supervisor.as_ref() {
+                                        Some(s) => s,
+                                        None => {
+                                            return JsonResponse(serde_json::json!({
+                                                "error": "no worker supervisor available"
+                                            }));
                                         }
                                     };
+                                    let retry_prompt = format!(
+                                        "{}\n{}\nError: {}",
+                                        prompt, output_text, exec_err
+                                    );
+                                    let retry_tokens: Vec<u32> = tokenize_prompt(&state, &retry_prompt);
+                                    let retry_payload = StartGenerationPayload {
+                                        prompt_token_ids: retry_tokens,
+                                        max_output_tokens: max_tokens as u32,
+                                        deadline_ms: now_ms + 300_000,
+                                        request_id: uuid::Uuid::new_v4().to_string(),
+                                        temperature: None,
+                                        top_k: None,
+                                        top_p: None,
+                                        seed: None,
+                                        stop_token_ids: Vec::new(),
+                                    };
+                                    match retry_supervisor.start_generation(&retry_payload) {
+                                        Ok(mut retry_handle) => {
+                                            let retry_gen = tokio::task::block_in_place(|| {
+                                                let mut retry_toks: Vec<u32> = Vec::new();
+                                                loop {
+                                                    match retry_handle.stream.recv() {
+                                                        Some(crate::streaming::GenerationEvent::Token(tok)) => retry_toks.push(tok),
+                                                        Some(crate::streaming::GenerationEvent::Done) => break,
+                                                        Some(crate::streaming::GenerationEvent::Error(msg)) => return Err(msg),
+                                                        Some(crate::streaming::GenerationEvent::Cancelled) => return Err("generation cancelled".to_string()),
+                                                        _ => continue,
+                                                    }
+                                                }
+                                                Ok(retry_toks)
+                                            });
+                                            match retry_gen {
+                                                Ok(retry_toks) => {
+                                                    let retry_text = detokenize(&retry_toks);
+                                                    match tools::parse_and_repair(&retry_text, &tool) {
+                                                        ToolCallResult::Valid(c) | ToolCallResult::Repaired(c, _) => {
+                                                            return JsonResponse(serde_json::json!({
+                                                                "id": format!("chatcmpl-{:x}", rand_hex()),
+                                                                "object": "chat.completion",
+                                                                "model": model_name,
+                                                                "choices": [{
+                                                                    "index": 0,
+                                                                    "message": {
+                                                                        "role": "assistant",
+                                                                        "content": null,
+                                                                        "tool_calls": [{
+                                                                            "id": format!("call_{:x}", rand_hex()),
+                                                                            "type": "function",
+                                                                            "function": {
+                                                                                "name": c.name,
+                                                                                "arguments": serde_json::to_string(&c.arguments).unwrap_or_default()
+                                                                            }
+                                                                        }]
+                                                                    },
+                                                                    "finish_reason": "tool_calls"
+                                                                }],
+                                                                "usage": {
+                                                                    "prompt_tokens": prompt_tokens_count,
+                                                                    "completion_tokens": completion_tokens_count,
+                                                                    "total_tokens": prompt_tokens_count + completion_tokens_count
+                                                                }
+                                                            }))
+                                                        }
+                                                        _ => return JsonResponse(serde_json::json!({
+                                                            "error": format!("tool call failed after retry: {exec_err}")
+                                                        })),
+                                                    }
+                                                }
+                                                Err(retry_err) => return JsonResponse(serde_json::json!({
+                                                    "error": format!("tool call failed after retry: {retry_err}")
+                                                })),
+                                            }
+                                        }
+                                        Err(e) => return JsonResponse(serde_json::json!({
+                                            "error": format!("tool call retry dispatch failed: {e}")
+                                        })),
+                                    }
                                 }
                             }
                         }
                         ToolCallResult::Unrepairable(err) => {
                             // Cannot repair; retry generation with error context.
-                            let retry = tools::retry_with_error(
-                                sess, &model_arc, messages, &err, &tool, max_tokens,
-                            );
-                            return match retry {
-                                Ok(ToolCallResult::Valid(c) | ToolCallResult::Repaired(c, _)) => {
-                                    JsonResponse(serde_json::json!({
-                                        "id": format!("chatcmpl-{:x}", rand_hex()),
-                                        "object": "chat.completion",
-                                        "model": model_name,
-                                        "choices": [{
-                                            "index": 0,
-                                            "message": {
-                                                "role": "assistant",
-                                                "content": null,
-                                                "tool_calls": [{
-                                                    "id": format!("call_{:x}", rand_hex()),
-                                                    "type": "function",
-                                                    "function": {
-                                                        "name": c.name,
-                                                        "arguments": serde_json::to_string(&c.arguments).unwrap_or_default()
-                                                    }
-                                                }]
-                                            },
-                                            "finish_reason": "tool_calls"
-                                        }],
-                                        "usage": {
-                                            "prompt_tokens": prompt_tokens_count,
-                                            "completion_tokens": completion_tokens_count,
-                                            "total_tokens": prompt_tokens_count + completion_tokens_count
-                                        }
-                                    }))
-                                }
-                                Ok(ToolCallResult::Unrepairable(retry_err)) | Err(retry_err) => {
-                                    JsonResponse(serde_json::json!({
-                                        "error": format!("tool call failed after retry: {retry_err}")
-                                    }))
+                            let retry_supervisor = match state.supervisor.as_ref() {
+                                Some(s) => s,
+                                None => {
+                                    return JsonResponse(serde_json::json!({
+                                        "error": "no worker supervisor available"
+                                    }));
                                 }
                             };
+                            let retry_prompt = format!(
+                                "{}\n{}\nError: {}",
+                                prompt, output_text, err
+                            );
+                            let retry_tokens: Vec<u32> = tokenize_prompt(&state, &retry_prompt);
+                            let retry_payload = StartGenerationPayload {
+                                prompt_token_ids: retry_tokens,
+                                max_output_tokens: max_tokens as u32,
+                                deadline_ms: now_ms + 300_000,
+                                request_id: uuid::Uuid::new_v4().to_string(),
+                                temperature: None,
+                                top_k: None,
+                                top_p: None,
+                                seed: None,
+                                stop_token_ids: Vec::new(),
+                            };
+                            match retry_supervisor.start_generation(&retry_payload) {
+                                Ok(mut retry_handle) => {
+                                    let retry_gen = tokio::task::block_in_place(|| {
+                                        let mut retry_toks: Vec<u32> = Vec::new();
+                                        loop {
+                                            match retry_handle.stream.recv() {
+                                                Some(crate::streaming::GenerationEvent::Token(tok)) => retry_toks.push(tok),
+                                                Some(crate::streaming::GenerationEvent::Done) => break,
+                                                Some(crate::streaming::GenerationEvent::Error(msg)) => return Err(msg),
+                                                Some(crate::streaming::GenerationEvent::Cancelled) => return Err("generation cancelled".to_string()),
+                                                _ => continue,
+                                            }
+                                        }
+                                        Ok(retry_toks)
+                                    });
+                                    match retry_gen {
+                                        Ok(retry_toks) => {
+                                            let retry_text = detokenize(&retry_toks);
+                                            match tools::parse_and_repair(&retry_text, &tool) {
+                                                ToolCallResult::Valid(c) | ToolCallResult::Repaired(c, _) => {
+                                                    return JsonResponse(serde_json::json!({
+                                                        "id": format!("chatcmpl-{:x}", rand_hex()),
+                                                        "object": "chat.completion",
+                                                        "model": model_name,
+                                                        "choices": [{
+                                                            "index": 0,
+                                                            "message": {
+                                                                "role": "assistant",
+                                                                "content": null,
+                                                                "tool_calls": [{
+                                                                    "id": format!("call_{:x}", rand_hex()),
+                                                                    "type": "function",
+                                                                    "function": {
+                                                                        "name": c.name,
+                                                                        "arguments": serde_json::to_string(&c.arguments).unwrap_or_default()
+                                                                    }
+                                                                }]
+                                                            },
+                                                            "finish_reason": "tool_calls"
+                                                        }],
+                                                        "usage": {
+                                                            "prompt_tokens": prompt_tokens_count,
+                                                            "completion_tokens": completion_tokens_count,
+                                                            "total_tokens": prompt_tokens_count + completion_tokens_count
+                                                        }
+                                                    }))
+                                                }
+                                                _ => return JsonResponse(serde_json::json!({
+                                                    "error": format!("tool call failed after retry: {err}")
+                                                })),
+                                            }
+                                        }
+                                        Err(retry_err) => return JsonResponse(serde_json::json!({
+                                            "error": format!("tool call failed after retry: {retry_err}")
+                                        })),
+                                    }
+                                }
+                                Err(e) => return JsonResponse(serde_json::json!({
+                                    "error": format!("tool call retry dispatch failed: {e}")
+                                })),
+                            }
                         }
                     },
                     Err(e) => {
@@ -1179,10 +1398,12 @@ async fn v1_chat_completions(
             }
 
             // Standard non-tool response.
+            let route_profile = crate::projection_executor::drain_route_receipts();
             JsonResponse(serde_json::json!({
                 "id": format!("chatcmpl-{:x}", rand_hex()),
                 "object": "chat.completion",
                 "model": model_name,
+                "route_profile": route_profile,
                 "choices": [{
                     "index": 0,
                     "message": {
@@ -1248,53 +1469,85 @@ async fn v1_completions(
         }
     };
 
-    let mut guard = state.session.lock().await;
-    let sess = match guard.as_mut() {
+
+    // ── Check if supervisor is available ──────────────────────────
+    let supervisor = match state.supervisor.as_ref() {
         Some(s) => s,
         None => {
             return JsonResponse(serde_json::json!({
-                "error": "no session available"
+                "error": "no inference worker available"
             }));
         }
     };
 
-    // Reset: rebuild KV caches, create fresh session.
-    let kv_caches = build_kv_caches(&model_arc);
-    let mut new_sess = ProfiledInferenceSession::new("server".into(), kv_caches);
-    new_sess.setup_from_model(&model_arc);
-    new_sess.generated_tokens.clear();
-    new_sess.phase = InferenceSessionState::Created;
-    *sess = new_sess;
+    // ── Tokenize prompt ──────────────────────────────────────────────
+    let prompt_tokens: Vec<u32> = tokenize_prompt(&state, &prompt);
 
-    let output_text = tokio::task::block_in_place(|| {
-        run_inference(sess, &model_arc, &prompt, &[], &[], &[], max_tokens, SamplerConfig {
-            temperature: None,
-            top_k: Some(1),
-            top_p: None,
-            repetition_penalty: None,
-            seed: None,
-            stop_token_ids: Vec::new(),
-            grammar: None,
-            grammar_tokenizer: None,
-        }, Some(state.telemetry.as_ref()))
-    });
+    // ── Dispatch to inference worker ──────────────────────────────
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let payload = crate::worker_protocol::StartGenerationPayload {
+        prompt_token_ids: prompt_tokens,
+        max_output_tokens: max_tokens as u32,
+        deadline_ms: now_ms + 300_000,
+        request_id: request_id.clone(),
+        temperature: body.get("temperature").and_then(|v| v.as_f64()).map(|v| v as f32),
+        top_k: body.get("top_k").and_then(|v| v.as_u64()).map(|v| v as u32),
+        top_p: body.get("top_p").and_then(|v| v.as_f64()).map(|v| v as f32),
+        seed: body.get("seed").and_then(|v| v.as_u64()),
+        stop_token_ids: vec![],
+    };
 
-    let output_text = match output_text {
-        Ok(t) => t,
+    let mut handle = match supervisor.start_generation(&payload) {
+        Ok(h) => h,
         Err(e) => {
             return JsonResponse(serde_json::json!({
-                "error": e
+                "error": format!("worker rejected request: {:?}", e)
             }));
         }
     };
+
+    let mut generated_tokens: Vec<u32> = Vec::new();
+    loop {
+        let event = handle.stream.recv();
+        match event {
+            Some(crate::streaming::GenerationEvent::Token(tok)) => {
+                generated_tokens.push(tok);
+            }
+            Some(crate::streaming::GenerationEvent::Done) => break,
+            Some(crate::streaming::GenerationEvent::Error(msg)) => {
+                return JsonResponse(serde_json::json!({
+                    "error": format!("generation error: {msg}")
+                }));
+            }
+            Some(crate::streaming::GenerationEvent::Cancelled) => {
+                return JsonResponse(serde_json::json!({
+                    "error": "generation cancelled"
+                }));
+            }
+            None => break,
+            _ => {} // ignore other events
+        }
+    }
+
+    let output_text: String = generated_tokens
+        .iter()
+        .filter(|t| **t >= 32 && **t <= 126)
+        .map(|t| *t as u8 as char)
+        .collect();
 
     let prompt_tokens_count = prompt.bytes().len() as u64;
     let completion_tokens_count = output_text.len() as u64;
 
+    let route_profile = crate::projection_executor::drain_route_receipts();
     JsonResponse(serde_json::json!({
         "id": format!("cmpl-{:x}", rand_hex()),
         "object": "text_completion",
         "model": model_name,
+        "route_profile": route_profile,
         "choices": [{
             "index": 0,
             "text": output_text,
@@ -1353,61 +1606,9 @@ async fn embeddings(
     let model_arc = state.model_cache.lock().await.get_or_load(model_name, source, Some(state.telemetry.as_ref()))
         .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, format!("embeddings: {e}")))?;
 
-    let mut guard = state.session.lock().await;
-    let sess = guard.as_mut().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "embeddings: no session".to_string(),
-    ))?;
-
-    // Build fresh KV caches for this embedding session
-    let kv_caches = build_kv_caches(&model_arc);
-    let mut new_sess = ProfiledInferenceSession::new("embed".into(), kv_caches);
-    new_sess.setup_from_model(&model_arc);
-    new_sess.generated_tokens.clear();
-    new_sess.phase = InferenceSessionState::Created;
-    *sess = new_sess;
-
-    // Process each input and collect embeddings
-    let mut embeddings_data: Vec<serde_json::Value> = Vec::with_capacity(inputs.len());
-    for (idx, input) in inputs.iter().enumerate() {
-        // Tokenize: byte-level fallback (same as run_inference)
-        let tokens: Vec<u32> = input.bytes().map(|b| b as u32).collect();
-
-        if tokens.is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("embeddings: empty input at index {}", idx),
-            ));
-        }
-
-        let embedding = tokio::task::block_in_place(|| {
-            sess.embed(&tokens, model_arc.as_ref(), EmbedPoolStrategy::Mean)
-        })
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("embeddings: {:?}", e),
-            )
-        })?;
-
-        embeddings_data.push(serde_json::json!({
-            "object": "embedding",
-            "index": idx,
-            "embedding": embedding,
-        }));
-    }
-
-    let total_tokens: usize = inputs.iter().map(|s| s.bytes().len()).sum();
-
-    Ok(JsonResponse(serde_json::json!({
-        "object": "list",
-        "data": embeddings_data,
-        "model": model_name,
-        "usage": {
-            "prompt_tokens": total_tokens,
-            "total_tokens": total_tokens,
-        },
-    })))
+    // Embeddings not yet supported through worker dispatch.
+    return Err((StatusCode::NOT_IMPLEMENTED,
+        "embeddings: not yet supported through worker dispatch".to_string()));
 }
 
 /// Quick random hex fragment for unique IDs.

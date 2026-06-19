@@ -143,7 +143,7 @@ impl AudioEncoder {
             match entry {
                 Some(e) => {
                     let (arr, _) = crate::profiled_executor::load_tensor_from_mapped_segment(
-                        segment, e,
+                        segment, e, false,
                     )
                     .map_err(|err| format!("load side tensor {}: {:?}", name, err))?;
                     Ok(crate::bridge::ARRAY_REGISTRY.write().insert(arr, None))
@@ -187,7 +187,7 @@ impl AudioEncoder {
                 .ok_or_else(|| format!("segment not found: {}", entry.segment))?;
 
             let (weight, _) = crate::profiled_executor::load_tensor_from_mapped_segment(
-                segment, entry,
+                segment, entry, false,
             )
             .map_err(|e| format!("load tensor {}: {:?}", name, e))?;
 
@@ -270,7 +270,7 @@ impl AudioEncoder {
                     .get(&entry.segment)
                     .ok_or_else(|| format!("segment not found: {}", entry.segment))?;
                 let (arr, _) = crate::profiled_executor::load_tensor_from_mapped_segment(
-                    segment, entry,
+                    segment, entry, false,
                 )
                 .map_err(|e| format!("load norm {}: {:?}", n_name, e))?;
                 Ok(arr)

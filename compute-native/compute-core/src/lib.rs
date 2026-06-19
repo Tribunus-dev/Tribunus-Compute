@@ -13,14 +13,21 @@ extern crate self as tribunus_compute_core;
 pub mod analysis;
 pub mod audio;
 pub mod autopsy;
+#[cfg(target_os = "macos")]
 pub mod ane;
+#[cfg(target_os = "macos")]
 pub mod ane_bridge;
+#[cfg(target_os = "macos")]
 pub mod arena;
+#[cfg(target_os = "macos")]
 pub mod arena_info;
+#[cfg(target_os = "macos")]
 pub mod arena_lifecycle;
+#[cfg(target_os = "macos")]
 pub mod arena_pool;
 pub mod attention;
 pub mod backend;
+#[cfg(target_os = "macos")]
 pub mod bridge;
 pub mod cache;
 pub mod capability;
@@ -36,10 +43,15 @@ pub mod compute_lane;
 pub mod compute_service;
 pub mod config;
 pub mod contracts;
+pub mod crash_breadcrumb;
 pub mod copy_ledger;
+#[cfg(target_os = "macos")]
 pub mod coreml_audit;
+#[cfg(target_os = "macos")]
 pub mod coreml_bridge;
+#[cfg(target_os = "macos")]
 pub mod coreml_pipeline;
+#[cfg(target_os = "macos")]
 pub mod coreml_state;
 pub mod cpu_benchmarks;
 pub mod decode_attribution;
@@ -70,6 +82,7 @@ pub mod lora;
 pub mod mapped_image;
 pub mod memory;
 pub mod metrics;
+#[cfg(target_os = "macos")]
 pub mod metal_capture;
 pub mod mil_builder;
 pub mod mlpackage;
@@ -91,11 +104,13 @@ pub mod primitives;
 pub mod profile_compiler;
 pub mod profiled_executor;
 pub mod projection_identity;
+pub mod projection_executor;
 pub mod projection_tests;
 pub mod quantization;
 pub mod quantized;
 pub mod receipt;
 pub mod ring;
+pub mod readiness_gates;
 pub mod receipts;
 pub mod replay_projection;
 pub mod requalification;
@@ -119,6 +134,7 @@ pub mod speculative;
 pub mod storage_adapters;
 pub mod storage_kernel;
 pub mod streaming;
+pub mod tokenizer;
 pub mod toolchain_attest;
 pub mod tools;
 pub mod transform_recipe;
@@ -126,6 +142,7 @@ pub mod treatment;
 pub mod validator;
 pub mod video;
 pub mod vision;
+pub mod worker_crash_ledger;
 pub mod worker_memory;
 pub mod worker_protocol;
 pub mod worker_supervisor;
@@ -134,6 +151,7 @@ pub use crate::session::{
     ControlSessionState, GenerationControlSession, InferenceSession, InferenceSessionState,
     SamplerConfig,
 };
+#[cfg(any(target_os = "macos", feature = "ane"))]
 pub use coreml_proto;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

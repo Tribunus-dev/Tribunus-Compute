@@ -323,7 +323,10 @@ fn generation_invalidated_on_release() {
     // Create a new tensor — if slot is reused, generation must differ
     let h2 = be.create_f32(&data, &[2, 2]).expect("create h2");
     if h2.slot == h.slot {
-        assert_ne!(h2.generation, generation, "reused slot generation must increment");
+        assert_ne!(
+            h2.generation, generation,
+            "reused slot generation must increment"
+        );
     }
 
     // The old handle must be rejected

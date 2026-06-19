@@ -76,7 +76,7 @@ fn main() {
     // Step 6: SDPA
     let scale = (head_dim as f32).powf(-0.5);
     let attn_out = mlx_rs::fast::scaled_dot_product_attention(
-        q_t, k_t, v_t, scale, None
+        q_t, k_t, v_t, scale, None, None
     ).unwrap();
     eval([&attn_out]).unwrap();
     stats("SDPA output", &attn_out);

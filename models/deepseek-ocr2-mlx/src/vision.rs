@@ -115,9 +115,9 @@ impl SamAttention {
             // SDPA with relative position bias as additive mask
             let bias = self.compute_rel_pos_bias(&q, h, w)?;
             let mask = mlx_rs::fast::ScaledDotProductAttentionMask::Array(&bias);
-            mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, Some(mask))?
+            mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, Some(mask), None)?
         } else {
-            mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, None)?
+            mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?
         };
 
         // [B, nH, H*W, hd] -> [B, H, W, C]

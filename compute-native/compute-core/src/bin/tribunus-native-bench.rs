@@ -40,7 +40,11 @@ fn main() {
 
     tribunus_compute_core::log_info!(
         "native-bench: M=1 K={} N={} group_size={} warmup={} iters={}",
-        k, n, group_size, warmup_iters, bench_iters
+        k,
+        n,
+        group_size,
+        warmup_iters,
+        bench_iters
     );
 
     let (weight, scales, biases) =
@@ -68,7 +72,11 @@ fn main() {
         let r = native_kernel::qmatvec_scalar(&x, &weight, &scales, &biases, k, n, group_size);
         let diff = native_kernel::max_abs_diff(&r.output, ref_out);
         if diff > 1e-5 {
-            tribunus_compute_core::log_warn!("WARN: scalar iter {} diverged: max_abs_diff={}", i, diff);
+            tribunus_compute_core::log_warn!(
+                "WARN: scalar iter {} diverged: max_abs_diff={}",
+                i,
+                diff
+            );
         }
         scalar_us.push(r.elapsed_us);
     }
@@ -77,7 +85,11 @@ fn main() {
         let r = native_kernel::qmatvec_auto(&x, &weight, &scales, &biases, k, n, group_size);
         let diff = native_kernel::max_abs_diff(&r.output, ref_out);
         if diff > 1e-5 {
-            tribunus_compute_core::log_warn!("WARN: auto iter {} diverged: max_abs_diff={}", i, diff);
+            tribunus_compute_core::log_warn!(
+                "WARN: auto iter {} diverged: max_abs_diff={}",
+                i,
+                diff
+            );
         }
         auto_us.push(r.elapsed_us);
     }
@@ -86,7 +98,11 @@ fn main() {
         let r = native_kernel::qmatvec_neon(&x, &weight, &scales, &biases, k, n, group_size);
         let diff = native_kernel::max_abs_diff(&r.output, ref_out);
         if diff > 1e-5 {
-            tribunus_compute_core::log_warn!("WARN: neon iter {} diverged: max_abs_diff={}", i, diff);
+            tribunus_compute_core::log_warn!(
+                "WARN: neon iter {} diverged: max_abs_diff={}",
+                i,
+                diff
+            );
         }
         neon_us.push(r.elapsed_us);
     }
@@ -95,7 +111,11 @@ fn main() {
         let r = native_kernel::qmatvec_neon_v2(&x, &weight, &scales, &biases, k, n, group_size);
         let diff = native_kernel::max_abs_diff(&r.output, ref_out);
         if diff > 1e-5 {
-            tribunus_compute_core::log_warn!("WARN: neon_v2 iter {} diverged: max_abs_diff={}", i, diff);
+            tribunus_compute_core::log_warn!(
+                "WARN: neon_v2 iter {} diverged: max_abs_diff={}",
+                i,
+                diff
+            );
         }
         neon2_us.push(r.elapsed_us);
     }

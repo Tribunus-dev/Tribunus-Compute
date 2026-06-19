@@ -69,13 +69,13 @@ fn main() -> anyhow::Result<()> {
             }
         }
     };
-    let gen = Generate::new(&mut model, temp, &prompt_tokens);
+    let generator = Generate::new(&mut model, temp, &prompt_tokens);
 
     let start = std::time::Instant::now();
     let mut token_count = 0;
     let mut ttft: Option<f64> = None;
 
-    for token_result in gen.take(max_tokens) {
+    for token_result in generator.take(max_tokens) {
         let token = token_result?;
         if ttft.is_none() {
             ttft = Some(start.elapsed().as_secs_f64());

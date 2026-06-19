@@ -232,7 +232,7 @@ impl DecoderTransformerLayer {
 
         let attn_out = mlx_rs::fast::scaled_dot_product_attention(
             q, k, v, scale,
-            mask.map(mlx_rs::fast::ScaledDotProductAttentionMask::Array),
+            mask.map(mlx_rs::fast::ScaledDotProductAttentionMask::Array), None
         )?
         .transpose_axes(&[0, 2, 1, 3])?
         .reshape(&[B, L, -1])?;

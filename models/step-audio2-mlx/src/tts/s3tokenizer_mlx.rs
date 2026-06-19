@@ -165,7 +165,7 @@ impl Module<&Array> for FSMNAttention {
         let v = v.reshape(&[batch, seq_len, self.num_heads, self.head_dim])?
             .transpose_axes(&[0, 2, 1, 3])?;
 
-        let attn_out = mlx_rs::fast::scaled_dot_product_attention(q, k, v, self.scale, None)?;
+        let attn_out = mlx_rs::fast::scaled_dot_product_attention(q, k, v, self.scale, None, None)?;
 
         let out = attn_out.transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[batch, seq_len, self.num_heads * self.head_dim])?;

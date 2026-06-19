@@ -162,6 +162,7 @@ impl Attention {
 
         let output = mlx_rs::fast::scaled_dot_product_attention(
             queries, keys, values, self.scale, sdpa_mask,
+            None,
         )?
         .transpose_axes(&[0, 2, 1, 3])?
         .reshape(&[B, L, -1])?;

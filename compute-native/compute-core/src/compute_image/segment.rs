@@ -7,6 +7,10 @@ use super::manifest::{
     QuantizedLinearBinding, TensorEntry,
 };
 use crate::projection_identity;
+use crate::projection_executor::{
+    ProjectionExecutor, QuantizedProjectionDescriptor,
+    MaterializationClass, StorageDtype, RuntimeMode,
+};
 use crate::session::SamplerConfig;
 use mlx_rs::Array;
 use std::collections::HashMap;
@@ -882,13 +886,48 @@ impl ImageRuntime {
                         "embed biases handle invalid at lm_head",
                     )
                 })?;
-            let gs = (ew.shape()[1] as i32 * 4) / es.shape()[1];
-            mlx_rs::ops::quantized_matmul(
-                &final_hidden, &ew, &es, &eb, true, gs, 8,
-            )
+            // Look up quantization metadata from the manifest tensor table.
+            let (_qbits, _qgroup_size, _storage_dtype_str) = {
+                let table = &self.manifest.tensor_table;
+                let entry = table.iter().find(|t| t.name == emb_w_name).ok_or_else(
+                    || {
+                        crate::Error::from_reason(
+                            "embed_tokens.weight not found in tensor table",
+                        )
+                    },
+                )?;
+                let q = entry.quantization.as_ref().ok_or_else(|| {
+                    crate::Error::from_reason(
+                        "embed_tokens.weight missing quantization descriptor",
+                    )
+                })?;
+                (q.bits as u8, q.group_size, entry.storage_dtype.clone())
+            };
+            let storage_dtype = match _storage_dtype_str.as_str() {
+                "U8" => StorageDtype::U8,
+                "I8" => StorageDtype::I8,
+                _ => StorageDtype::U32,
+            };
+            let w_shape: Vec<u32> = ew.shape().iter().map(|&d| d as u32).collect();
+            let desc = QuantizedProjectionDescriptor {
+                family: projection_identity::ProjectionFamily::LmHead,
+                logical_in_features: arch.hidden_size,
+                logical_out_features: arch.vocab_size,
+                bits: _qbits,
+                group_size: _qgroup_size,
+                storage_dtype,
+                physical_weight_shape: w_shape,
+                layer_index: 0,
+                weight_materialization: MaterializationClass::MlxOwned,
+            };
+            let executor = ProjectionExecutor {
+                mode: RuntimeMode::Safe,
+            };
+            executor
+                .run_projection(&final_hidden, &ew, &es, &eb, &desc)
             .map_err(|e| {
                 crate::Error::from_reason(format!(
-                    "lm_head matmul: {:?}",
+                    "lm_head projection: {:?}",
                     e
                 ))
             })?

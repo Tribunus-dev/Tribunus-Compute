@@ -22,6 +22,7 @@ use tokio::sync::Mutex;
 
 use crate::cache::evolkv::{CalibrationSet, EvolKV};
 use crate::server::routes::AppState;
+use crate::worker_supervisor::WorkerSupervisor;
 
 // ---------------------------------------------------------------------------
 // Request tracking
@@ -138,14 +139,15 @@ async fn admin_status(
 
     // ── Session ────────────────────────────────────────────────────────
     let sess_info = {
-        let guard = state.session.lock().await;
-        match &*guard {
-            Some(sess) => json!({
-                "active": true,
-                "phase": format!("{:?}", sess.phase),
-                "generated_tokens": sess.generated_tokens.len(),
+        match state.supervisor.as_ref() {
+            Some(sup) => json!({
+                "worker_pid": sup.process_ctrl.pid(),
+                "alive": sup.process_ctrl.is_alive(),
+                "active_requests": sup.registry.len(),
+                "model_loaded": sup.runtime_state.is_model_loaded(),
+                "faulted": sup.runtime_state.is_faulted(),
             }),
-            None => json!({"active": false}),
+            None => json!({"worker": false}),
         }
     };
 
@@ -231,21 +233,20 @@ async fn admin_sessions(
         })
         .collect();
     drop(registry);
+    let cancelled = state.admin_cancelled_requests.lock().await;
 
-    // Also report the bare session-state from the engine.
-    let guard = state.session.lock().await;
-    let engine_active = guard.is_some();
-    let engine_phase = match &*guard {
-        Some(sess) => format!("{:?}", sess.phase),
-        None => "idle".into(),
-    };
-    drop(guard);
+    // Report the worker state.
+    let (worker_pid, worker_alive, worker_faulted) = state.supervisor.as_ref()
+        .map(|s| (s.process_ctrl.pid(), s.process_ctrl.is_alive(), s.runtime_state.is_faulted()))
+        .unwrap_or((0, false, false));
 
     JsonResponse(json!({
         "sessions": sessions,
         "count": sessions.len(),
-        "engine_session_active": engine_active,
-        "engine_phase": engine_phase,
+        "worker_pid": worker_pid,
+        "worker_alive": worker_alive,
+        "worker_faulted": worker_faulted,
+        "cancelled_count": cancelled.len(),
     }))
 }
 

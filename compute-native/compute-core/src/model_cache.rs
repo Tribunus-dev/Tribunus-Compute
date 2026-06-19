@@ -658,6 +658,10 @@ impl ModelCache {
 /// Map well-known model names to their disk or HuggingFace sources.
 pub fn default_model_sources() -> HashMap<String, ModelSource> {
     let mut m = HashMap::new();
+        m.insert(
+        "qwen2.5:0.5b".into(),
+        ModelSource::ImageDir("compute-native/models/qwen-compiled".into()),
+    );
     m.insert(
         "gemma4".into(),
         ModelSource::ImageDir("compute-native/models/gemma4-compiled".into()),

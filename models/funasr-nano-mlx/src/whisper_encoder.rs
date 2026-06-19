@@ -113,7 +113,7 @@ impl Module<&Array> for WhisperAttention {
 
         // Scaled dot-product attention
         let attn_out = mlx_rs::fast::scaled_dot_product_attention(
-            q, k, v, self.scale, None,
+            q, k, v, self.scale, None, None,
         )?;
 
         // Reshape back to [B, L, dim]

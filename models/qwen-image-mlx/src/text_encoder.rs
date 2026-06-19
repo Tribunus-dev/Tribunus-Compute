@@ -237,14 +237,14 @@ impl TextAttention {
             // SDPA in MLX accepts mask directly
             fast::scaled_dot_product_attention(
                 &query, &key, &value,
-                None, // MLX computes scale internally
-                Some(mask),
+                1.0 / (self.head_dim as f32).sqrt(),
+                mask, None,
             )?
         } else {
             fast::scaled_dot_product_attention(
                 &query, &key, &value,
-                None,
-                None,
+                1.0 / (self.head_dim as f32).sqrt(),
+                None, None,
             )?
         };
 

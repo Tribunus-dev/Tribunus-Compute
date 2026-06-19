@@ -162,35 +162,31 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=Metal");
         println!("cargo:rustc-link-lib=framework=Cocoa");
         println!("cargo:rustc-link-lib=framework=CoreML");
+        println!("cargo:rustc-link-lib=framework=Foundation");
+        println!("cargo:rustc-link-lib=framework=CoreFoundation");
+        println!("cargo:rustc-link-lib=framework=IOSurface");
+        println!("cargo:rustc-link-lib=framework=Accelerate");
+        println!("cargo:rustc-link-lib=framework=CoreML");
+        println!("cargo:rustc-link-lib=framework=CoreVideo");
+        println!("cargo:rustc-link-lib=framework=Metal");
+        println!("cargo:rustc-link-lib=framework=Cocoa");
+        // Use rustc-link-arg for framework flags — more reliable for test targets
+        println!("cargo:rustc-link-arg=-framework");
+        println!("cargo:rustc-link-arg=Foundation");
+        println!("cargo:rustc-link-arg=-framework");
+        println!("cargo:rustc-link-arg=CoreFoundation");
+        println!("cargo:rustc-link-arg=-framework");
+        println!("cargo:rustc-link-arg=IOSurface");
+        println!("cargo:rustc-link-arg=-framework");
+        println!("cargo:rustc-link-arg=Accelerate");
+        println!("cargo:rustc-link-arg=-framework");
+        println!("cargo:rustc-link-arg=CoreML");
+        println!("cargo:rustc-link-arg=-framework");
+        println!("cargo:rustc-link-arg=CoreVideo");
+        println!("cargo:rustc-link-arg=-framework");
+        println!("cargo:rustc-link-arg=Metal");
+        println!("cargo:rustc-link-arg=-framework");
+        println!("cargo:rustc-link-arg=Cocoa");
     }
-    // Always link these frameworks for all targets (lib, tests, bins).
-    // The #[cfg] block above handles framework-specific needs, but cargo may
-    // cache per-target build-script output differently.  This catch-all ensures
-    // every target gets the frameworks it needs for ObjC runtime support.
-    println!("cargo:rustc-link-lib=framework=Foundation");
-    println!("cargo:rustc-link-lib=framework=CoreFoundation");
-    println!("cargo:rustc-link-lib=framework=IOSurface");
-    println!("cargo:rustc-link-lib=framework=Accelerate");
-    println!("cargo:rustc-link-lib=framework=CoreML");
-    println!("cargo:rustc-link-lib=framework=CoreVideo");
-    println!("cargo:rustc-link-lib=framework=Metal");
-    println!("cargo:rustc-link-lib=framework=Cocoa");
-    // Use rustc-link-arg for framework flags — more reliable for test targets
-    println!("cargo:rustc-link-arg=-framework");
-    println!("cargo:rustc-link-arg=Foundation");
-    println!("cargo:rustc-link-arg=-framework");
-    println!("cargo:rustc-link-arg=CoreFoundation");
-    println!("cargo:rustc-link-arg=-framework");
-    println!("cargo:rustc-link-arg=IOSurface");
-    println!("cargo:rustc-link-arg=-framework");
-    println!("cargo:rustc-link-arg=Accelerate");
-    println!("cargo:rustc-link-arg=-framework");
-    println!("cargo:rustc-link-arg=CoreML");
-    println!("cargo:rustc-link-arg=-framework");
-    println!("cargo:rustc-link-arg=CoreVideo");
-    println!("cargo:rustc-link-arg=-framework");
-    println!("cargo:rustc-link-arg=Metal");
-    println!("cargo:rustc-link-arg=-framework");
-    println!("cargo:rustc-link-arg=Cocoa");
     eprintln!("build.rs: END of main() — all link directives emitted");
 }

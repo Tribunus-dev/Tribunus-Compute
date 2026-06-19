@@ -313,7 +313,7 @@ impl VisionAttention {
         let v2 = v.reshape(&[1, self.num_heads as i32, n, self.head_dim as i32])?;
 
         let attn_weights = mlx_rs::fast::scaled_dot_product_attention(
-            &q2, &k2, &v2, None, None, self.scale as f64, None, false, false, None, None, None,
+            &q2, &k2, &v2, self.scale, None, None,
         )?;
 
         // Merge heads: [1, num_heads, n, head_dim] -> [n, num_heads * head_dim]
@@ -628,7 +628,7 @@ impl Attention {
 
         // Scaled dot-product attention
         let attn_out = mlx_rs::fast::scaled_dot_product_attention(
-            &q, &k, &v, mask, None, self.scale as f64, None, false, false, None, None, None,
+            &q, &k, &v, self.scale, mask.map(ScaledDotProductAttentionMask::Array), None,
         )?;
 
         // Merge heads: [B, n_heads, S, head_dim] -> [B, S, n_heads * head_dim]

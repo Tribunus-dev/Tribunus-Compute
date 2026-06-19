@@ -1852,6 +1852,7 @@ pub struct ServerConfigSection {
     pub max_concurrent: u32,
     pub rate_limit_per_min: u32,
     pub log_level: String,
+    pub runtime_mode: String,
 }
 
 /// Model loading and download policy.
@@ -1899,6 +1900,7 @@ impl Default for ServerConfigSection {
             max_concurrent: 64,
             rate_limit_per_min: 60,
             log_level: "info".into(),
+            runtime_mode: "safe".into(),
         }
     }
 }
@@ -2003,6 +2005,9 @@ impl ServerConfig {
         if let Ok(v) = std::env::var("TRIBUNUS_LOG_LEVEL") {
             self.server.log_level = v;
         }
+        if let Ok(v) = std::env::var("TRIBUNUS_RUNTIME_MODE") {
+            self.server.runtime_mode = v.to_lowercase();
+        }
         if let Ok(v) = std::env::var("TRIBUNUS_MODEL_PATH") {
             self.model.model_path = Some(v);
         }
@@ -2099,6 +2104,12 @@ impl ServerConfig {
                         }
                     }
                 }
+                "--runtime-mode" => {
+                    i += 1;
+                    if i < args.len() {
+                        self.server.runtime_mode = args[i].to_lowercase();
+                    }
+                }
                 _ => {}
             }
             i += 1;
@@ -2112,6 +2123,7 @@ impl ServerConfig {
         self.server.max_concurrent = other.server.max_concurrent;
         self.server.rate_limit_per_min = other.server.rate_limit_per_min;
         self.server.log_level = other.server.log_level;
+        self.server.runtime_mode = other.server.runtime_mode;
 
         if other.model.model_path.is_some() {
             self.model.model_path = other.model.model_path;

@@ -139,8 +139,9 @@ impl QwenTransformerAttention {
         let scale = 1.0 / (self.head_dim as f32).sqrt();
         let attn_out = fast::scaled_dot_product_attention(
             &q, &k, &v,
-            Some(scale),
+            scale,
             mask,
+            None,
         )?;
 
         // Split back into image and text outputs

@@ -228,7 +228,7 @@ impl SANMAttention {
 
         // Use optimized SDPA (scaled dot-product attention)
         let attn_out = mlx_rs::fast::scaled_dot_product_attention(
-            &q, &k, &v_h, self.scale, None::<mlx_rs::fast::ScaledDotProductAttentionMask>
+            &q, &k, &v_h, self.scale, None::<mlx_rs::fast::ScaledDotProductAttentionMask>, None
         )?;
 
         // Reshape back to [batch, seq, dim]

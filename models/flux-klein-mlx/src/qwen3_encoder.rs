@@ -206,6 +206,7 @@ impl Qwen3Attention {
                 &values,
                 self.scale,
                 ScaledDotProductAttentionMask::Array(&mask),
+                None
             )?
         } else {
             // No attention mask provided - use causal only
@@ -215,6 +216,7 @@ impl Qwen3Attention {
                 &values,
                 self.scale,
                 ScaledDotProductAttentionMask::Causal,
+                None
             )?
         };
 

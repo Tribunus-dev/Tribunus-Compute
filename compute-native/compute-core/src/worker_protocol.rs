@@ -121,6 +121,16 @@ pub struct StartGenerationPayload {
     pub deadline_ms: u64,
     /// Opaque request identifier echoed in all response events.
     pub request_id: String,
+    /// Temperature for sampling (None = use model default).
+    pub temperature: Option<f32>,
+    /// Top-K for sampling (None = no limit).
+    pub top_k: Option<u32>,
+    /// Top-P (nucleus) for sampling (None = no filtering).
+    pub top_p: Option<f32>,
+    /// Random seed for reproducible generation.
+    pub seed: Option<u64>,
+    /// Token IDs that stop generation when sampled.
+    pub stop_token_ids: Vec<u32>,
 }
 
 /// Payload for [`WorkerEvent::Token`].

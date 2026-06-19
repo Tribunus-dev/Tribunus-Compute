@@ -515,7 +515,7 @@ impl Module<&Array> for SanmAttention {
             .transpose_axes(&[0, 2, 1, 3])?;
 
         // Use MLX SDPA — avoids materializing full attention matrix for long sequences
-        let attn_out = mlx_rs::fast::scaled_dot_product_attention(q, k, v, self.scale, None)?;
+        let attn_out = mlx_rs::fast::scaled_dot_product_attention(q, k, v, self.scale, None, None)?;
 
         let attn_out = attn_out
             .transpose_axes(&[0, 2, 1, 3])?
@@ -1003,7 +1003,7 @@ impl ParaformerDecoderLayer {
             .transpose_axes(&[0, 2, 1, 3])?;
 
         // Use MLX SDPA — avoids materializing full attention matrix
-        let attn_out = mlx_rs::fast::scaled_dot_product_attention(q, k, v, self.scale, None)?;
+        let attn_out = mlx_rs::fast::scaled_dot_product_attention(q, k, v, self.scale, None, None)?;
 
         let attn_out = attn_out
             .transpose_axes(&[0, 2, 1, 3])?

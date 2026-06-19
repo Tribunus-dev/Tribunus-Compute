@@ -193,7 +193,7 @@ impl<C: KeyValueCache> Module<AttentionInput<'_, C>> for Attention {
         let values = values.transpose(&[0, 2, 1, 3]).unwrap();
 
         // Scaled dot-product attention
-        let output = scaled_dot_product_attention(&queries, &keys, &values, mask, self.scale);
+        let output = scaled_dot_product_attention(&queries, &keys, &values, None, self.scale, mask)?;
 
         // Concatenate heads
         let output = output

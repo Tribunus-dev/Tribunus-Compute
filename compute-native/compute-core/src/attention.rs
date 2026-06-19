@@ -1,12 +1,39 @@
 //! Gemma 4 attention blocks — 2D inputs (no batch/seq reshape needed).
 
+use crate::projection_executor::{
+    MaterializationClass, ProjectionExecutor, QuantizedProjectionDescriptor,
+    RuntimeMode, StorageDtype,
+};
+use crate::projection_identity::ProjectionFamily;
 use crate::primitives;
 use mlx_rs::error::Result as MlxResult;
 use mlx_rs::Array;
 
-fn qmatmul(x: &Array, w: &Array, s: &Array, b: &Array) -> MlxResult<Array> {
+/// Helper: run one attention projection through [`ProjectionExecutor`]
+/// with the correct descriptor derived from tensors.
+fn run_attention_projection(
+    executor: &ProjectionExecutor,
+    x: &Array,
+    w: &Array,
+    s: &Array,
+    b: &Array,
+    family: ProjectionFamily,
+    hidden_size: u32,
+    out_features: u32,
+) -> MlxResult<Array> {
     let group_size = (w.shape()[1] as i32 * 4) / s.shape()[1];
-    mlx_rs::ops::quantized_matmul(x, w, s, b, true, group_size, 8)
+    let desc = QuantizedProjectionDescriptor {
+        family,
+        logical_in_features: hidden_size,
+        logical_out_features: out_features,
+        bits: 8,
+        group_size: group_size as u32,
+        storage_dtype: StorageDtype::U32,
+        physical_weight_shape: vec![w.shape()[0] as u32, w.shape()[1] as u32],
+        layer_index: 0,
+        weight_materialization: MaterializationClass::MlxOwned,
+    };
+    executor.run_projection(x, w, s, b, &desc)
 }
 
 pub fn sliding_attention(
@@ -33,10 +60,15 @@ pub fn sliding_attention(
 ) -> MlxResult<Array> {
     let n_tokens = x.shape()[0];
     let n_rep = n_heads / n_kv_heads;
+    let hidden_size = x.shape()[1] as u32;
+    let executor = ProjectionExecutor { mode: RuntimeMode::Safe };
 
-    let q = qmatmul(x, qw, qs, qb)?.reshape(&[n_tokens, n_heads as i32, head_dim as i32])?;
-    let k = qmatmul(x, kw, ks, kb)?.reshape(&[n_tokens, n_kv_heads as i32, head_dim as i32])?;
-    let v = qmatmul(x, vw, vs, vb)?.reshape(&[n_tokens, n_kv_heads as i32, head_dim as i32])?;
+    let q = run_attention_projection(&executor, x, qw, qs, qb, ProjectionFamily::QProj, hidden_size, n_heads * head_dim)?
+        .reshape(&[n_tokens, n_heads as i32, head_dim as i32])?;
+    let k = run_attention_projection(&executor, x, kw, ks, kb, ProjectionFamily::KProj, hidden_size, n_kv_heads * head_dim)?
+        .reshape(&[n_tokens, n_kv_heads as i32, head_dim as i32])?;
+    let v = run_attention_projection(&executor, x, vw, vs, vb, ProjectionFamily::VProj, hidden_size, n_kv_heads * head_dim)?
+        .reshape(&[n_tokens, n_kv_heads as i32, head_dim as i32])?;
 
     let q = primitives::rms_norm_scale_free(&q.reshape(&[-1, head_dim as i32])?, 1e-6)?
         .reshape(&[n_tokens, n_heads as i32, head_dim as i32])?;
@@ -73,7 +105,8 @@ pub fn sliding_attention(
     let out = attn
         .matmul(&vt)?
         .reshape(&[n_tokens, (n_heads * head_dim) as i32])?;
-    qmatmul(&out, ow, os, ob)?.reshape(&[n_tokens, -1])
+    run_attention_projection(&executor, &out, ow, os, ob, ProjectionFamily::OProj, hidden_size, hidden_size)?
+        .reshape(&[n_tokens, -1])
 }
 
 pub fn full_attention(
@@ -96,9 +129,13 @@ pub fn full_attention(
 ) -> MlxResult<Array> {
     let n_tokens = x.shape()[0];
     let n_rep = n_heads / n_kv_heads;
+    let hidden_size = x.shape()[1] as u32;
+    let executor = ProjectionExecutor { mode: RuntimeMode::Safe };
 
-    let q = qmatmul(x, qw, qs, qb)?.reshape(&[n_tokens, n_heads as i32, head_dim as i32])?;
-    let k = qmatmul(x, kw, ks, kb)?.reshape(&[n_tokens, n_kv_heads as i32, head_dim as i32])?;
+    let q = run_attention_projection(&executor, x, qw, qs, qb, ProjectionFamily::QProj, hidden_size, n_heads * head_dim)?
+        .reshape(&[n_tokens, n_heads as i32, head_dim as i32])?;
+    let k = run_attention_projection(&executor, x, kw, ks, kb, ProjectionFamily::KProj, hidden_size, n_kv_heads * head_dim)?
+        .reshape(&[n_tokens, n_kv_heads as i32, head_dim as i32])?;
 
     let q = primitives::rms_norm_scale_free(&q.reshape(&[-1, head_dim as i32])?, 1e-6)?
         .reshape(&[n_tokens, n_heads as i32, head_dim as i32])?;
@@ -129,7 +166,8 @@ pub fn full_attention(
     let out = attn
         .matmul(&vt)?
         .reshape(&[n_tokens, (n_heads * head_dim) as i32])?;
-    qmatmul(&out, ow, os, ob)?.reshape(&[n_tokens, -1])
+    run_attention_projection(&executor, &out, ow, os, ob, ProjectionFamily::OProj, hidden_size, hidden_size)?
+        .reshape(&[n_tokens, -1])
 }
 
 fn causal_mask(seq_len: u32) -> MlxResult<Array> {

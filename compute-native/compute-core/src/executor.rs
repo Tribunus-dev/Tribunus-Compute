@@ -5,18 +5,22 @@
 //! segments, mapped storage, or test fixtures. The caller is responsible for
 //! calling `eval()` on the result before dropping the weight leases.
 
-use crate::log_debug;
-use crate::config::{EpiloguePlan, LayerPlan, ProloguePlan};
-use crate::kv_cache::KvCache;
-use crate::config::operation_route::OperationRoute;
-use crate::primitives;
-use crate::backend::routing::BackendId;
-use crate::projection_identity::{dtype_to_storage, ProjectionContext, ProjectionFamily};
-use crate::session::SamplerConfig;
-use crate::grammar::{GrammarFSM, GrammarTokenizer};
 use crate::ane::hot_row_predictor::HotRowPredictor;
 use crate::ane::moe_scheduler::{AneMoEScheduler, ExpertWeights};
 use crate::ane::weight_row_cache::WeightRowCache;
+use crate::backend::routing::BackendId;
+use crate::config::operation_route::OperationRoute;
+use crate::config::{EpiloguePlan, LayerPlan, ProloguePlan};
+use crate::grammar::{GrammarFSM, GrammarTokenizer};
+use crate::kv_cache::KvCache;
+use crate::log_debug;
+use crate::primitives;
+use crate::projection_executor::{
+    MaterializationClass, ProjectionExecutor, QuantizedProjectionDescriptor, RuntimeMode,
+    StorageDtype,
+};
+use crate::projection_identity::{dtype_to_storage, ProjectionContext, ProjectionFamily};
+use crate::session::SamplerConfig;
 use mlx_rs::error::Result as MlxResult;
 use mlx_rs::ops;
 use mlx_rs::ops::indexing::IndexOp;
@@ -61,14 +65,11 @@ impl SinkState {
         }
     }
 
-    pub fn capture_sinks(
-        &mut self,
-        cache: &crate::kv_cache::KvCache,
-    ) -> MlxResult<()> {
+    pub fn capture_sinks(&mut self, cache: &crate::kv_cache::KvCache) -> MlxResult<()> {
         let n_sinks = self.num_permanent_sinks as usize;
-        let (k_cached, v_cached) = cache.read_window().ok_or_else(|| {
-            mlx_rs::error::Exception::custom("capture_sinks: cache is empty")
-        })?;
+        let (k_cached, v_cached) = cache
+            .read_window()
+            .ok_or_else(|| mlx_rs::error::Exception::custom("capture_sinks: cache is empty"))?;
         let cached_len = k_cached.shape()[0] as usize;
         let n_sinks_actual = n_sinks.min(cached_len);
         if n_sinks_actual == 0 {
@@ -90,9 +91,9 @@ impl SinkState {
     ) -> MlxResult<Array> {
         // Q shape is [n_heads, 1, head_dim] — single query token per head.
         let n_heads = q.shape()[0];
-        let (k_cached, v_cached) = cache.read_window().ok_or_else(|| {
-            mlx_rs::error::Exception::custom("sink_attention: cache is empty")
-        })?;
+        let (k_cached, v_cached) = cache
+            .read_window()
+            .ok_or_else(|| mlx_rs::error::Exception::custom("sink_attention: cache is empty"))?;
         let cached_len = k_cached.shape()[0] as usize;
         // Window starts after sink positions to avoid overlap.
         let sink_end = self.num_permanent_sinks as usize;
@@ -112,13 +113,21 @@ impl SinkState {
             (Some(sk), true) => mlx_rs::ops::concatenate(&[sk, &window_k])?,
             (Some(sk), false) => sk.clone(),
             (None, true) => window_k,
-            (None, false) => return Err(mlx_rs::error::Exception::custom("sink_attention: no sinks and no window tokens")),
+            (None, false) => {
+                return Err(mlx_rs::error::Exception::custom(
+                    "sink_attention: no sinks and no window tokens",
+                ))
+            }
         };
         let v_full = match (&self.sink_v, window_v.shape()[0] > 0) {
             (Some(sv), true) => mlx_rs::ops::concatenate(&[sv, &window_v])?,
             (Some(sv), false) => sv.clone(),
             (None, true) => window_v,
-            (None, false) => return Err(mlx_rs::error::Exception::custom("sink_attention: no sinks and no window tokens")),
+            (None, false) => {
+                return Err(mlx_rs::error::Exception::custom(
+                    "sink_attention: no sinks and no window tokens",
+                ))
+            }
         };
         let full_len = k_full.shape()[0];
         let k_exp = repeat_kv(&k_full, n_rep)?;
@@ -129,7 +138,7 @@ impl SinkState {
         // Q is already [n_heads, 1, head_dim] from the caller.
         let qt = q.reshape(&[n_heads, 1, head_dim as i32])?;
         let scale = (head_dim as f32).sqrt();
-        let scores = qt.matmul(&kt_t)?.divide(&Array::from_f32(scale))?;  // [n_heads, 1, full_len]
+        let scores = qt.matmul(&kt_t)?.divide(&Array::from_f32(scale))?; // [n_heads, 1, full_len]
         let attn = mlx_rs::ops::softmax_axes(&scores, &[-1], None)?;
         let out = attn.matmul(&vt)?.reshape(&[1, -1])?;
         Ok(out)
@@ -140,16 +149,24 @@ impl SinkState {
             let seq = attention_weights.shape().last().copied().unwrap_or(1);
             let head_0 = attention_weights.index((0..1, 0..seq as i32));
             if let Ok(flat) = head_0.reshape(&[-1]) {
-                    if let Ok(slice) = flat.try_as_slice::<f32>() {
-                        let mut e = 0.0f32;
-                        for &p in slice.iter() {
-                            if p > 0.0 { e -= p * p.log(std::f32::consts::E); }
+                if let Ok(slice) = flat.try_as_slice::<f32>() {
+                    let mut e = 0.0f32;
+                    for &p in slice.iter() {
+                        if p > 0.0 {
+                            e -= p * p.log(std::f32::consts::E);
                         }
-                        self.last_entropy = e;
-                        e
-                    } else { self.last_entropy }
-            } else { self.last_entropy }
-        } else { self.last_entropy };
+                    }
+                    self.last_entropy = e;
+                    e
+                } else {
+                    self.last_entropy
+                }
+            } else {
+                self.last_entropy
+            }
+        } else {
+            self.last_entropy
+        };
         let base = (self.adaptive_window as f32).ln().max(1.0);
         let threshold = base * 0.8;
         if entropy > threshold && self.adaptive_window < self.window_size * 4 {
@@ -248,9 +265,12 @@ pub fn apply_vision_embeddings(
 
     let ids: Vec<u32> = flat_ids
         .try_as_slice::<u32>()
-        .map_err(|e| mlx_rs::error::Exception::custom(format!(
-            "apply_vision_embeddings: token_ids as_slice: {:?}", e
-        )))?
+        .map_err(|e| {
+            mlx_rs::error::Exception::custom(format!(
+                "apply_vision_embeddings: token_ids as_slice: {:?}",
+                e
+            ))
+        })?
         .to_vec();
 
     let seq_len = ids.len();
@@ -260,17 +280,13 @@ pub fn apply_vision_embeddings(
     let vision_count = ids.iter().filter(|&&id| id >= VISION_TOKEN_OFFSET).count();
     if vision_count == 0 {
         return Ok(hidden.clone());
-}
+    }
 
     // Get hidden data as mutable slice.
-    let mut h_data: Vec<f32> = hidden
-        .as_slice::<f32>()
-        .to_vec();
+    let mut h_data: Vec<f32> = hidden.as_slice::<f32>().to_vec();
 
     // Get vision features data.
-    let vf_data: Vec<f32> = vision_features
-        .as_slice::<f32>()
-        .to_vec();
+    let vf_data: Vec<f32> = vision_features.as_slice::<f32>().to_vec();
 
     let vf_dim = vision_features.shape().get(1).copied().unwrap_or(1) as usize;
     let num_patches = vision_features.shape().get(0).copied().unwrap_or(1) as usize;
@@ -290,10 +306,10 @@ pub fn apply_vision_embeddings(
                 } else {
                     0.0
                 };
-}
+            }
             vf_offset += 1;
-}
-}
+        }
+    }
 
     let dims: Vec<i32> = vec![seq_len as i32, hidden_size as i32];
     Ok(Array::from_slice(&h_data, &dims))
@@ -361,7 +377,8 @@ pub fn run_layer(
 
     // --- Attention norm ---
     let residual = hidden;
-    let normed = crate::heterogeneous::dispatch_rms_norm(hidden, attn_norm, rms_norm_eps, route, island)?;
+    let normed =
+        crate::heterogeneous::dispatch_rms_norm(hidden, attn_norm, rms_norm_eps, route, island)?;
 
     // --- Attention ---
     let attn_out = match plan.attention_kind.as_str() {
@@ -460,7 +477,8 @@ pub fn run_layer(
         5,
     )?;
     let gated = mlx_rs::nn::silu(&gate)?.multiply(&up)?;
-    let gated = crate::heterogeneous::dispatch_multiply(&mlx_rs::nn::silu(&gate)?, &up, route, island)?;
+    let gated =
+        crate::heterogeneous::dispatch_multiply(&mlx_rs::nn::silu(&gate)?, &up, route, island)?;
     let ffn_out = qmatmul_attributed(
         &gated,
         dw,
@@ -492,15 +510,29 @@ pub fn run_layer_with_sinks(
     ane_coreml_models: &[Option<std::sync::Arc<crate::coreml_bridge::CoreMlModel>>],
     attn_norm: &Array,
     ffn_norm: &Array,
-    qw: &Array, qs: &Array, qb: &Array,
-    kw: &Array, ks: &Array, kb: &Array,
-    vw: &Array, vs: &Array, vb: &Array,
-    ow: &Array, os: &Array, ob: &Array,
+    qw: &Array,
+    qs: &Array,
+    qb: &Array,
+    kw: &Array,
+    ks: &Array,
+    kb: &Array,
+    vw: &Array,
+    vs: &Array,
+    vb: &Array,
+    ow: &Array,
+    os: &Array,
+    ob: &Array,
     q_norm_weight: Option<&Array>,
     k_norm_weight: Option<&Array>,
-    gw: &Array, gs: &Array, gb: &Array,
-    uw: &Array, us: &Array, ub: &Array,
-    dw: &Array, ds: &Array, db: &Array,
+    gw: &Array,
+    gs: &Array,
+    gb: &Array,
+    uw: &Array,
+    us: &Array,
+    ub: &Array,
+    dw: &Array,
+    ds: &Array,
+    db: &Array,
     rope_cos: &Array,
     rope_sin: &Array,
     cache: &mut KvCache,
@@ -526,18 +558,57 @@ pub fn run_layer_with_sinks(
         let n_rep = n_heads / n_kv_heads;
 
         let residual = hidden;
-        let normed = crate::heterogeneous::dispatch_rms_norm(hidden, attn_norm, rms_norm_eps, route, island)?;
+        let normed = crate::heterogeneous::dispatch_rms_norm(
+            hidden,
+            attn_norm,
+            rms_norm_eps,
+            route,
+            island,
+        )?;
 
         // Compute Q, K, V projections (same as sliding_attention_layer / full_attention_layer).
-        let q = qmatmul_attributed(&normed, qw, qs, qb, true, 64, 8, ctx, ProjectionFamily::QProj, 0)?
-            .reshape(&[1, n_heads as i32, head_dim as i32])?;
-        let k = qmatmul_attributed(&normed, kw, ks, kb, true, 64, 8, ctx, ProjectionFamily::KProj, 1)?
-            .reshape(&[1, n_kv_heads as i32, head_dim as i32])?;
+        let q = qmatmul_attributed(
+            &normed,
+            qw,
+            qs,
+            qb,
+            true,
+            64,
+            8,
+            ctx,
+            ProjectionFamily::QProj,
+            0,
+        )?
+        .reshape(&[1, n_heads as i32, head_dim as i32])?;
+        let k = qmatmul_attributed(
+            &normed,
+            kw,
+            ks,
+            kb,
+            true,
+            64,
+            8,
+            ctx,
+            ProjectionFamily::KProj,
+            1,
+        )?
+        .reshape(&[1, n_kv_heads as i32, head_dim as i32])?;
         let v = if plan.attention_k_eq_v {
             k.clone()
         } else {
-            qmatmul_attributed(&normed, vw, vs, vb, true, 64, 8, ctx, ProjectionFamily::VProj, 2)?
-                .reshape(&[1, n_kv_heads as i32, head_dim as i32])?
+            qmatmul_attributed(
+                &normed,
+                vw,
+                vs,
+                vb,
+                true,
+                64,
+                8,
+                ctx,
+                ProjectionFamily::VProj,
+                2,
+            )?
+            .reshape(&[1, n_kv_heads as i32, head_dim as i32])?
         };
 
         // Q norm and K norm.
@@ -545,25 +616,35 @@ pub fn run_layer_with_sinks(
             primitives::rms_norm(&q.reshape(&[-1, head_dim as i32])?, wn, 1e-6)?
         } else {
             primitives::rms_norm_scale_free(&q.reshape(&[-1, head_dim as i32])?, 1e-6)?
-        }.reshape(&[1, n_heads as i32, head_dim as i32])?;
+        }
+        .reshape(&[1, n_heads as i32, head_dim as i32])?;
 
         let k = if let Some(wn) = k_norm_weight {
             primitives::rms_norm(&k.reshape(&[-1, head_dim as i32])?, wn, 1e-6)?
         } else {
             primitives::rms_norm_scale_free(&k.reshape(&[-1, head_dim as i32])?, 1e-6)?
-        }.reshape(&[1, n_kv_heads as i32, head_dim as i32])?;
+        }
+        .reshape(&[1, n_kv_heads as i32, head_dim as i32])?;
 
         // Apply RoPE.
         let q4d = q.reshape(&[1, n_heads as i32, 1, head_dim as i32])?;
         let q4d = primitives::rope_apply(
-            &q4d, rope_cos, rope_sin, kv_offset, plan.partial_rotary_factor,
+            &q4d,
+            rope_cos,
+            rope_sin,
+            kv_offset,
+            plan.partial_rotary_factor,
         )?;
         // Reshape to [n_heads, 1, head_dim] for batched matmul over heads.
         let q_rope = q4d.reshape(&[-1, 1, head_dim as i32])?;
 
         let k4d = k.reshape(&[1, n_kv_heads as i32, 1, head_dim as i32])?;
         let k4d = primitives::rope_apply(
-            &k4d, rope_cos, rope_sin, kv_offset, plan.partial_rotary_factor,
+            &k4d,
+            rope_cos,
+            rope_sin,
+            kv_offset,
+            plan.partial_rotary_factor,
         )?;
         let k_rope = k4d.reshape(&[1, n_kv_heads as i32, head_dim as i32])?;
 
@@ -578,42 +659,136 @@ pub fn run_layer_with_sinks(
         let attn_out = sink_state.sink_attention(&q_rope, cache, n_rep, head_dim)?;
 
         let attn_proj = qmatmul_attributed(
-            &attn_out, ow, os, ob, true, 64, 8, ctx, ProjectionFamily::OProj, 3,
-        )?.reshape(&[1, -1])?;
+            &attn_out,
+            ow,
+            os,
+            ob,
+            true,
+            64,
+            8,
+            ctx,
+            ProjectionFamily::OProj,
+            3,
+        )?
+        .reshape(&[1, -1])?;
 
         // Residual + FFN (same as run_layer).
-        let hidden_after_attn = crate::heterogeneous::dispatch_add(residual, &attn_proj, route, island)?;
+        let hidden_after_attn =
+            crate::heterogeneous::dispatch_add(residual, &attn_proj, route, island)?;
 
         let residual_ffn = &hidden_after_attn;
         let normed_ffn = primitives::rms_norm(&hidden_after_attn, ffn_norm, rms_norm_eps)?;
 
-        let gate = qmatmul_attributed(&normed_ffn, gw, gs, gb, true, 64, 8, ctx, ProjectionFamily::GateProj, 4)?;
+        let gate = qmatmul_attributed(
+            &normed_ffn,
+            gw,
+            gs,
+            gb,
+            true,
+            64,
+            8,
+            ctx,
+            ProjectionFamily::GateProj,
+            4,
+        )?;
         gate.eval()?;
         log_debug!("[infer] op=gate_proj_done layer={}", ctx.layer_index);
-        let up = qmatmul_attributed(&normed_ffn, uw, us, ub, true, 64, 8, ctx, ProjectionFamily::UpProj, 5)?;
+        let up = qmatmul_attributed(
+            &normed_ffn,
+            uw,
+            us,
+            ub,
+            true,
+            64,
+            8,
+            ctx,
+            ProjectionFamily::UpProj,
+            5,
+        )?;
         up.eval()?;
         log_debug!("[infer] op=up_proj_done layer={}", ctx.layer_index);
-        let gated = crate::heterogeneous::dispatch_multiply(&mlx_rs::nn::silu(&gate)?, &up, route, island)?;
-        log_debug!("[infer] op=down_proj layer={} gated_shape={:?}", ctx.layer_index, gated.shape());
-        let ffn_out = qmatmul_attributed(&gated, dw, ds, db, true, 64, 8, ctx, ProjectionFamily::DownProj, 6)?;
+        let gated =
+            crate::heterogeneous::dispatch_multiply(&mlx_rs::nn::silu(&gate)?, &up, route, island)?;
+        log_debug!(
+            "[infer] op=down_proj layer={} gated_shape={:?}",
+            ctx.layer_index,
+            gated.shape()
+        );
+        let ffn_out = qmatmul_attributed(
+            &gated,
+            dw,
+            ds,
+            db,
+            true,
+            64,
+            8,
+            ctx,
+            ProjectionFamily::DownProj,
+            6,
+        )?;
         ffn_out.eval()?;
-        log_debug!("[infer] op=down_proj_done layer={} shape={:?}", ctx.layer_index, ffn_out.shape());
-        log_debug!("[infer] op=ffn_add layer={} ffn_shape={:?}", ctx.layer_index, ffn_out.shape());
+        log_debug!(
+            "[infer] op=down_proj_done layer={} shape={:?}",
+            ctx.layer_index,
+            ffn_out.shape()
+        );
+        log_debug!(
+            "[infer] op=ffn_add layer={} ffn_shape={:?}",
+            ctx.layer_index,
+            ffn_out.shape()
+        );
         let result = crate::heterogeneous::dispatch_add(residual_ffn, &ffn_out, route, island)?;
-        log_debug!("[infer] op=ffn_eval layer={} result_shape={:?}", ctx.layer_index, result.shape());
+        log_debug!(
+            "[infer] op=ffn_eval layer={} result_shape={:?}",
+            ctx.layer_index,
+            result.shape()
+        );
         result.eval()?;
-        log_debug!("[infer] op=layer_done layer={} result_shape={:?}", ctx.layer_index, result.shape());
+        log_debug!(
+            "[infer] op=layer_done layer={} result_shape={:?}",
+            ctx.layer_index,
+            result.shape()
+        );
         Ok(result)
     } else {
         // --- Prefill path: full attention, then capture sinks ---
         let result = run_layer(
-            hidden, plan, route, island, ane_coreml_models,
-            attn_norm, ffn_norm,
-            qw, qs, qb, kw, ks, kb, vw, vs, vb, ow, os, ob,
-            q_norm_weight, k_norm_weight,
-            gw, gs, gb, uw, us, ub, dw, ds, db,
-            rope_cos, rope_sin,
-            cache, kv_offset, rms_norm_eps, ctx,
+            hidden,
+            plan,
+            route,
+            island,
+            ane_coreml_models,
+            attn_norm,
+            ffn_norm,
+            qw,
+            qs,
+            qb,
+            kw,
+            ks,
+            kb,
+            vw,
+            vs,
+            vb,
+            ow,
+            os,
+            ob,
+            q_norm_weight,
+            k_norm_weight,
+            gw,
+            gs,
+            gb,
+            uw,
+            us,
+            ub,
+            dw,
+            ds,
+            db,
+            rope_cos,
+            rope_sin,
+            cache,
+            kv_offset,
+            rms_norm_eps,
+            ctx,
         )?;
         // Capture sink K/V from cache for future decode steps.
         if let Err(e) = sink_state.capture_sinks(cache) {
@@ -634,17 +809,43 @@ fn qmatmul(x: &Array, w: &Array, s: &Array, b: &Array) -> MlxResult<Array> {
     // bits = 4 for int4 packing.
     let in_features = x.shape().last().copied().unwrap_or(1) as i32;
     let n_groups = s.shape().last().copied().unwrap_or(1) as i32;
-    let group_size = if n_groups > 0 { in_features / n_groups } else { 64 };
-    let bits: i32 = 4; // int4 quantization — 8 values per uint32
+    let group_size = if n_groups > 0 {
+        in_features / n_groups
+    } else {
+        64
+    };
+
+    // Build descriptor and executor for this projection.
+    let logical_in_features = in_features as u32;
+    let logical_out_features = w.shape()[0] as u32;
+    let executor = ProjectionExecutor {
+        mode: RuntimeMode::Safe,
+    };
+    let qmatmul_desc = QuantizedProjectionDescriptor {
+        family: ProjectionFamily::OProj,
+        logical_in_features,
+        logical_out_features,
+        bits: 4,
+        group_size: group_size as u32,
+        storage_dtype: StorageDtype::U32,
+        physical_weight_shape: vec![w.shape()[0] as u32, w.shape()[1] as u32],
+        layer_index: 0,
+        weight_materialization: MaterializationClass::MlxOwned,
+    };
 
     // OPT-0006-T2 diagnostic: first-call stride/contiguity probe.
     // Answers: do external (mmap-backed) arrays trigger hidden copies?
     use std::sync::atomic::{AtomicBool, Ordering};
     if T2_PROBE.swap(false, Ordering::Relaxed) {
+        // Force authority path for both probe calls (external and copied arrays)
+        // so the timing comparison is apples-to-apples.
+        let mut probe_desc = qmatmul_desc.clone();
+        probe_desc.weight_materialization = MaterializationClass::MappedReadOnly;
+
         let ws = w.shape();
         w.eval()?;
         let t_ext_start = std::time::Instant::now();
-        let r1 = mlx_rs::ops::quantized_matmul(x, w, s, b, true, group_size, bits)?;
+        let r1 = executor.run_projection(x, w, s, b, &probe_desc)?;
         let _ = r1.eval()?;
         let t_ext = t_ext_start.elapsed();
         let ws_str: Vec<String> = ws.iter().map(|d| d.to_string()).collect();
@@ -664,7 +865,7 @@ fn qmatmul(x: &Array, w: &Array, s: &Array, b: &Array) -> MlxResult<Array> {
                 .to_vec();
             let bc = Array::from_slice(&b_vec, &b.shape());
             let t_copy_start = std::time::Instant::now();
-            let r2 = mlx_rs::ops::quantized_matmul(x, &wc, &sc, &bc, true, group_size, bits)?;
+            let r2 = executor.run_projection(x, &wc, &sc, &bc, &probe_desc)?;
             let _ = r2.eval()?;
             let t_copy = t_copy_start.elapsed();
             let wss: Vec<String> = ws.iter().map(|d| d.to_string()).collect();
@@ -685,11 +886,9 @@ fn qmatmul(x: &Array, w: &Array, s: &Array, b: &Array) -> MlxResult<Array> {
         return Ok(r1);
     }
 
-    mlx_rs::ops::quantized_matmul(x, w, s, b, true, group_size, bits)
+    // Route through ProjectionExecutor which applies safe-mode dispatch.
+    executor.run_projection(x, w, s, b, &qmatmul_desc)
 }
-
-// ── Projection attribution wrapper ────────────────────────────────────
-
 /// Wrapper around qmatmul that conditionally emits a projection attribution
 /// event when `TRIBUNUS_PROJECTION_ATTRIBUTION=1`.
 ///
@@ -866,13 +1065,13 @@ fn sliding_attention_layer(
     // ANE dispatch: if this layer is routed to ANE, send Q/K/V to CoreML
     if route.attention == crate::heterogeneous::ANE {
         return crate::heterogeneous::dispatch_attention_coreml(
-            &q, &k, &v,
+            &q,
+            &k,
+            &v,
             ane_coreml_models,
             layer_idx,
             island.ok_or_else(|| {
-                mlx_rs::error::Exception::from(
-                    "ANE sliding attention requires SharedMemoryIsland",
-                )
+                mlx_rs::error::Exception::from("ANE sliding attention requires SharedMemoryIsland")
             })?,
         );
     }
@@ -1018,13 +1217,13 @@ fn full_attention_layer(
     // ANE dispatch: if this layer is routed to ANE, send Q/K/V to CoreML
     if route.attention == crate::heterogeneous::ANE {
         return crate::heterogeneous::dispatch_attention_coreml(
-            &q, &k, &v,
+            &q,
+            &k,
+            &v,
             ane_coreml_models,
             layer_idx,
             island.ok_or_else(|| {
-                mlx_rs::error::Exception::from(
-                    "ANE full attention requires SharedMemoryIsland",
-                )
+                mlx_rs::error::Exception::from("ANE full attention requires SharedMemoryIsland")
             })?,
         );
     }
@@ -1119,21 +1318,14 @@ pub fn moe_forward(
         .map_err(|e| format!("moe softmax: {:?}", e))?;
 
     // 2. Top-K indices: argsort descending (negate), take first K
-    let neg_probs = (&routing_probs).neg()
-    ;
-    let sorted_idx = ops::argsort_axis(&neg_probs, -1)
-        .map_err(|e| format!("moe argsort: {:?}", e))?;
-    let top_k_indices = sorted_idx
-        .index((.., ..(top_k as i32)))
-        ;
+    let neg_probs = (&routing_probs).neg();
+    let sorted_idx =
+        ops::argsort_axis(&neg_probs, -1).map_err(|e| format!("moe argsort: {:?}", e))?;
+    let top_k_indices = sorted_idx.index((.., ..(top_k as i32)));
 
     // 3. Gather top-K routing weights via take_along_axis
-    let top_k_weights = ops::indexing::take_along_axis(
-        &routing_probs,
-        &top_k_indices,
-        Some(-1),
-    )
-    .map_err(|e| format!("moe gather weights: {:?}", e))?;
+    let top_k_weights = ops::indexing::take_along_axis(&routing_probs, &top_k_indices, Some(-1))
+        .map_err(|e| format!("moe gather weights: {:?}", e))?;
 
     // Eval to read indices/weights on host for expert grouping
     top_k_indices
@@ -1212,10 +1404,8 @@ pub fn moe_forward(
         for (i, &t) in token_positions.iter().enumerate() {
             let row_idx = i as i32;
             let t_idx = t as i32;
-            let row = weighted
-                .index((row_idx, ..));
-            let existing_row = output
-                .index((t_idx, ..));
+            let row = weighted.index((row_idx, ..));
+            let existing_row = output.index((t_idx, ..));
             let combined_row = existing_row
                 .add(&row)
                 .map_err(|e| format!("moe expert {} add row: {:?}", e_idx, e))?;
@@ -1224,15 +1414,13 @@ pub fn moe_forward(
                 .map_err(|e| format!("moe expert {} reshape row: {:?}", e_idx, e))?;
             // Build output by concatenating [before, updated_row, after]
             let before: Array = if t_idx > 0 {
-                output
-                    .index((..t_idx, ..))
+                output.index((..t_idx, ..))
             } else {
                 Array::zeros::<f32>(&[0, hidden_size_i32])
                     .map_err(|e| format!("moe before zeros: {:?}", e))?
             };
             let after: Array = if t_idx + 1 < seq_len {
-                output
-                    .index(((t_idx + 1).., ..))
+                output.index(((t_idx + 1).., ..))
             } else {
                 Array::zeros::<f32>(&[0, hidden_size_i32])
                     .map_err(|e| format!("moe after zeros: {:?}", e))?
@@ -1290,32 +1478,51 @@ pub fn run_epilogue(
     let normed = primitives::rms_norm(hidden, final_norm, rms_norm_eps)?;
 
     // Tied output projection: quantized matmul with embedding weights
-    let group_size = if output_scales.shape().len() >= 1 {
-        (output_weight.shape()[1] as i32 * 4)
-            / output_scales.shape()[output_scales.shape().len() - 1]
+    let executor = ProjectionExecutor {
+        mode: RuntimeMode::Safe,
+    };
+    let logical_in_features = normed.shape()[1] as u32;
+    let logical_out_features = output_weight.shape()[0] as u32;
+    let n_groups = if output_scales.shape().len() >= 1 {
+        output_scales.shape()[output_scales.shape().len() - 1] as u32
+    } else {
+        1
+    };
+    let gs = if n_groups > 0 {
+        logical_in_features / n_groups
     } else {
         64
     };
+    let lm_head_desc = QuantizedProjectionDescriptor {
+        family: ProjectionFamily::LmHead,
+        logical_in_features,
+        logical_out_features,
+        bits: 8,
+        group_size: gs,
+        storage_dtype: StorageDtype::U32,
+        physical_weight_shape: vec![
+            output_weight.shape()[0] as u32,
+            output_weight.shape()[1] as u32,
+        ],
+        layer_index: 0,
+        weight_materialization: MaterializationClass::MlxOwned,
+    };
     let logits = if tie_word_embeddings {
-        mlx_rs::ops::quantized_matmul(
+        executor.run_projection(
             &normed,
             output_weight,
             output_scales,
             output_biases,
-            true, // transpose weight
-            group_size,
-            8,
+            &lm_head_desc,
         )?
     } else {
         // Non-tied: use dedicated lm_head tensor if available
-        mlx_rs::ops::quantized_matmul(
+        executor.run_projection(
             &normed,
             output_weight,
             output_scales,
             output_biases,
-            true,
-            group_size,
-            8,
+            &lm_head_desc,
         )?
     };
 
@@ -1537,27 +1744,28 @@ pub fn run_epilogue_prefetch(
 
     // 2. Predict next token candidates on ANE.
     let candidates = predictor.predict(&hidden_slice).map_err(|e| {
-        mlx_rs::error::Exception::custom(format!(
-            "run_epilogue_prefetch: predictor error: {}",
-            e
-        ))
+        mlx_rs::error::Exception::custom(format!("run_epilogue_prefetch: predictor error: {}", e))
     })?;
 
     // 3. Pre-fetch those rows into ANE SRAM.
-    row_cache.prefetch_rows(&candidates, output_weight).map_err(|e| {
-        mlx_rs::error::Exception::custom(format!(
-            "run_epilogue_prefetch: prefetch error: {}",
-            e
-        ))
-    })?;
+    row_cache
+        .prefetch_rows(&candidates, output_weight)
+        .map_err(|e| {
+            mlx_rs::error::Exception::custom(format!(
+                "run_epilogue_prefetch: prefetch error: {}",
+                e
+            ))
+        })?;
 
     // 4. Run hybrid LM head (cached rows are fast, rest are normal).
-    let logits = row_cache.hybrid_lm_head(&normed, output_weight).map_err(|e| {
-        mlx_rs::error::Exception::custom(format!(
-            "run_epilogue_prefetch: hybrid_lm_head error: {}",
-            e
-        ))
-    })?;
+    let logits = row_cache
+        .hybrid_lm_head(&normed, output_weight)
+        .map_err(|e| {
+            mlx_rs::error::Exception::custom(format!(
+                "run_epilogue_prefetch: hybrid_lm_head error: {}",
+                e
+            ))
+        })?;
 
     // 5. Final logit softcapping (same as run_epilogue)
     let logits = if let Some(cap) = plan.final_logit_softcapping {
@@ -1583,17 +1791,15 @@ pub fn run_epilogue_prefetch(
         token_arr
     } else {
         // Must extract f32 for grammar masking and/or non-greedy sampling.
-        last_logits.eval().map_err(|e| {
-            mlx_rs::error::Exception::custom(format!("last_logits eval: {:?}", e))
-        })?;
+        last_logits
+            .eval()
+            .map_err(|e| mlx_rs::error::Exception::custom(format!("last_logits eval: {:?}", e)))?;
 
         let flat = last_logits.reshape(&[-1])?;
         let vocab_size = flat.shape()[0] as usize;
         let mut logits_vec: Vec<f32> = flat
             .try_as_slice::<f32>()
-            .map_err(|e| {
-                mlx_rs::error::Exception::custom(format!("read logits: {:?}", e))
-            })?
+            .map_err(|e| mlx_rs::error::Exception::custom(format!("read logits: {:?}", e)))?
             .to_vec();
 
         // 0. Grammar mask: set invalid token logits to -inf
@@ -1612,90 +1818,91 @@ pub fn run_epilogue_prefetch(
                 .unwrap_or(0);
             Array::from_slice(&[token], &[1])
         } else {
-        // Non-greedy sampling: temperature, top-k, top-p
-        // Temperature
-        if let Some(temp) = sampler.temperature {
-            if temp > 0.0 && (temp - 1.0).abs() > f32::EPSILON {
-                let scale = 1.0 / temp;
-                for v in &mut logits_vec {
-                    *v *= scale;
-                }
-            }
-        }
-
-        // Top-k
-        if let Some(k) = sampler.top_k {
-            let k = (k as usize).min(vocab_size);
-            if k > 0 && k < vocab_size {
-                let mut sorted = logits_vec.clone();
-                sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-                let threshold = sorted[k - 1];
-                for v in &mut logits_vec {
-                    if *v < threshold {
-                        *v = f32::NEG_INFINITY;
+            // Non-greedy sampling: temperature, top-k, top-p
+            // Temperature
+            if let Some(temp) = sampler.temperature {
+                if temp > 0.0 && (temp - 1.0).abs() > f32::EPSILON {
+                    let scale = 1.0 / temp;
+                    for v in &mut logits_vec {
+                        *v *= scale;
                     }
                 }
             }
-        }
 
-        // Top-p
-        if let Some(p) = sampler.top_p {
-            if p > 0.0 && p < 1.0 {
-                let max_l = logits_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let mut probs = vec![0.0f32; vocab_size];
-                let mut prob_sum = 0.0f32;
-                for (i, &v) in logits_vec.iter().enumerate() {
-                    let e = (v - max_l).exp();
-                    probs[i] = e;
-                    prob_sum += e;
-                }
-                if prob_sum > 0.0 {
-                    for v in &mut probs {
-                        *v /= prob_sum;
-                    }
-                }
-                let mut indices: Vec<usize> = (0..vocab_size).collect();
-                indices.sort_by(|&a, &b| {
-                    probs[b]
-                        .partial_cmp(&probs[a])
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                let mut cumsum = 0.0f32;
-                for (rank, &idx) in indices.iter().enumerate() {
-                    cumsum += probs[idx];
-                    if cumsum > p {
-                        for &i in &indices[rank..] {
-                            logits_vec[i] = f32::NEG_INFINITY;
+            // Top-k
+            if let Some(k) = sampler.top_k {
+                let k = (k as usize).min(vocab_size);
+                if k > 0 && k < vocab_size {
+                    let mut sorted = logits_vec.clone();
+                    sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                    let threshold = sorted[k - 1];
+                    for v in &mut logits_vec {
+                        if *v < threshold {
+                            *v = f32::NEG_INFINITY;
                         }
-                        break;
                     }
                 }
             }
-        }
 
-        let all_inf = logits_vec.iter().all(|v| !v.is_finite() || v.is_nan());
-        let token = if all_inf {
-            logits_vec
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(i, _)| i as u32)
-                .unwrap_or(0)
-        } else {
-            let shape = [1i32, 1, vocab_size as i32];
-            let filtered_arr = Array::from_slice(&logits_vec, &shape);
-            let key = match sampler.seed {
-                Some(s) => Some(mlx_rs::random::key(s)?),
-                None => None,
+            // Top-p
+            if let Some(p) = sampler.top_p {
+                if p > 0.0 && p < 1.0 {
+                    let max_l = logits_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let mut probs = vec![0.0f32; vocab_size];
+                    let mut prob_sum = 0.0f32;
+                    for (i, &v) in logits_vec.iter().enumerate() {
+                        let e = (v - max_l).exp();
+                        probs[i] = e;
+                        prob_sum += e;
+                    }
+                    if prob_sum > 0.0 {
+                        for v in &mut probs {
+                            *v /= prob_sum;
+                        }
+                    }
+                    let mut indices: Vec<usize> = (0..vocab_size).collect();
+                    indices.sort_by(|&a, &b| {
+                        probs[b]
+                            .partial_cmp(&probs[a])
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    let mut cumsum = 0.0f32;
+                    for (rank, &idx) in indices.iter().enumerate() {
+                        cumsum += probs[idx];
+                        if cumsum > p {
+                            for &i in &indices[rank..] {
+                                logits_vec[i] = f32::NEG_INFINITY;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let all_inf = logits_vec.iter().all(|v| !v.is_finite() || v.is_nan());
+            let token = if all_inf {
+                logits_vec
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i as u32)
+                    .unwrap_or(0)
+            } else {
+                let shape = [1i32, 1, vocab_size as i32];
+                let filtered_arr = Array::from_slice(&logits_vec, &shape);
+                let key = match sampler.seed {
+                    Some(s) => Some(mlx_rs::random::key(s)?),
+                    None => None,
+                };
+                let token_arr =
+                    mlx_rs::random::categorical(&filtered_arr, None, None, key.as_ref())?;
+                let t: Vec<u32> = token_arr
+                    .try_as_slice::<u32>()
+                    .map_err(|e| mlx_rs::error::Exception::custom(format!("categorical: {:?}", e)))?
+                    .to_vec();
+                t.first().copied().unwrap_or(0)
             };
-            let token_arr = mlx_rs::random::categorical(&filtered_arr, None, None, key.as_ref())?;
-            let t: Vec<u32> = token_arr
-                .try_as_slice::<u32>()
-                .map_err(|e| mlx_rs::error::Exception::custom(format!("categorical: {:?}", e)))?
-                .to_vec();
-            t.first().copied().unwrap_or(0)
-        };
-        Array::from_slice(&[token], &[1])
+            Array::from_slice(&[token], &[1])
         }
     };
 
@@ -1703,10 +1910,7 @@ pub fn run_epilogue_prefetch(
     let token_slice: Vec<u32> = selected_token
         .try_as_slice::<u32>()
         .map_err(|e| {
-            mlx_rs::error::Exception::custom(format!(
-                "run_epilogue_prefetch: read token: {:?}",
-                e
-            ))
+            mlx_rs::error::Exception::custom(format!("run_epilogue_prefetch: read token: {:?}", e))
         })?
         .to_vec();
     let selected_token_id = token_slice.first().copied().unwrap_or(0);

@@ -5,6 +5,7 @@
 
 use mlx_rs::error::Result as MlxResult;
 use mlx_rs::Array;
+use crate::bridge::ARRAY_REGISTRY;
 
 // ── RMSNorm ────────────────────────────────────────────────────────────────
 
@@ -186,7 +187,12 @@ impl QuantizedEmbedding {
     /// Output projection (lm_head): reuses the same quantized weights
     /// as a linear projection. x: [batch, seq, hidden_dim] → [batch, seq, vocab_size]
     pub fn as_output(&self, x: &Array) -> MlxResult<Array> {
-        use crate::bridge::ARRAY_REGISTRY;
+        use crate::projection_executor::{
+            MaterializationClass, ProjectionExecutor, QuantizedProjectionDescriptor,
+            RuntimeMode, StorageDtype,
+        };
+        use crate::projection_identity::ProjectionFamily;
+
         let reg = ARRAY_REGISTRY.read();
         let w = reg
             .get(self.weight)
@@ -202,7 +208,36 @@ impl QuantizedEmbedding {
             .ok_or_else(|| mlx_rs::error::Exception::custom("embed biases not found"))?;
         drop(reg);
 
-        mlx_rs::ops::quantized_matmul(x, &w, &s, &b, true, 64, 8)
+        // Derive quantization parameters from the loaded weight shapes.
+        let w_shape: Vec<u32> = w.shape().iter().map(|&d| d as u32).collect();
+        let bits: u8 = 4; // int4
+        let logical_in_features = self.hidden_dim;
+        let logical_out_features = self.vocab_size;
+        // group_size = logical_in_features / n_groups where n_groups = scales[-1]
+        let n_groups = s.shape().last().copied().unwrap_or(1) as u32;
+        let group_size = if n_groups > 0 {
+            logical_in_features / n_groups
+        } else {
+            64
+        };
+
+        let executor = ProjectionExecutor {
+            mode: RuntimeMode::Safe,
+        };
+
+        let desc = QuantizedProjectionDescriptor {
+            family: ProjectionFamily::LmHead,
+            logical_in_features,
+            logical_out_features,
+            bits,
+            group_size,
+            storage_dtype: StorageDtype::U32,
+            physical_weight_shape: w_shape,
+            layer_index: 0, // not a decoder-layer projection
+            weight_materialization: MaterializationClass::MlxOwned,
+        };
+
+        executor.run_projection(x, &w, &s, &b, &desc)
     }
 }
 

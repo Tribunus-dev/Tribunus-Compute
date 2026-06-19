@@ -183,7 +183,7 @@ impl ProjectionHarness {
             .segments
             .get(&w_entry.segment)
             .ok_or_else(|| format!("segment not found: {}", w_entry.segment))?;
-        let (w_arr, _) = crate::profiled_executor::load_tensor_from_mapped_segment(w_seg, w_entry)
+        let (w_arr, _) = crate::profiled_executor::load_tensor_from_mapped_segment(w_seg, w_entry, false)
             .map_err(|e| format!("load weight: {}", e))?;
 
         let s_entry = reader
@@ -196,7 +196,7 @@ impl ProjectionHarness {
             .segments
             .get(&s_entry.segment)
             .ok_or_else(|| format!("segment not found: {}", s_entry.segment))?;
-        let (s_arr, _) = crate::profiled_executor::load_tensor_from_mapped_segment(s_seg, s_entry)
+        let (s_arr, _) = crate::profiled_executor::load_tensor_from_mapped_segment(s_seg, s_entry, false)
             .map_err(|e| format!("load scale: {}", e))?;
 
         let b_entry = reader
@@ -209,7 +209,7 @@ impl ProjectionHarness {
             .segments
             .get(&b_entry.segment)
             .ok_or_else(|| format!("segment not found: {}", b_entry.segment))?;
-        let (b_arr, _) = crate::profiled_executor::load_tensor_from_mapped_segment(b_seg, b_entry)
+        let (b_arr, _) = crate::profiled_executor::load_tensor_from_mapped_segment(b_seg, b_entry, false)
             .map_err(|e| format!("load bias: {}", e))?;
 
         let group_size = if s_arr.shape().len() >= 1 {
@@ -414,7 +414,7 @@ impl ProjectionHarness {
             }
             ProjectionFamily::OProj => {
                 // O-proj input is attention output: n_heads * head_dim
-                // Default to 4096 (16 heads × 256) for interior layers
+                // Default to 4096 (16 heads x 256) for interior layers
                 vec![1, 4096]
             }
             ProjectionFamily::GateProj | ProjectionFamily::UpProj => {
@@ -423,6 +423,10 @@ impl ProjectionHarness {
             ProjectionFamily::DownProj => {
                 // Down-proj input is gated MLP output: intermediate_size
                 vec![1, 15360]
+            }
+            ProjectionFamily::LmHead => {
+                // LmHead input is the final hidden state: hidden_size
+                vec![1, self.hidden_size]
             }
         }
     }

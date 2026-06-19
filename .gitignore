@@ -4,6 +4,7 @@ Thumbs.db
 
 # Build artifacts
 target/
+packages/
 *.node
 *.so
 *.dylib
@@ -15,17 +16,21 @@ __pycache__/
 venv/
 
 # Models (too large for git)
+compute-native/models/
+models/qwen-coreml/
+models/qwen-source/
 models/*.safetensors
 models/*.gguf
 models/*.bin
 models/*.pt
 models/*.pth
 
-# IDE
+# IDE / generated
 .idea/
 .vscode/
 *.swp
 *.swo
+*.xcodeproj/
 
 # Environment
 .environment

@@ -275,9 +275,9 @@ impl JointAttention {
 
         // Scaled dot-product attention
         let attn_out = if let Some(mask) = mask {
-            fast::scaled_dot_product_attention(&q, &k, &v, Some(self.scale), Some(mask))?
+            fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask, None)?
         } else {
-            fast::scaled_dot_product_attention(&q, &k, &v, Some(self.scale), None)?
+            fast::scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?
         };
 
         // Split back into image and text

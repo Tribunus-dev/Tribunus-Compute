@@ -100,7 +100,7 @@ fn attention(
     let v = v.reshape(&[batch, seq_len, num_heads, head_dim])?
         .transpose_axes(&[0, 2, 1, 3])?;
 
-    let attn = mlx_rs::fast::scaled_dot_product_attention(q, k, v, scale, None)?;
+    let attn = mlx_rs::fast::scaled_dot_product_attention(q, k, v, scale, None, None)?;
     attn.transpose_axes(&[0, 2, 1, 3])?
         .reshape(&[batch, seq_len, num_heads * head_dim])
 }

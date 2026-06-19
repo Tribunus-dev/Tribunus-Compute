@@ -66,7 +66,7 @@ pub fn sample_token(
     }
 
     // Multinomial sampling
-    let r: f32 = rng.gen();
+    let r: f32 = rng.r#gen();
     let mut cumsum = 0.0;
     for &(idx, prob) in &probs {
         cumsum += prob;

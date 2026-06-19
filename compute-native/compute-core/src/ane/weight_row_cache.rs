@@ -21,6 +21,11 @@
 use crate::arena::Arena;
 use mlx_rs::Array;
 use mlx_rs::ops::indexing::IndexOp;
+use crate::projection_executor::{
+    ProjectionExecutor, QuantizedProjectionDescriptor,
+    MaterializationClass, StorageDtype, RuntimeMode,
+};
+use crate::projection_identity::ProjectionFamily;
 
 // ---------------------------------------------------------------------------
 // SlotAllocator
@@ -135,6 +140,8 @@ pub struct WeightRowCache {
     pub max_rows: u32,
     /// Hidden size dimension.
     hidden_size: u32,
+    /// Quantization bit width for the LM head weight.
+    bits: u8,
     /// ANE SRAM slot allocator.
     pub slot_allocator: SlotAllocator,
     /// Temporary buffer for dot-product computation.
@@ -148,7 +155,8 @@ impl WeightRowCache {
     ///
     /// * `max_rows` — maximum number of weight rows to cache (e.g. 256).
     /// * `hidden_size` — model's hidden state dimension (e.g. 3840).
-    pub fn new(max_rows: u32, hidden_size: u32) -> Result<Self, String> {
+    /// * `bits` — quantization bit width for the LM head weight (e.g. 4 for int4).
+    pub fn new(max_rows: u32, hidden_size: u32, bits: u8) -> Result<Self, String> {
         let row_arena = Arena::new(max_rows, hidden_size, mlx_rs::Dtype::Float16)?;
 
         Ok(Self {
@@ -156,6 +164,7 @@ impl WeightRowCache {
             cached_token_ids: vec![0u32; max_rows as usize],
             max_rows,
             hidden_size,
+            bits,
             slot_allocator: SlotAllocator::new(max_rows),
             dot_buffer: vec![0.0f32; hidden_size as usize],
         })
@@ -389,20 +398,32 @@ impl WeightRowCache {
             ));
         }
 
-        // Compute scale/group_size from lm_head shapes
-        // We need output_scales and output_biases for the quantized matmul.
-        // These should have been provided alongside lm_head.
-        // For a standalone hybrid path, read them from the quantized weight.
         let (w, s, b) = Self::decompose_quantized_weight(lm_head)?;
 
+        // Derive group_size from the scales shape.
         let group_size = if s.shape().len() >= 1 {
-            (w.shape()[1] as i32 * 4) / s.shape()[s.shape().len() - 1]
+            (w.shape()[1] as u32 * 4) / s.shape()[s.shape().len() - 1] as u32
         } else {
             64
         };
+        let bits = self.bits;
 
-        let logits = mlx_rs::ops::quantized_matmul(hidden, &w, &s, &b, true, group_size, 8)
-            .map_err(|e| format!("hybrid_lm_head quantized_matmul: {:?}", e))?;
+        let w_shape: Vec<u32> = w.shape().iter().map(|&d| d as u32).collect();
+        let desc = QuantizedProjectionDescriptor {
+            family: ProjectionFamily::LmHead,
+            logical_in_features: self.hidden_size,
+            logical_out_features: w_shape[1],
+            bits,
+            group_size,
+            storage_dtype: StorageDtype::U32,
+            physical_weight_shape: w_shape,
+            layer_index: 0,
+            weight_materialization: MaterializationClass::MlxOwned,
+        };
+        let executor = ProjectionExecutor { mode: RuntimeMode::Safe };
+        let logits = executor
+            .run_projection(hidden, &w, &s, &b, &desc)
+            .map_err(|e| format!("hybrid_lm_head run_projection: {:?}", e))?;
 
         // logits shape: [1, vocab_size]
         logits.eval().map_err(|e| format!("hybrid_lm_head eval: {}", e))?;

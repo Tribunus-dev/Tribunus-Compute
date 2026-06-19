@@ -4,8 +4,11 @@
 //! through opaque generational-handle indices. The MlxBackend implementation wraps
 //! `mlx_rs::Array` operations behind a generational slot-map registry.
 
+#[cfg(target_os = "macos")]
 pub mod accelerate;
+#[cfg(target_os = "macos")]
 pub mod accelerate_ffi;
+#[cfg(target_os = "macos")]
 pub mod coreml;
 pub mod evaluation;
 pub mod graph;

@@ -167,10 +167,12 @@ impl AudioAttention {
             Some(m) => mlx_rs::fast::scaled_dot_product_attention(
                 q, k, v, 1.0,
                 mlx_rs::fast::ScaledDotProductAttentionMask::Array(m),
+                None,
             )?,
             None => mlx_rs::fast::scaled_dot_product_attention(
                 q, k, v, 1.0,
                 None::<mlx_rs::fast::ScaledDotProductAttentionMask>,
+                None,
             )?,
         };
 

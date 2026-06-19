@@ -173,12 +173,15 @@ impl Qwen4BAttention {
         let attn_out = match mask {
             Some(m) => mlx_rs::fast::scaled_dot_product_attention(
                 q, k, v, self.scale, ScaledDotProductAttentionMask::Array(m),
+                None,
             )?,
             None if seq_len > 1 => mlx_rs::fast::scaled_dot_product_attention(
                 q, k, v, self.scale, ScaledDotProductAttentionMask::Causal,
+                None,
             )?,
             None => mlx_rs::fast::scaled_dot_product_attention(
                 q, k, v, self.scale, None::<ScaledDotProductAttentionMask>,
+                None,
             )?,
         };
 

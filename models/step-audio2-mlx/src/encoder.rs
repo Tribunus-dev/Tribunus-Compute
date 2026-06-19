@@ -184,7 +184,7 @@ impl Module<&Array> for EncoderAttention {
             .transpose_axes(&[0, 2, 1, 3])?;
 
         // Scaled dot-product attention (no mask for encoder)
-        let attn_out = mlx_rs::fast::scaled_dot_product_attention(q, k, v, self.scale, None)?;
+        let attn_out = mlx_rs::fast::scaled_dot_product_attention(q, k, v, self.scale, None, None)?;
 
         // Reshape back to [B, L, dim]
         let attn_out = attn_out

@@ -160,7 +160,7 @@ impl QuantizedQwen3Attention {
                 &keys,
                 &values,
                 self.scale,
-                ScaledDotProductAttentionMask::Array(&mask),
+                ScaledDotProductAttentionMask::Array(&mask), None,
             )?
         } else {
             fast::scaled_dot_product_attention(
@@ -168,7 +168,7 @@ impl QuantizedQwen3Attention {
                 &keys,
                 &values,
                 self.scale,
-                ScaledDotProductAttentionMask::Causal,
+                ScaledDotProductAttentionMask::Causal, None,
             )?
         };
 
