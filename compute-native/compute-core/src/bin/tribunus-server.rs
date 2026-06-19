@@ -97,6 +97,7 @@ async fn main() {
         #[cfg(feature = "mlx-backend")]
         eprintln!("  --no-worker          Coordinator-only node (no local inference)");
         eprintln!("  --code-mode          Optimize for code completion latency");
+        eprintln!("  --dev-mode           Disable auth, auto-register model, verbose errors");
         eprintln!();
         eprintln!("Environment variables:");
         eprintln!("  TRIBUNUS_CONFIG_PATH   Config file path");
@@ -135,17 +136,25 @@ async fn main() {
     let mut no_worker = false;
     #[cfg(feature = "mlx-backend")]
     let mut code_mode = false;
+    let mut dev_mode = false;
     for arg in &args {
         match arg.as_str() {
             #[cfg(feature = "mlx-backend")]
             "--no-worker" => no_worker = true,
             #[cfg(feature = "mlx-backend")]
             "--code-mode" => code_mode = true,
+            "--dev-mode" => dev_mode = true,
             _ => {}
         }
     }
 
     log_info!("Tribunus Compute Server v0.1.0");
+    // ── Dev mode: disable auth, auto-register model, verbose errors ────
+    if dev_mode {
+        log_warn!("[dev-mode] Auth disabled, model auto-registered, verbose errors enabled");
+        unsafe { std::env::set_var("TRIBUNUS_API_KEYS", ""); }
+        // Model auto-registration happens below.
+    }
 
     // ── MLX backend startup path ────────────────────────────────────────
     #[cfg(feature = "mlx-backend")]

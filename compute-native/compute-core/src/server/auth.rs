@@ -40,6 +40,10 @@ impl ApiKeyValidator {
     /// Returns `true` if `token` is a known API key, `false` otherwise.
     pub fn validate(&self, token: &str) -> bool {
         let keys = self.keys.read().expect("RwLock poisoned");
+        // If no keys are configured, allow all requests (dev mode).
+        if keys.is_empty() {
+            return true;
+        }
         keys.contains(token)
     }
 
