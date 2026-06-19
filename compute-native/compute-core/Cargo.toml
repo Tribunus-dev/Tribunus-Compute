@@ -58,6 +58,10 @@ name = "tribunus-bench-smoke"
 path = "src/bin/tribunus-bench-smoke.rs"
 
 [[bin]]
+name = "tribunus-bench"
+path = "src/bin/tribunus-bench.rs"
+
+[[bin]]
 name = "tribunus-server"
 required-features = ["server"]
 path = "src/bin/tribunus-server.rs"

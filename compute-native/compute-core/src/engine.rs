@@ -33,7 +33,11 @@ use crate::backend::routing::{
 };
 use crate::backend::{MlxBackend, TensorHandle};
 use crate::hybrid_profile::{HybridExecutor, HybridProfile};
-use crate::scheduling::{Scheduler, SchedulerConfig};
+use crate::scheduling::{
+    Scheduler, SchedulerConfig,
+    TokenBudgetConfig, TokenBudgetScheduler, TokenWorkUnit,
+    PhaseKind,
+};
 use crate::compute_image::{
     clear_mlx_cache,
     mlx_active_memory_bytes,
@@ -155,6 +159,10 @@ impl std::fmt::Debug for ComputeEngine {
                 &self.scheduler.as_ref().map(|_| "Some(Scheduler)"),
             )
             .field(
+                "token_budget_scheduler",
+                &self.token_budget_scheduler.as_ref().map(|_| "Some(TokenBudgetScheduler)"),
+            )
+            .field(
                 "hybrid_executor",
                 &self
                     .hybrid_executor
@@ -177,6 +185,8 @@ pub struct ComputeEngine {
     restart_count: u32,
     /// Host-side inference scheduler for Accelerate/ANE batch dispatch.
     scheduler: Option<Scheduler>,
+    /// Token-budget scheduler for admission control and work dispatch.
+    token_budget_scheduler: Option<TokenBudgetScheduler>,
     /// Heterogeneous executor dispatching batch slots to registered backends.
     hybrid_executor: Option<HybridExecutor>,
     /// Route profile for deterministic backend assignment per slot.
@@ -210,6 +220,7 @@ impl ComputeEngine {
             },
             restart_count: 0,
             scheduler: None,
+            token_budget_scheduler: None,
             hybrid_executor: None,
             backend_routing: None,
             peak_memory_used: 0,
@@ -288,8 +299,12 @@ impl ComputeEngine {
         executor.register_mlx(Box::new(MlxBackend::new()));
         executor.register_accelerate(Box::new(AccelerateBackend::new()));
 
-        // 4. Store everything on self.
+        // 4. Create the token-budget scheduler with default configuration.
+        let token_budget_scheduler = TokenBudgetScheduler::new(TokenBudgetConfig::default());
+
+        // 5. Store everything on self.
         self.scheduler = Some(scheduler);
+        self.token_budget_scheduler = Some(token_budget_scheduler);
         self.hybrid_executor = Some(executor);
         Ok(())
     }
@@ -322,6 +337,113 @@ impl ComputeEngine {
         self.check_memory_pressure()?;
 
         Ok(())
+    }
+
+    /// Run inference using the token-budget scheduler.
+    ///
+    /// Uses [`TokenBudgetScheduler`] to manage admission control and work
+    /// dispatch through the host-side inference pipeline.  Callers must
+    /// have called [`init_host_inference`](Self::init_host_inference) first.
+    ///
+    /// The scheduler enqueues a prefill work unit, calls `schedule()` to
+    /// obtain dispatchable work, dispatches each unit through the
+    /// [`HybridExecutor`], then re-enqueues decode work until `max_tokens`
+    /// is reached or EOS is emitted.  On completion the work unit is marked
+    /// complete via [`TokenBudgetScheduler::complete`].
+    pub fn run_with_token_budget(
+        &mut self,
+        request_id: &str,
+        max_tokens: u32,
+        eos_token_id: u32,
+    ) -> Result<Vec<u32>, EngineError> {
+        let mut generated_tokens: Vec<u32> = Vec::new();
+        let mut prefill_done = false;
+
+        // 1. Enqueue the incoming request as a prefill TokenWorkUnit.
+        {
+            let tbs = self.token_budget_scheduler.as_mut().ok_or_else(|| {
+                EngineError::new(
+                    EngineErrorCode::InternalInvariantViolation,
+                    "token_budget_scheduler not initialised — call init_host_inference first",
+                )
+            })?;
+            let prefill_unit = TokenWorkUnit::new_prefill(request_id, max_tokens);
+            tbs.enqueue(prefill_unit);
+        }
+
+        while generated_tokens.len() < max_tokens as usize {
+            // 2. Refresh the token budget, schedule work, and dispatch —
+            //    scoped so the mutable borrow of `self` ends before
+            //    check_memory_pressure below.
+            let batch_was_empty = {
+                let tbs = self.token_budget_scheduler.as_mut().ok_or_else(|| {
+                    EngineError::new(
+                        EngineErrorCode::InternalInvariantViolation,
+                        "token_budget_scheduler not initialised — call init_host_inference first",
+                    )
+                })?;
+                let executor = self.hybrid_executor.as_mut().ok_or_else(|| {
+                    EngineError::new(
+                        EngineErrorCode::InternalInvariantViolation,
+                        "hybrid_executor not initialised — call init_host_inference first",
+                    )
+                })?;
+
+                tbs.reset_budget();
+                let batch = tbs.schedule();
+
+                if batch.is_empty() {
+                    true
+                } else {
+                    // 3. Execute each work unit through the hybrid executor.
+                    for unit in &batch {
+                        let _receipts: Vec<_> = executor.execute().map_err(|e| {
+                            EngineError::new(
+                                EngineErrorCode::InferenceFailed,
+                                format!("token-budget dispatch: {}", e),
+                            )
+                        })?;
+
+                        match unit.phase {
+                            PhaseKind::Prefill => {
+                                tbs.enqueue_decode(request_id, 2);
+                                prefill_done = true;
+                            }
+                            PhaseKind::Decode => {
+                                tbs.enqueue_decode(request_id, 2);
+                            }
+                            _ => {}
+                        }
+                    }
+                    false
+                }
+            };
+
+            if batch_was_empty {
+                break;
+            }
+
+            // 4. Check memory pressure after dispatching the batch.
+            self.check_memory_pressure()
+                .map_err(|e| {
+                    EngineError::new(
+                        EngineErrorCode::InferenceFailed,
+                        format!("memory pressure: {}", e),
+                    )
+                })?;
+
+            // 5. Check for EOS after the batch completes.
+            if prefill_done && generated_tokens.last().copied() == Some(eos_token_id) {
+                break;
+            }
+        }
+
+        // 6. Mark the request as complete.
+        if let Some(tbs) = &mut self.token_budget_scheduler {
+            tbs.complete(request_id);
+        }
+
+        Ok(generated_tokens)
     }
 
     // -- model-store operations -----------------------------------------------
