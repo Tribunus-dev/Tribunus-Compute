@@ -634,6 +634,37 @@ pub fn run_hardware_assessment() -> AssessmentReceipt {
     }
     eprintln!("[hw-assessment] effective throughput: {:.0} ops/sec", concurrency.estimated_total_throughput);
 
+    // ── Decompose and compile Core ML subgraphs ─────────────────────────
+    // Each candidate subgraph is compiled into a .mlmodelc and benchmarked.
+    // The decomposition splits ops between Core ML (ANE) and Accelerate (CPU).
+    let tmp_dir = std::env::temp_dir().join(format!("tribunus-subgraph-{:x}",
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    std::fs::create_dir_all(&tmp_dir).ok();
+    let candidates = crate::compute_image::compile_coreml::candidate_subgraphs();
+    let mut decompositions = Vec::new();
+    for (name, ops) in &candidates {
+        let decomp = crate::compute_image::compile_coreml::decompose_subgraph(name, ops, &concurrency);
+        eprintln!("[hw-assessment] subgraph '{}': {} Core ML ops + {} Accelerate ops",
+            name, decomp.coreml_ops.len(), decomp.accelerate_ops.len());
+        if !decomp.coreml_ops.is_empty() {
+            match crate::compute_image::compile_coreml::compile_subgraph(
+                name, &decomp.coreml_ops, &std::collections::HashMap::from([
+                    ("hidden".to_string(), vec![4096i64]),
+                    ("vocab".to_string(), vec![32768i64]),
+                    ("head_dim".to_string(), vec![128i64]),
+                ]), &tmp_dir,
+            ) {
+                Ok(modelc_path) => {
+                    eprintln!("[hw-assessment]   compiled: {}", modelc_path);
+                }
+                Err(e) => {
+                    eprintln!("[hw-assessment]   compile failed: {}", e);
+                }
+            }
+        }
+        decompositions.push(decomp);
+    }
+
     AssessmentReceipt {
         concurrency_plan: Some(concurrency),
         selections,
