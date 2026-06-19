@@ -11,81 +11,115 @@ compile_error!(
 
 extern crate self as tribunus_compute_core;
 
+#[cfg(feature = "mlx-backend")]
 pub mod analysis;
+#[cfg(feature = "mlx-backend")]
 pub mod audio;
+#[cfg(feature = "mlx-backend")]
 pub mod autopsy;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "mlx-backend"))]
 pub mod ane;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "mlx-backend"))]
 pub mod ane_bridge;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "mlx-backend"))]
 pub mod arena;
 #[cfg(target_os = "macos")]
 pub mod arena_info;
 #[cfg(target_os = "macos")]
 pub mod arena_lifecycle;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "mlx-backend"))]
 pub mod arena_pool;
+#[cfg(feature = "mlx-backend")]
 pub mod attention;
 pub mod backend;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "mlx-backend"))]
 pub mod bridge;
+#[cfg(feature = "mlx-backend")]
 pub mod cache;
+#[cfg(feature = "mlx-backend")]
 pub mod capability;
 pub mod cli;
+#[cfg(feature = "mlx-backend")]
 pub mod compile_pipeline;
+#[cfg(feature = "mlx-backend")]
 pub mod compile_progress;
+#[cfg(feature = "mlx-backend")]
 pub mod compile_state;
+#[cfg(feature = "mlx-backend")]
 pub mod compiler;
+#[cfg(feature = "mlx-backend")]
 pub mod compute_image;
 pub mod compute_image_v0;
 pub mod compute_ir;
 pub mod compute_lane;
 pub mod compute_service;
+#[cfg(feature = "mlx-backend")]
 pub mod config;
+#[cfg(feature = "mlx-backend")]
 pub mod contracts;
 pub mod crash_breadcrumb;
+#[cfg(feature = "mlx-backend")]
 pub mod copy_ledger;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "mlx-backend"))]
 pub mod coreml_audit;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "mlx-backend"))]
 pub mod coreml_bridge;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "mlx-backend"))]
 pub mod coreml_pipeline;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "mlx-backend"))]
 pub mod coreml_state;
+#[cfg(feature = "mlx-backend")]
 pub mod cpu_benchmarks;
+#[cfg(feature = "mlx-backend")]
 pub mod decode_attribution;
+#[cfg(feature = "mlx-backend")]
 pub mod engine;
 pub mod engine_error;
 pub mod engine_policy;
 pub mod engine_receipts;
 pub mod errors;
+#[cfg(feature = "mlx-backend")]
 pub mod executor;
 pub mod experiment;
+#[cfg(feature = "mlx-backend")]
 pub mod external_array;
+#[cfg(feature = "mlx-backend")]
 pub mod generation;
 pub mod fusion_region;
+#[cfg(feature = "mlx-backend")]
 pub mod gemma;
+#[cfg(feature = "mlx-backend")]
 pub mod grammar;
 pub mod gpu_memory;
+#[cfg(feature = "mlx-backend")]
 pub mod gguf;
+#[cfg(feature = "mlx-backend")]
 pub mod gpu_worker;
+#[cfg(feature = "mlx-backend")]
 pub mod heterogeneous;
+#[cfg(feature = "mlx-backend")]
 pub mod hybrid_profile;
 pub mod inference_profile;
+#[cfg(feature = "mlx-backend")]
 pub mod kv_cache;
+#[cfg(feature = "mlx-backend")]
 pub mod layout_compiler;
 pub mod layout_transform;
+#[cfg(feature = "mlx-backend")]
 pub mod loader;
 #[macro_use] pub mod logging;
+#[cfg(feature = "mlx-backend")]
 pub mod lora;
+#[cfg(feature = "mlx-backend")]
 pub mod mapped_image;
+#[cfg(feature = "mlx-backend")]
 pub mod memory;
 pub mod metrics;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "mlx-backend"))]
 pub mod metal_capture;
+#[cfg(feature = "mlx-backend")]
 pub mod mil_builder;
+#[cfg(feature = "mlx-backend")]
 pub mod mlpackage;
 pub mod plugin;
 #[cfg(feature = "mlx-backend")]
@@ -98,43 +132,65 @@ pub mod mlx_inventory;
 pub mod mlx_patch_register;
 #[cfg(feature = "mlx-backend")]
 pub mod mlx_runtime_probe;
+#[cfg(feature = "mlx-backend")]
 pub mod model_cache;
+#[cfg(feature = "mlx-backend")]
 pub mod model;
+#[cfg(feature = "mlx-backend")]
 pub mod model_runtime;
 pub mod model_store;
 pub mod native_kernel;
+#[cfg(feature = "mlx-backend")]
 pub mod operation_catalog;
+#[cfg(feature = "mlx-backend")]
 pub mod pipeline_parity;
 pub mod placement_profile;
+#[cfg(feature = "mlx-backend")]
 pub mod primitives;
 pub mod profile_compiler;
+#[cfg(feature = "mlx-backend")]
 pub mod profiled_executor;
+#[cfg(feature = "mlx-backend")]
 pub mod projection_identity;
 #[cfg(feature = "mlx-backend")]
 pub mod projection_executor;
+#[cfg(feature = "mlx-backend")]
 pub mod projection_tests;
 pub mod quantization;
+#[cfg(feature = "mlx-backend")]
 pub mod quantized;
 pub mod receipt;
 pub mod ring;
+#[cfg(feature = "mlx-backend")]
 pub mod readiness_gates;
 pub mod receipts;
+#[cfg(feature = "mlx-backend")]
 pub mod replay_projection;
 pub mod requalification;
+#[cfg(feature = "mlx-backend")]
 pub mod research_contracts;
+#[cfg(feature = "mlx-backend")]
 pub mod research_metrics;
+#[cfg(feature = "mlx-backend")]
 pub mod research_trace;
 pub mod residency;
 pub mod runtime_contract;
 pub mod runtime_orchestration;
+#[cfg(feature = "mlx-backend")]
 pub mod runtime_trace;
+#[cfg(feature = "mlx-backend")]
 pub mod scheduling;
 #[cfg(feature = "server")]
 pub mod server;
+#[cfg(feature = "mlx-backend")]
 pub mod editing;
+#[cfg(feature = "mlx-backend")]
 pub mod exo;
+#[cfg(feature = "mlx-backend")]
 pub mod session;
+#[cfg(feature = "mlx-backend")]
 pub mod sidecar;
+#[cfg(feature = "mlx-backend")]
 pub mod speculative;
 
 #[cfg(feature = "storage-adapters")]
@@ -143,24 +199,32 @@ pub mod storage_kernel;
 pub mod streaming;
 pub mod tokenizer;
 pub mod toolchain_attest;
+#[cfg(feature = "mlx-backend")]
 pub mod tools;
 pub mod transform_recipe;
+#[cfg(feature = "mlx-backend")]
 pub mod treatment;
+#[cfg(feature = "mlx-backend")]
 pub mod validator;
+#[cfg(feature = "mlx-backend")]
 pub mod video;
+#[cfg(feature = "mlx-backend")]
 pub mod vision;
 pub mod worker_crash_ledger;
+#[cfg(feature = "mlx-backend")]
 pub mod worker_memory;
 pub mod worker_protocol;
+#[cfg(feature = "mlx-backend")]
 pub mod worker_supervisor;
 #[cfg(feature = "candle-cpu")]
 pub mod candle_cpu_backend;
 
+#[cfg(feature = "mlx-backend")]
 pub use crate::session::{
     ControlSessionState, GenerationControlSession, InferenceSession, InferenceSessionState,
     SamplerConfig,
 };
-#[cfg(any(target_os = "macos", feature = "ane"))]
+#[cfg(any(feature = "mlx-backend"))]
 pub use coreml_proto;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

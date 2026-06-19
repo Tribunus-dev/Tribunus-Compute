@@ -5,19 +5,26 @@
 //! `mlx_rs::Array` operations behind a generational slot-map registry.
 
 #[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "mlx-backend"))]
 pub mod accelerate;
 #[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "mlx-backend"))]
 pub mod accelerate_ffi;
 #[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "mlx-backend"))]
 pub mod coreml;
 pub mod evaluation;
 pub mod graph;
+#[cfg(feature = "mlx-backend")]
 pub mod flex_dispatch;
+#[cfg(feature = "mlx-backend")]
 pub mod heterogeneous_executor;
 pub mod routing;
 pub mod tensor_registry;
 
+#[cfg(feature = "mlx-backend")]
 use mlx_rs::ops;
+#[cfg(feature = "mlx-backend")]
 use mlx_rs::Array;
 
 // ── DType ──────────────────────────────────────────────────────────────────
@@ -294,12 +301,14 @@ pub trait TensorBackend {
     fn backend_capabilities(&self) -> BackendCapabilities;
 }
 
+#[cfg(feature = "mlx-backend")]
 // ── MLX backend ────────────────────────────────────────────────────────────
 
 /// MLX-backed implementation of [`TensorBackend`].
 ///
 /// Stores arrays in generational slot-maps indexed by `TensorHandle`. A free
 /// list recycles slots from released handles. Slot generations are bumped
+#[cfg(feature = "mlx-backend")]
 pub struct MlxBackend {
     arrays: Vec<Option<Array>>,
     generations: Vec<u32>,
@@ -310,6 +319,7 @@ pub struct MlxBackend {
     name: String,
 }
 
+#[cfg(feature = "mlx-backend")]
 impl MlxBackend {
     /// Create a new empty backend.
     pub fn new() -> Self {
@@ -385,12 +395,14 @@ impl MlxBackend {
     }
 }
 
+#[cfg(feature = "mlx-backend")]
 impl Default for MlxBackend {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "mlx-backend")]
 impl TensorBackend for MlxBackend {
     // ── Creation ───────────────────────────────────────────────────────
 
