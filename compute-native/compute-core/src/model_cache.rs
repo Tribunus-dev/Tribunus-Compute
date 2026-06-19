@@ -682,6 +682,10 @@ pub fn default_model_sources() -> HashMap<String, ModelSource> {
         "qwen-tts".into(),
         ModelSource::HuggingFace("Qwen/qwen3-tts-mlx".into()),
     );
+    m.insert(
+        "qwen2.5-hw-bench".into(),
+        ModelSource::ImageDir("./models/qwen2.5-hw-bench".into()),
+    );
     m
 }
 

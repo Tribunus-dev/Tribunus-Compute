@@ -234,7 +234,10 @@ async fn main() {
             let worker_binary = std::env::var("TRIBUNUS_WORKER_BINARY")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| {
-                    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("tribunus-compute-worker"))
+                    std::env::current_exe()
+                        .ok()
+                        .map(|p| p.with_file_name("tribunus-compute-worker"))
+                        .unwrap_or_else(|| PathBuf::from("tribunus-compute-worker"))
                 });
 
             let image_hash = "";
