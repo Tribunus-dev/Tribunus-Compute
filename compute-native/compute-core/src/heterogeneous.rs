@@ -5,6 +5,7 @@
 use mlx_rs::Array;
 use mlx_rs::error::Result as MlxResult;
 
+use crate::log_debug;
 use crate::config::operation_route::OperationRoute;
 use crate::memory::allocator::IosurfaceAllocator;
 use crate::arena::Arena;
@@ -163,8 +164,10 @@ pub fn dispatch_rms_norm(
     island: Option<&SharedMemoryIsland>,
 ) -> MlxResult<Array> {
     if route.rms_norm != ACCELERATE {
+        log_debug!("[infer] backend=mlx op=rms_norm shape={:?} elems={}", x.shape(), x.shape().iter().product::<i32>());
         return crate::primitives::rms_norm(x, weight, eps);
     }
+    log_debug!("[infer] backend=accelerate op=rms_norm shape={:?} elems={}", x.shape(), x.shape().iter().product::<i32>());
     let (shape, x_data) = eval_and_extract(x)?;
     let weight_data = match weight.try_as_slice::<f32>() {
         Ok(s) => s.to_vec(),
@@ -263,8 +266,10 @@ pub fn dispatch_add(
     island: Option<&SharedMemoryIsland>,
 ) -> MlxResult<Array> {
     if route.add != ACCELERATE {
+        log_debug!("[infer] backend=mlx op=add shape={:?} elems={}", a.shape(), a.shape().iter().product::<i32>());
         return a.add(b);
     }
+    log_debug!("[infer] backend=accelerate op=add shape={:?} elems={}", a.shape(), a.shape().iter().product::<i32>());
     let (shape, a_data) = eval_and_extract(a)?;
     let b_data = match b.try_as_slice::<f32>() {
         Ok(s) => s.to_vec(),
@@ -307,8 +312,10 @@ pub fn dispatch_multiply(
     island: Option<&SharedMemoryIsland>,
 ) -> MlxResult<Array> {
     if route.multiply != ACCELERATE {
+        log_debug!("[infer] backend=mlx op=multiply shape={:?} elems={}", a.shape(), a.shape().iter().product::<i32>());
         return a.multiply(b);
     }
+    log_debug!("[infer] backend=accelerate op=multiply shape={:?} elems={}", a.shape(), a.shape().iter().product::<i32>());
     let (shape, a_data) = eval_and_extract(a)?;
     let b_data = match b.try_as_slice::<f32>() {
         Ok(s) => s.to_vec(),
@@ -346,8 +353,10 @@ pub fn dispatch_multiply(
 /// Reshape — no-op in Accelerate (view change).
 pub fn dispatch_reshape(x: &Array, shape: &[i32], route: &OperationRoute) -> MlxResult<Array> {
     if route.reshape != ACCELERATE {
+        log_debug!("[infer] backend=mlx op=reshape from={:?} to={:?}", x.shape(), shape);
         return x.reshape(shape);
     }
+    log_debug!("[infer] backend=accelerate op=reshape from={:?} to={:?}", x.shape(), shape);
     x.reshape(shape)
 }
 

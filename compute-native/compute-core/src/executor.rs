@@ -618,11 +618,14 @@ pub fn run_layer_with_sinks(
 static T2_PROBE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 fn qmatmul(x: &Array, w: &Array, s: &Array, b: &Array) -> MlxResult<Array> {
-    let group_size = if s.shape().len() >= 1 {
-        (w.shape()[1] as i32 * 4) / s.shape()[s.shape().len() - 1]
-    } else {
-        64
-    };
+    // Correct quantization parameters derived from logical feature dimensions.
+    // Packed U32 int4: each uint32 holds 8 logical values (32/4 = 8).
+    // logical_in = x.shape()[-1] (the input's hidden size).
+    // bits = 4 for int4 packing.
+    let in_features = x.shape().last().copied().unwrap_or(1) as i32;
+    let n_groups = s.shape().last().copied().unwrap_or(1) as i32;
+    let group_size = if n_groups > 0 { in_features / n_groups } else { 64 };
+    let bits: i32 = 4; // int4 quantization — 8 values per uint32
 
     // OPT-0006-T2 diagnostic: first-call stride/contiguity probe.
     // Answers: do external (mmap-backed) arrays trigger hidden copies?
@@ -631,7 +634,7 @@ fn qmatmul(x: &Array, w: &Array, s: &Array, b: &Array) -> MlxResult<Array> {
         let ws = w.shape();
         w.eval()?;
         let t_ext_start = std::time::Instant::now();
-        let r1 = mlx_rs::ops::quantized_matmul(x, w, s, b, true, group_size, 8)?;
+        let r1 = mlx_rs::ops::quantized_matmul(x, w, s, b, true, group_size, bits)?;
         let _ = r1.eval()?;
         let t_ext = t_ext_start.elapsed();
         let ws_str: Vec<String> = ws.iter().map(|d| d.to_string()).collect();
@@ -651,7 +654,7 @@ fn qmatmul(x: &Array, w: &Array, s: &Array, b: &Array) -> MlxResult<Array> {
                 .to_vec();
             let bc = Array::from_slice(&b_vec, &b.shape());
             let t_copy_start = std::time::Instant::now();
-            let r2 = mlx_rs::ops::quantized_matmul(x, &wc, &sc, &bc, true, group_size, 8)?;
+            let r2 = mlx_rs::ops::quantized_matmul(x, &wc, &sc, &bc, true, group_size, bits)?;
             let _ = r2.eval()?;
             let t_copy = t_copy_start.elapsed();
             let wss: Vec<String> = ws.iter().map(|d| d.to_string()).collect();
@@ -672,7 +675,7 @@ fn qmatmul(x: &Array, w: &Array, s: &Array, b: &Array) -> MlxResult<Array> {
         return Ok(r1);
     }
 
-    mlx_rs::ops::quantized_matmul(x, w, s, b, true, group_size, 8)
+    mlx_rs::ops::quantized_matmul(x, w, s, b, true, group_size, bits)
 }
 
 // ── Projection attribution wrapper ────────────────────────────────────

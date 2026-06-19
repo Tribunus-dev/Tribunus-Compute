@@ -106,17 +106,28 @@ pub fn quantized_embedding_lookup(
     scales: &Array,
     biases: &Array,
 ) -> MlxResult<Array> {
-    let group_size = if scales.shape().len() >= 1 {
-        (weight.shape()[1] as i32 * 4) / scales.shape()[scales.shape().len() - 1]
-    } else {
-        64
-    };
+    // Correct quantization parameters derived from logical feature dimensions.
+    // Packed U32 int4: each uint32 holds 8 logical values (32/4 = 8).
+    // In this context, weight.shape()[-1] is the PACKED physical column count.
+    // The logical in_features must be known from the weight's full shape.
+    // For embedding: logical_in_features = weight.shape()[-1] * (32 / bits).
+    // With bits=4: logical_in = weight.shape()[-1] * 8.
+    // But we don't have bits yet. Derive from the scale count:
+    let n_groups = scales.shape().last().copied().unwrap_or(1) as i32;
+    // logical_in_features = n_groups * group_size. We know group_size = 128 for embedding,
+    // but derive from the weight's second-to-last dimension (vocab) and logical hidden_size.
+    // Simpler: logical_in = weight.logical_shape[1] which is 896.
+    // At runtime, dequantize expects bits. Use int4 = 4.
+    let bits: i32 = 4;
+    let packed_cols = weight.shape().get(1).copied().unwrap_or(1) as i32;
+    let logical_in = packed_cols * (32 / bits); // 112 * 8 = 896
+    let group_size = if n_groups > 0 { logical_in / n_groups } else { 64 };
 
     let flat_ids = token_ids.reshape(&[-1])?;
     let rows = mlx_rs::ops::indexing::take_axis(weight, &flat_ids, 0)?;
     let row_scales = mlx_rs::ops::indexing::take_axis(scales, &flat_ids, 0)?;
     let row_biases = mlx_rs::ops::indexing::take_axis(biases, &flat_ids, 0)?;
-    let out = mlx_rs::ops::dequantize(&rows, &row_scales, &row_biases, group_size, 8)?;
+    let out = mlx_rs::ops::dequantize(&rows, &row_scales, &row_biases, group_size, bits)?;
 
     let mut shape = token_ids.shape().to_vec();
     shape.push(out.shape()[out.shape().len() - 1]);

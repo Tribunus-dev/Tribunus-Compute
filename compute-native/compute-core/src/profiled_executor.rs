@@ -6,6 +6,7 @@
 //! Per-generation state lives in ProfiledInferenceSession (owns KV caches,
 //! cancellation flag, token buffer, and timeline).
 
+use crate::log_debug;
 use crate::compute_image::{CompiledImageReader, CopyClassification, TensorEntry};
 use crate::config::ModelExecutionPlan;
 use crate::engine_error::{EngineError, EngineErrorCode};
@@ -1324,6 +1325,9 @@ impl ProfiledInferenceSession {
         }
 
         if let Some(scheduled) = &model.scheduled_module {
+        if std::env::var("TRIBUNUS_SKIP_MEMORY_PLAN").is_ok() {
+            return;
+        }
             if let Some(plan) = crate::memory::plan::plan_from_scheduled_module(
                 scheduled,
                 &crate::arena::Arena::new(1, 1, mlx_rs::Dtype::Float32).unwrap_or_else(|_| panic!("tmp arena")),
@@ -1462,6 +1466,7 @@ impl ProfiledInferenceSession {
             EngineErrorCode::InferenceFailed,
             format!("chunk prologue: {:?}", e),
         ))?;
+        log_debug!("[infer] event=prologue_output shape={:?} elems={}", hidden.shape(), hidden.shape().iter().product::<i32>());
         hidden.eval().map_err(|e| {
             EngineError::new(EngineErrorCode::NumericalFailure, format!("chunk prologue eval: {}", e))
         })?;
@@ -1469,6 +1474,7 @@ impl ProfiledInferenceSession {
         let _slots = model.memory_island.preallocate_layer_slots(1, 3840);
 
         for (l, layer_plan) in plan.layers.iter().enumerate() {
+            log_debug!("[infer] event=layer_run layer={} kind={}", l, &layer_plan.attention_kind);
             let lw = match &mut self.working_set {
                 Some(ws) => ws.weight_streamer.activate(l as u32)
                     .map_err(|e| EngineError::new(EngineErrorCode::InferenceFailed, e))?,
