@@ -16,7 +16,35 @@
 use std::path::Path;
 use std::time::Instant;
 
+use tempfile::TempDir;
+
 use crate::compute_image::hw_assessment::KernelBenchResult;
+use crate::coreml_pipeline;
+
+/// Compute profile for the Core ML execution lane.
+///
+/// Maps to Apple's [`MLComputeUnits`] values used when loading Core ML models.
+/// The recommended default for flexible CPU/ANE execution is [`CpuAndNeuralEngine`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComputeProfile {
+    CpuOnly,
+    CpuAndNeuralEngine,
+    NeuralEngineOnly,
+    GpuOnly,
+    All,
+}
+
+impl ComputeProfile {
+    pub fn name(&self) -> &'static str {
+        match self {
+            ComputeProfile::CpuOnly => "cpuOnly",
+            ComputeProfile::CpuAndNeuralEngine => "cpuAndNeuralEngine",
+            ComputeProfile::NeuralEngineOnly => "neuralEngine",
+            ComputeProfile::GpuOnly => "gpuOnly",
+            ComputeProfile::All => "all",
+        }
+    }
+}
 
 /// Status of a Core ML compiled subgraph.
 #[derive(Clone, Debug)]
@@ -108,7 +136,7 @@ impl CoreMlSubgraph {
             io_surface: std::ptr::null_mut(),
         };
 
-        model.predict("input", &input_arena, "output", &output_arena)?;
+        model.predict("input", &input_arena, "matmul_1", &output_arena)?;
         let elapsed = start.elapsed().as_secs_f64() * 1000.0;
         Ok(elapsed)
     }
@@ -119,6 +147,7 @@ pub struct CoreMlLane {
     pub name: String,
     pub subgraphs: Vec<CoreMlSubgraph>,
     pub is_available: bool,
+    pub compute_profile: ComputeProfile,
 }
 
 impl CoreMlLane {
@@ -129,6 +158,7 @@ impl CoreMlLane {
             name: "coreml-ane".into(),
             subgraphs: Vec::new(),
             is_available,
+            compute_profile: ComputeProfile::CpuAndNeuralEngine,
         }
     }
 
@@ -146,25 +176,44 @@ impl CoreMlLane {
 
     /// Compile a minimal test subgraph and benchmark it.
     ///
-    /// Looks for a pre-compiled .mlmodelc at standard test paths. If found,
-    /// loads the model, runs 10 warm + 10 timed iterations over a 256x256
-    /// float32 buffer, and returns measured latency statistics.
+    /// Compiles a 256x256 F32 matmul via [`coreml_pipeline::build_matmul_region`]
+    /// (which uses `cpuAndNeuralEngine` compute profile), loads the compiled
+    /// `.mlmodelc`, runs 1 warmup + 10 timed iterations, and returns measured
+    /// latency statistics.
     ///
-    /// Returns None if Core ML is unavailable, no model is found, or
-    /// inference fails.
+    /// Returns None if Core ML is unavailable, compilation fails, or inference fails.
     pub fn bench_minimal_subgraph(&self) -> Option<KernelBenchResult> {
+        eprintln!(
+            "[coreml-bench] using {} compute profile",
+            self.compute_profile.name()
+        );
+
         if !self.is_available {
             return None;
         }
 
-        // Standard paths for pre-compiled benchmark models used in CI/test.
-        let model_paths = [
-            "/tmp/tribunus-coreml-bench.mlmodelc/tribunus-coreml-bench.mlmodelc",
-            "/tmp/tribunus-coreml-nn-identity.mlmodelc/tribunus-coreml-nn-identity.mlmodelc",
-        ];
-        let model_path = model_paths.iter().find(|p| Path::new(p).exists())?;
+        // Compile a minimal matmul benchmark model with cpuAndNeuralEngine profile.
+        eprintln!("[coreml-bench] compiling benchmark subgraph...");
+        let compile_dir = TempDir::new().ok()?;
+        let compile_dir_path = compile_dir.path().to_path_buf();
 
-        let model = crate::coreml_bridge::CoreMlModel::load(model_path).ok()?;
+        let receipt = coreml_pipeline::build_matmul_region(
+            "input",
+            &[256, 256],
+            "weight",
+            &[1.0f32; 256 * 256],
+            &[256, 256],
+            &compile_dir_path,
+            "coreml-bench-identity",
+        )
+        .ok()?;
+
+        eprintln!(
+            "[coreml-bench] compiled: {} (hash={})",
+            receipt.compiled_modelc_path, receipt.compiled_hash
+        );
+
+        let model = crate::coreml_bridge::CoreMlModel::load(&receipt.compiled_modelc_path).ok()?;
 
         // 256x256 float32 — large enough to measure real ANE dispatch.
         let dim = 256u32;
@@ -199,8 +248,7 @@ impl CoreMlLane {
         };
 
         // Warmup: one inference to prime ANE caches and avoid cold-start bias.
-        model
-            .predict("input", &input_arena, "output", &output_arena)
+        model.predict("input", &input_arena, "matmul_1", &output_arena)
             .ok()?;
 
         // Timed iterations.
@@ -211,8 +259,7 @@ impl CoreMlLane {
 
         for _ in 0..ITERATIONS {
             let t0 = Instant::now();
-            model
-                .predict("input", &input_arena, "output", &output_arena)
+                model.predict("input", &input_arena, "matmul_1", &output_arena)
                 .ok()?;
             let elapsed_ns = t0.elapsed().as_nanos() as u64;
             total_ns = total_ns.wrapping_add(elapsed_ns);
