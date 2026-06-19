@@ -8,6 +8,7 @@ use crate::mapped_image::MappedSegment;
 pub(crate) use crate::quantized::QuantizedLinearBinding;
 use mlx_rs::Array;
 use serde::{Deserialize, Serialize};
+use crate::compute_image::hw_assessment::AssessmentReceipt;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -632,6 +633,9 @@ pub struct CompileReceipt {
     pub structural_verification: bool,
     /// Native dependency identity captured at compile time.
     pub native_dependency_report: NativeCapabilityReport,
+    /// Hardware assessment receipt from compile-time kernel profiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hw_assessment: Option<AssessmentReceipt>,
     pub stage_profile: StageProfile,
 }
 

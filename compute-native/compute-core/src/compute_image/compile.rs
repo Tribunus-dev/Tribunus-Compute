@@ -9,6 +9,8 @@ use super::manifest::{
     mlx_active_memory_bytes, mlx_peak_memory_bytes,
 };
 use super::plan::{compile_unchecked_speculative, plan};
+use super::compile_hw::run_hardware_assessment;
+use super::hw_assessment::AssessmentReceipt;
 use crate::config::CompileQuantMode;
 use crate::config::HardwareTarget;
 use mlx_rs::Array;
@@ -1002,6 +1004,7 @@ pub(crate) fn build_compile_receipt(
     manifest: &Manifest,
     elapsed_ms: u128,
     stage_profile: StageProfile,
+    hw_assessment: Option<AssessmentReceipt>,
 ) -> CompileReceipt {
     let byte_provenance = manifest
         .tensor_table
@@ -1073,6 +1076,7 @@ pub(crate) fn build_compile_receipt(
             && manifest.image_hash == compute_manifest_hash(manifest),
         native_dependency_report: NativeCapabilityReport::probe(),
         stage_profile,
+        hw_assessment,
     }
 }
 
@@ -1972,6 +1976,18 @@ pub(crate) fn compile_sequential(
     let manifest = builder.finalize(output_dir)?;
     let finalize_ms = t_finalize.elapsed().as_millis() as u64;
 
+    // ── Hardware assessment pass ────────────────────────────────────
+    // Probe target hardware, run synthetic benchmarks, and select
+    // optimal kernel variants for every op type.
+    let hw_assessment = run_hardware_assessment();
+
+    // Write assessment receipt alongside the manifest
+    let hw_path = output_dir.join("hw_assessment.json");
+    let hw_json = serde_json::to_string_pretty(&hw_assessment)
+        .map_err(|e| crate::Error::from_reason(format!("hw assessment json: {}", e)))?;
+    std::fs::write(&hw_path, hw_json)
+        .map_err(|e| crate::Error::from_reason(format!("write hw assessment: {}", e)))?;
+
     let total_source_bytes = loaded
         .source_tensors
         .values()
@@ -2006,6 +2022,7 @@ pub(crate) fn compile_sequential(
         &manifest,
         started_at.elapsed().as_millis(),
         stage_profile,
+        Some(hw_assessment),
     );
     let receipt_path = output_dir.join("receipt.json");
     let receipt_json = serde_json::to_string_pretty(&receipt)
@@ -2317,6 +2334,7 @@ pub fn compile_differential(
         &combined_manifest,
         started_at.elapsed().as_millis(),
         stage_profile,
+        Default::default(),
     );
     let receipt_path = output_dir_path.join("receipt.json");
     let receipt_json = serde_json::to_string_pretty(&receipt)

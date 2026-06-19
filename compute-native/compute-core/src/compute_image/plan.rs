@@ -387,6 +387,7 @@ pub(crate) fn compile_unchecked_speculative(
         &manifest,
         started_at.elapsed().as_millis(),
         stage_profile,
+        Default::default(),
     );
     let receipt_path = output_dir.join("receipt.json");
     let receipt_json = serde_json::to_string_pretty(&receipt)

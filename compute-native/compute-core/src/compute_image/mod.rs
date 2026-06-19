@@ -20,6 +20,9 @@ pub mod segment;
 pub mod pipeline;
 pub mod verify;
 pub mod source;
+pub mod hw_assessment;
+pub mod hw_bench_suite;
+pub mod compile_hw;
 #[cfg(feature = "tensix")]
 pub mod tensix;
 #[cfg(feature = "tensix")]
@@ -93,6 +96,10 @@ pub use compile::{
     load_source_tensor_table,
     parse_hf_source,
     SourceTensorInfo,
+};
+
+pub use compile_hw::{
+    run_hardware_assessment,
 };
 
 pub use segment::{
