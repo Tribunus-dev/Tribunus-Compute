@@ -21,6 +21,7 @@ use serde_json::json;
 use tokio::sync::Mutex;
 
 use crate::cache::evolkv::{CalibrationSet, EvolKV};
+use crate::worker_supervisor::WorkerLifecyclePhase;
 use crate::server::routes::AppState;
 use crate::worker_supervisor::WorkerSupervisor;
 
@@ -144,7 +145,7 @@ async fn admin_status(
                 "worker_pid": sup.process_ctrl.pid(),
                 "alive": sup.process_ctrl.is_alive(),
                 "active_requests": sup.registry.len(),
-                "model_loaded": sup.runtime_state.is_model_loaded(),
+                "model_loaded": sup.runtime_state.phase() == WorkerLifecyclePhase::Ready,
                 "faulted": sup.runtime_state.is_faulted(),
             }),
             None => json!({"worker": false}),

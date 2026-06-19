@@ -28,7 +28,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use crate::supervisor_crash::CrashRecoveryState;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -45,7 +45,52 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Graceful-shutdown wait before SIGKILL.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
-// ── WorkerProcessControl ───────────────────────────────────────────────────
+// ── Worker Lifecycle Phase ────────────────────────────────────
+
+/// Lifecycle phase of a worker subprocess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WorkerLifecyclePhase {
+    Absent = 0,
+    Spawning = 1,
+    Handshaking = 2,
+    Loading = 3,
+    Warming = 4,
+    Ready = 5,
+    Failed = 6,
+    Stopped = 7,
+}
+
+impl WorkerLifecyclePhase {
+    pub fn from_repr(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Absent),
+            1 => Some(Self::Spawning),
+            2 => Some(Self::Handshaking),
+            3 => Some(Self::Loading),
+            4 => Some(Self::Warming),
+            5 => Some(Self::Ready),
+            6 => Some(Self::Failed),
+            7 => Some(Self::Stopped),
+            _ => None,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Spawning => "spawning",
+            Self::Handshaking => "handshaking",
+            Self::Loading => "loading",
+            Self::Warming => "warming",
+            Self::Ready => "ready",
+            Self::Failed => "failed",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+// ── WorkerProcessControl ────────────────────────────────────
 
 /// Controls a worker subprocess.
 ///
@@ -412,8 +457,10 @@ impl WorkerEventReader {
 /// Uses `AtomicBool` for model/faulted flags, `Mutex<Instant>` for the
 /// heartbeat timestamp (updated frequently by event reader, read by watchdog).
 pub struct WorkerRuntimeState {
-    model_loaded: AtomicBool,
-    faulted: AtomicBool,
+    /// Current lifecycle phase — stored as u8 for atomic access.
+    phase: AtomicU8,
+    /// Monotonically increasing counter incremented on every LoadModel.
+    load_epoch: AtomicU64,
     last_heartbeat: Mutex<Instant>,
     restart_count: AtomicU32,
     worker_id: String,
@@ -422,8 +469,8 @@ pub struct WorkerRuntimeState {
 impl WorkerRuntimeState {
     pub fn new(worker_id: String) -> Self {
         Self {
-            model_loaded: AtomicBool::new(false),
-            faulted: AtomicBool::new(false),
+            phase: AtomicU8::new(WorkerLifecyclePhase::Absent as u8),
+            load_epoch: AtomicU64::new(0),
             last_heartbeat: Mutex::new(Instant::now()),
             restart_count: AtomicU32::new(0),
             worker_id,
@@ -435,11 +482,11 @@ impl WorkerRuntimeState {
     }
 
     pub fn mark_faulted(&self) {
-        self.faulted.store(true, Ordering::SeqCst);
+        self.phase.store(WorkerLifecyclePhase::Failed as u8, Ordering::Release);
     }
 
     pub fn is_faulted(&self) -> bool {
-        self.faulted.load(Ordering::SeqCst)
+        self.phase.load(Ordering::Acquire) == WorkerLifecyclePhase::Failed as u8
     }
 
     pub fn record_heartbeat(&self) {
@@ -454,16 +501,23 @@ impl WorkerRuntimeState {
         *self.last_heartbeat.lock()
     }
 
-    pub fn is_model_loaded(&self) -> bool {
-        self.model_loaded.load(Ordering::SeqCst)
+    pub fn phase(&self) -> WorkerLifecyclePhase {
+        WorkerLifecyclePhase::from_repr(self.phase.load(Ordering::Acquire))
+            .unwrap_or(WorkerLifecyclePhase::Failed)
     }
 
-    pub fn set_model_loaded(&self) {
-        self.model_loaded.store(true, Ordering::SeqCst);
+    /// Transition to a new phase.
+    pub fn set_phase(&self, phase: WorkerLifecyclePhase) {
+        self.phase.store(phase as u8, Ordering::Release);
     }
 
-    pub fn clear_model_loaded(&self) {
-        self.model_loaded.store(false, Ordering::SeqCst);
+    pub fn load_epoch(&self) -> u64 {
+        self.load_epoch.load(Ordering::Acquire)
+    }
+
+    /// Increment load epoch and return the new value.
+    pub fn increment_load_epoch(&self) -> u64 {
+        self.load_epoch.fetch_add(1, Ordering::Release) + 1
     }
 
     pub fn restart_count(&self) -> u32 {
@@ -952,7 +1006,7 @@ impl WorkerSupervisor {
         let session = Arc::new(std::sync::Mutex::new(session));
 
         let runtime_state = Arc::new(WorkerRuntimeState::new("in-process".into()));
-        runtime_state.set_model_loaded();
+        runtime_state.set_phase(WorkerLifecyclePhase::Ready);
         let registry = Arc::new(ActiveRequestRegistry::new());
         let diagnostics = Arc::new(WorkerDiagnosticsCollector::new(65536));
         let process_ctrl = Arc::new(WorkerProcessControl::new_in_process());
@@ -1018,6 +1072,7 @@ impl WorkerSupervisor {
             "mlx_cache_limit_bytes": policy_snapshot.mlx_cache_limit_bytes,
             "prompt_token_ceiling": policy_snapshot.prompt_token_ceiling,
             "output_token_ceiling": policy_snapshot.output_token_ceiling,
+            "load_epoch": self.runtime_state.increment_load_epoch(),
         });
         self.cmd_writer
             .send_command(HostCommand::LoadModel, payload)?;
@@ -1039,9 +1094,9 @@ impl WorkerSupervisor {
                 ));
             }
 
-            if self.runtime_state.is_model_loaded() {
-                return Ok(());
-            }
+            if self.runtime_state.phase() == WorkerLifecyclePhase::Ready {
+                        return Ok(());
+                    }
 
             // Check if worker has exited.
             if !self.process_ctrl.is_alive() {
@@ -1078,12 +1133,21 @@ impl WorkerSupervisor {
         &self,
         request: &StartGenerationPayload,
     ) -> Result<GenerationHandle, EngineError> {
-        if !self.runtime_state.is_model_loaded() {
-            return Err(EngineError::new(
-                EngineErrorCode::ModelNotLoaded,
-                "model not loaded",
-            ));
-        }
+        match self.runtime_state.phase() {
+                    WorkerLifecyclePhase::Ready => {}
+                    WorkerLifecyclePhase::Loading | WorkerLifecyclePhase::Warming => {
+                        return Err(EngineError::new(
+                            EngineErrorCode::ModelNotLoaded,
+                            "model loading in progress",
+                        ));
+                    }
+                    _ => {
+                        return Err(EngineError::new(
+                            EngineErrorCode::ModelNotLoaded,
+                            "model not loaded",
+                        ));
+                    }
+                }
 
         if self.registry.contains(&request.request_id) {
             return Err(EngineError::new(
@@ -1326,7 +1390,7 @@ impl WorkerSupervisor {
             std::thread::sleep(Duration::from_millis(50));
         }
 
-        self.runtime_state.clear_model_loaded();
+        self.runtime_state.set_phase(WorkerLifecyclePhase::Absent);
         Ok(())
     }
 
@@ -1335,7 +1399,7 @@ impl WorkerSupervisor {
     /// Callers should join threads separately via the handles.
     pub fn shutdown(&self) {
         let _ = self.process_ctrl.kill();
-        self.runtime_state.clear_model_loaded();
+        self.runtime_state.set_phase(WorkerLifecyclePhase::Stopped);
         self.registry.fail_all("worker shutdown");
     }
 
@@ -1537,11 +1601,48 @@ impl WorkerSupervisor {
                     }
 
                     WorkerEvent::ModelLoaded => {
-                        runtime.set_model_loaded();
+                        // weights loaded; stays in Loading phase;
+                    }
+
+                    WorkerEvent::ComputeImageBound
+                    | WorkerEvent::AnePrepared
+                    | WorkerEvent::GpuPrepared
+                    | WorkerEvent::CpuPrepared
+                    | WorkerEvent::KvArenaReady => {
+                        let epoch = frame.payload.get("load_epoch").and_then(|v| v.as_u64()).unwrap_or(0);
+                        if epoch != 0 && epoch != runtime.load_epoch() {
+                            diagnostics.append_line(&format!(
+                                "stale lifecycle event (epoch {} != current {})",
+                                epoch, runtime.load_epoch()
+                            ));
+                        }
+                    }
+
+                    WorkerEvent::RoutesValidated => {
+                        let epoch = frame.payload.get("load_epoch").and_then(|v| v.as_u64()).unwrap_or(0);
+                        if epoch != 0 && epoch != runtime.load_epoch() {
+                            diagnostics.append_line(&format!(
+                                "stale lifecycle event (epoch {} != current {})",
+                                epoch, runtime.load_epoch()
+                            ));
+                        }
+                        runtime.set_phase(WorkerLifecyclePhase::Warming);
+                    }
+
+                    WorkerEvent::ModelReady => {
+                        let epoch = frame.payload.get("load_epoch").and_then(|v| v.as_u64()).unwrap_or(0);
+                        if epoch != 0 && epoch != runtime.load_epoch() {
+                            diagnostics.append_line(&format!(
+                                "stale ModelReady (epoch {} != current {})",
+                                epoch, runtime.load_epoch()
+                            ));
+                        } else {
+                            runtime.set_phase(WorkerLifecyclePhase::Ready);
+                        }
                     }
 
                     WorkerEvent::ModelUnloaded => {
-                        runtime.clear_model_loaded();
+                        runtime.set_phase(WorkerLifecyclePhase::Absent);
                     }
 
                     WorkerEvent::ResearchTraceBatch => {
@@ -1702,6 +1803,26 @@ impl WorkerSupervisor {
                     HostCommand::MemoryPressure,
                     serde_json::json!({ "rss_bytes": rss }),
                 );
+            }
+
+
+            let phase = runtime.phase();
+            let launched_elapsed = process.launched_at().elapsed();
+            if phase == WorkerLifecyclePhase::Handshaking && launched_elapsed > HANDSHAKE_TIMEOUT {
+                diagnostics.append_line("watchdog: handshake timed out");
+                let _ = process.kill();
+                runtime.mark_faulted();
+                registry.fail_all("handshake timed out");
+                return;
+            }
+            if (phase == WorkerLifecyclePhase::Loading || phase == WorkerLifecyclePhase::Warming)
+                && launched_elapsed > policy.model_load_timeout
+            {
+                diagnostics.append_line("watchdog: model load timed out");
+                let _ = process.kill();
+                runtime.mark_faulted();
+                registry.fail_all("model load timed out");
+                return;
             }
 
             // ── Deadline enforcement ──
@@ -1935,14 +2056,22 @@ mod tests {
     // ── WorkerRuntimeState Tests ─────────────────────────────────────────
 
     #[test]
-    fn test_runtime_state_model_loaded() {
+    fn test_runtime_state_phase_transitions() {
         let state = WorkerRuntimeState::new("worker-1".into());
 
-        assert!(!state.is_model_loaded());
-        state.set_model_loaded();
-        assert!(state.is_model_loaded());
-        state.clear_model_loaded();
-        assert!(!state.is_model_loaded());
+        assert_eq!(state.phase(), WorkerLifecyclePhase::Absent);
+        state.set_phase(WorkerLifecyclePhase::Spawning);
+        assert_eq!(state.phase(), WorkerLifecyclePhase::Spawning);
+        state.set_phase(WorkerLifecyclePhase::Handshaking);
+        assert_eq!(state.phase(), WorkerLifecyclePhase::Handshaking);
+        state.set_phase(WorkerLifecyclePhase::Loading);
+        assert_eq!(state.phase(), WorkerLifecyclePhase::Loading);
+        state.set_phase(WorkerLifecyclePhase::Warming);
+        assert_eq!(state.phase(), WorkerLifecyclePhase::Warming);
+        state.set_phase(WorkerLifecyclePhase::Ready);
+        assert_eq!(state.phase(), WorkerLifecyclePhase::Ready);
+        state.set_phase(WorkerLifecyclePhase::Failed);
+        assert_eq!(state.phase(), WorkerLifecyclePhase::Failed);
     }
 
     #[test]
@@ -2595,7 +2724,7 @@ mod integration_tests {
         let runtime_state = Arc::new(WorkerRuntimeState::new(worker_id.to_string()));
 
         handshake(&cmd_writer, &mut stdout_reader);
-        runtime_state.set_model_loaded();
+        runtime_state.set_phase(WorkerLifecyclePhase::Ready);
 
         let (sender, mut stream) = generation_channel(Some(16));
         let policy = qualification_policy();

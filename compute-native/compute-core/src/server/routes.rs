@@ -833,7 +833,7 @@ async fn stream_generate(
 async fn handle_streaming_chat(
     State(state): State<AppState>,
     Extension(client_ip): Extension<String>,
-    body: serde_json::Value,
+    Json(body): Json<serde_json::Value>,
 ) -> axum::response::Response {
     let model_name = body
         .get("model")
@@ -1004,7 +1004,7 @@ async fn chat_completions_dispatch(
     Json(body): Json<serde_json::Value>,
 ) -> axum::response::Response {
     if body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false) {
-        return handle_streaming_chat(State(state), Extension(client_ip), body).await;
+        return handle_streaming_chat(State(state), Extension(client_ip), Json(body)).await;
     }
     v1_chat_completions(State(state), Extension(client_ip), Json(body)).await.into_response()
 }
@@ -1015,7 +1015,7 @@ async fn v1_chat_completions(
     State(state): State<AppState>,
     Extension(client_ip): Extension<String>,
     Json(body): Json<serde_json::Value>,
-) -> JsonResponse<serde_json::Value> {
+) -> impl IntoResponse {
     let model_name = body
         .get("model")
         .and_then(|v| v.as_str())
@@ -1185,13 +1185,20 @@ async fn v1_chat_completions(
             let mut handle = match supervisor.start_generation(&payload) {
                 Ok(h) => h,
                 Err(e) => {
+                    let err_str = format!("{e}");
+                    if err_str.contains("model loading in progress") {
+                        return JsonResponse(serde_json::json!({
+                            "error": "model loading in progress",
+                            "retry_after_seconds": 1,
+                        }));
+                    }
                     return JsonResponse(serde_json::json!({
                         "error": format!("inference dispatch failed: {e}")
                     }));
                 }
             };
 
-            // ── Collect generated tokens (blocking) ─────
+            // ── Collect generated tokens (blocking) ────
             let generated = tokio::task::block_in_place(|| {
                 let mut tokens: Vec<u32> = Vec::new();
                 loop {

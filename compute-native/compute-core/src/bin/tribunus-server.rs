@@ -256,7 +256,17 @@ async fn main() {
             match WorkerSupervisor::launch_and_handshake(policy, &worker_binary, path, image_hash, &worker_id) {
                 Ok(sup) => {
                     log_info!("  Worker spawned (pid {})", sup.process_ctrl.pid());
-                    Some(Arc::new(sup))
+                    // Load model in the worker and wait for it to be ready.
+                    match sup.load_model(image_hash) {
+                        Ok(()) => {
+                            log_info!("  Model ready");
+                            Some(Arc::new(sup))
+                        }
+                        Err(e) => {
+                            tribunus_compute_core::log_error!("  Model load failed: {:?}", e);
+                            std::process::exit(1);
+                        }
+                    }
                 }
                 Err(e) => {
                     tribunus_compute_core::log_error!("  Failed to spawn worker: {:?}", e);

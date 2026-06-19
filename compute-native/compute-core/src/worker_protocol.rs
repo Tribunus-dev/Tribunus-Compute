@@ -66,6 +66,20 @@ pub enum WorkerEvent {
     ModelLoadStarted,
     /// Model load completed successfully.
     ModelLoaded,
+    /// Manifest + segments resolved, arena allocated.
+    ComputeImageBound,
+    /// Core ML ANE programs compiled and loaded.
+    AnePrepared,
+    /// MLX GPU shader/library warmup done.
+    GpuPrepared,
+    /// Accelerate CPU lane initialized.
+    CpuPrepared,
+    /// KV cache pool constructed.
+    KvArenaReady,
+    /// At least one dry-run dispatch per lane succeeded.
+    RoutesValidated,
+    /// Terminal: generation may now be accepted.
+    ModelReady,
     /// Generation has been accepted and is starting.
     GenerationStarted,
     /// Prefill (prompt processing) phase started.

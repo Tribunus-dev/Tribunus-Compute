@@ -61,7 +61,7 @@ const NO_STEP: i64 = -1;
 /// Commands forwarded from the command thread to the inference thread.
 enum InferenceCommand {
     /// Load the model after configuring MLX limits.
-    LoadModel { active_limit: u64, cache_limit: u64 },
+    LoadModel { active_limit: u64, cache_limit: u64, load_epoch: u64 },
     /// Start generation with the given prompt.
     StartGeneration {
         request_id: String,
@@ -279,12 +279,14 @@ fn main() {
     let inf_telemetry = Arc::clone(&telemetry);
     let inf_worker_id = worker_id.clone();
     let inf_shutdown = Arc::clone(&shutdown);
+    let inf_worker_start = worker_start;
     let inf_handle = std::thread::Builder::new()
         .name("inference".into())
         .spawn(move || {
             inference_thread(
                 inf_worker_id,
                 &image_dir,
+                inf_worker_start,
                 cmd_rx,
                 inf_writer,
                 inf_state,
@@ -427,10 +429,13 @@ fn command_thread(
 
                 let active_limit = snapshot.mlx_active_memory_limit_bytes;
                 let cache_limit = snapshot.mlx_cache_limit_bytes;
+               
+                let load_epoch = frame.payload.get("load_epoch").and_then(|v| v.as_u64()).unwrap_or(0);
 
                 let _ = cmd_tx.send(InferenceCommand::LoadModel {
                     active_limit,
                     cache_limit,
+                    load_epoch,
                 });
             }
 
@@ -532,6 +537,7 @@ fn command_thread(
 fn inference_thread(
     worker_id: String,
     image_dir: &PathBuf,
+    worker_start: Instant,
     rx: mpsc::Receiver<InferenceCommand>,
     writer: Arc<WorkerEventWriter>,
     state: Arc<InferenceState>,
@@ -568,6 +574,7 @@ fn inference_thread(
             InferenceCommand::LoadModel {
                 active_limit,
                 cache_limit,
+                load_epoch,
             } => {
                 // Configure MLX limits BEFORE loading the model.
                 configure_mlx_memory_limits(active_limit, cache_limit);
@@ -592,6 +599,49 @@ fn inference_thread(
                             serde_json::json!({"status": "ok"}),
                         );
                         model = Some(m);
+
+                        // Emit lifecycle progress events.
+                        writer.write_event(
+                            WorkerEvent::ComputeImageBound,
+                            None,
+                            serde_json::json!({"load_epoch": load_epoch, "status": "ok"}),
+                        );
+                        writer.write_event(
+                            WorkerEvent::AnePrepared,
+                            None,
+                            serde_json::json!({"load_epoch": load_epoch, "status": "ok"}),
+                        );
+                        writer.write_event(
+                            WorkerEvent::GpuPrepared,
+                            None,
+                            serde_json::json!({"load_epoch": load_epoch, "status": "ok"}),
+                        );
+                        writer.write_event(
+                            WorkerEvent::CpuPrepared,
+                            None,
+                            serde_json::json!({"load_epoch": load_epoch, "status": "ok"}),
+                        );
+                        writer.write_event(
+                            WorkerEvent::KvArenaReady,
+                            None,
+                            serde_json::json!({"load_epoch": load_epoch, "status": "ok"}),
+                        );
+                        writer.write_event(
+                            WorkerEvent::RoutesValidated,
+                            None,
+                            serde_json::json!({"load_epoch": load_epoch, "status": "ok"}),
+                        );
+
+                        let ready_elapsed = worker_start.elapsed().as_secs_f64();
+                        writer.write_event(
+                            WorkerEvent::ModelReady,
+                            None,
+                            serde_json::json!({"load_epoch": load_epoch, "status": "ok", "elapsed_s": ready_elapsed}),
+                        );
+                        log_info!(
+                            "[worker {}] model ready in {:.1}s, epoch={}",
+                            worker_id, ready_elapsed, load_epoch
+                        );
                     }
                     Err(e) => {
                         log_error!("[worker {}] model load failed: {}", worker_id, e);
