@@ -14,6 +14,15 @@ pub mod manifest;
 pub mod plan;
 pub mod segment;
 pub mod verify;
+#[cfg(feature = "tensix")]
+pub mod tensix;
+#[cfg(feature = "tensix")]
+pub mod layout_tensix;
+#[cfg(feature = "tensix")]
+pub mod fusion_tensix;
+
+#[cfg(feature = "tensix")]
+pub mod compile_tensix;
 
 pub use manifest::{
     AliasEntry,

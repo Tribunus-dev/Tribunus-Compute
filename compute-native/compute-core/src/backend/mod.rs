@@ -22,9 +22,14 @@ pub mod flex_dispatch;
 /// (ported from vLLM's cpu_attn_impl.hpp).
 #[cfg(feature = "candle-cpu")]
 pub mod cpu_attn;
+/// Intel USM zero-copy buffer abstraction for iGPU (Level Zero / oneAPI).
+#[cfg(feature = "intel")]
+pub mod intel_usm;
 #[cfg(feature = "mlx-backend")]
 pub mod heterogeneous_executor;
 pub mod routing;
+#[cfg(feature = "intel")]
+pub mod intel_level_zero;
 pub mod tensor_registry;
 
 #[cfg(feature = "mlx-backend")]

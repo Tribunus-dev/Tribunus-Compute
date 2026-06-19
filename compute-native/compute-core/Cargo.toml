@@ -165,6 +165,8 @@ cpu = ["candle-cpu"]
 storage-adapters = ["dep:tokio-postgres", "dep:redis", "dep:duckdb"]
 server = ["dep:axum", "dep:tower-http"]
 exo = []
+tensix = []
+intel = []
 
 [build-dependencies]
 cc = "1.2"

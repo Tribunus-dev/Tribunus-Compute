@@ -51,6 +51,8 @@ pub mod profile;
 pub mod reference_backend;
 pub mod serde_schema;
 pub mod tuning;
+#[cfg(feature = "tensix")]
+pub mod tensix;
 
 // ── Convenience re-exports ─────────────────────────────────────────────────
 
@@ -102,4 +104,6 @@ pub use core_ai::CoreAIBackendAdapter;
 pub use coreml_opaque_probe::CoreMlOpaqueProbe;
 pub use ledger_jsonl::JsonlEvidenceLedger;
 pub use mlx_probe::MlxProbe;
+#[cfg(feature = "tensix")]
+pub use tensix::{TensixProfileCollector, TensixProfileEvent};
 pub use reference_backend::CpuReferenceBackend;

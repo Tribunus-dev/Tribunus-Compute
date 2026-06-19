@@ -2,6 +2,7 @@
 #[cfg(not(any(
     feature = "mlx-backend",
     feature = "candle-cpu",
+    feature = "intel",
     feature = "stub-backend",
     feature = "storage-adapters"
 )))]
@@ -149,7 +150,7 @@ pub mod primitives;
 pub mod profile_compiler;
 #[cfg(feature = "mlx-backend")]
 pub mod profiled_executor;
-#[cfg(any(feature = "mlx-backend", feature = "candle-cpu"))]
+#[cfg(any(feature = "mlx-backend", feature = "candle-cpu", feature = "intel", feature = "tensix"))]
 pub mod projection_identity;
 #[cfg(any(feature = "mlx-backend", feature = "candle-cpu"))]
 pub mod projection_executor;
