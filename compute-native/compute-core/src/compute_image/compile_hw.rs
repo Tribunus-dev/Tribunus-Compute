@@ -606,6 +606,33 @@ pub fn run_hardware_assessment() -> AssessmentReceipt {
     let assessment_duration_ms = 100;
     let assessment_timestamp = format!("{:?}", std::time::SystemTime::now());
 
+    let mut concurrency = crate::compute_image::hw_assessment::ConcurrencyPlan::new();
+    for result in &results {
+        let shape_size: u64 = result.shape.iter().map(|&d| d as u64).product();
+        let is_large = shape_size >= 1024 * 1024;
+        match result.op_type.as_str() {
+            "matmul" if is_large => {
+                concurrency.assign_op("matmul", "mlx_gpu", result.median_latency_ns);
+            }
+            "rms_norm" | "softmax" | "silu_mul" | "rope" => {
+                concurrency.assign_op(&result.op_type, "accelerate_cpu", result.median_latency_ns);
+            }
+            _ => {
+                concurrency.assign_op(&result.op_type, "accelerate_cpu", result.median_latency_ns);
+            }
+        }
+    }
+    concurrency.estimated_total_throughput = concurrency.concurrent_assignments.iter()
+        .map(|a| 1_000_000_000.0 / a.estimated_latency_ns as f64)
+        .fold(0.0, f64::max);
+    eprintln!("[hw-assessment] concurrency plan: {} lanes simultaneously over shared arena",
+        concurrency.concurrent_assignments.len());
+    for a in &concurrency.concurrent_assignments {
+        eprintln!("[hw-assessment]   {}: {} ops, est {} us",
+            a.lane, a.ops.len(), a.estimated_latency_ns / 1000);
+    }
+    eprintln!("[hw-assessment] effective throughput: {:.0} ops/sec", concurrency.estimated_total_throughput);
+
     AssessmentReceipt {
         selections,
         benchmark_results: results,

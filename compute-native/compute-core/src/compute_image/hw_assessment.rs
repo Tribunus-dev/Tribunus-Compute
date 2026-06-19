@@ -71,6 +71,55 @@ pub struct KernelSelection {
     pub assessment_id: String,        // hash of the benchmark receipt
 }
 
+
+/// Concurrency plan: which ops run on which lane during the same inference step.
+/// All lanes execute simultaneously over the same UnifiedExecutionArena.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConcurrencyPlan {
+    pub plan_name: String,
+    pub concurrent_assignments: Vec<LaneAssignment>,
+    pub estimated_total_throughput: f64,
+    pub shared_memory_arena_size: u64,
+}
+
+/// Assignment of a set of ops to a specific lane for concurrent execution.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LaneAssignment {
+    pub lane: String,
+    pub ops: Vec<String>,
+    pub estimated_latency_ns: u64,
+    pub memory_views: Vec<String>,
+}
+
+impl ConcurrencyPlan {
+    pub fn new() -> Self {
+        ConcurrencyPlan {
+            plan_name: "apple-unified-heterogeneous".into(),
+            concurrent_assignments: Vec::new(),
+            estimated_total_throughput: 0.0,
+            shared_memory_arena_size: 128 * 1024 * 1024,
+        }
+    }
+
+    pub fn assign_op(&mut self, op_type: &str, lane: &str, latency_ns: u64) {
+        for assignment in &mut self.concurrent_assignments {
+            if assignment.lane == lane {
+                assignment.ops.push(op_type.to_string());
+                assignment.estimated_latency_ns =
+                    assignment.estimated_latency_ns.max(latency_ns);
+                assignment.memory_views.push(format!("{}-view", op_type));
+                return;
+            }
+        }
+        self.concurrent_assignments.push(LaneAssignment {
+            lane: lane.to_string(),
+            ops: vec![op_type.to_string()],
+            estimated_latency_ns: latency_ns,
+            memory_views: vec![format!("{}-view", op_type)],
+        });
+    }
+}
+
 /// Complete hardware assessment receipt stored in ComputeImage manifest.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AssessmentReceipt {
