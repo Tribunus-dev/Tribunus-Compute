@@ -103,6 +103,8 @@ pub mod inference_profile;
 #[cfg(feature = "mlx-backend")]
 pub mod kv_cache;
 #[cfg(feature = "mlx-backend")]
+pub mod kv_arena;
+#[cfg(feature = "mlx-backend")]
 pub mod layout_compiler;
 pub mod layout_transform;
 #[cfg(feature = "mlx-backend")]
