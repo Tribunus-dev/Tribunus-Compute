@@ -1,11 +1,12 @@
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 #[cfg(not(any(
     feature = "mlx-backend",
+    feature = "candle-cpu",
     feature = "stub-backend",
     feature = "storage-adapters"
 )))]
 compile_error!(
-    "Compute authority requires Apple Silicon (macOS arm64) or a supported backend feature."
+    "Tribunus Compute requires a supported backend: Apple Silicon (macOS arm64), Candle CPU (Linux x86), or a stub/storage backend feature."
 );
 
 extern crate self as tribunus_compute_core;
@@ -87,10 +88,15 @@ pub mod metal_capture;
 pub mod mil_builder;
 pub mod mlpackage;
 pub mod plugin;
+#[cfg(feature = "mlx-backend")]
 pub mod mlx_api_compat;
+#[cfg(feature = "mlx-backend")]
 pub mod mlx_executor;
+#[cfg(feature = "mlx-backend")]
 pub mod mlx_inventory;
+#[cfg(feature = "mlx-backend")]
 pub mod mlx_patch_register;
+#[cfg(feature = "mlx-backend")]
 pub mod mlx_runtime_probe;
 pub mod model_cache;
 pub mod model;
@@ -104,6 +110,7 @@ pub mod primitives;
 pub mod profile_compiler;
 pub mod profiled_executor;
 pub mod projection_identity;
+#[cfg(feature = "mlx-backend")]
 pub mod projection_executor;
 pub mod projection_tests;
 pub mod quantization;
@@ -146,6 +153,8 @@ pub mod worker_crash_ledger;
 pub mod worker_memory;
 pub mod worker_protocol;
 pub mod worker_supervisor;
+#[cfg(feature = "candle-cpu")]
+pub mod candle_cpu_backend;
 
 pub use crate::session::{
     ControlSessionState, GenerationControlSession, InferenceSession, InferenceSessionState,

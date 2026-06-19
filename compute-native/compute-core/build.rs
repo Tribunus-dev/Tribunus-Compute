@@ -53,8 +53,14 @@ fn main() {
     // MLX identity (fixed for this gate - pointing to the new published fork)
     println!("cargo:rustc-env=TRIBUNUS_MLX_IDENTITY=Tribunus-dev/mlx-rs-fork@main");
 
+    // Guard: on non-macOS targets, a CPU backend feature must be explicit.
+    #[cfg(all(not(target_os = "macos"), not(feature = "candle-cpu")))]
+    compile_error!(
+        "On non-macOS targets, feature 'candle-cpu' must be enabled. See Cargo.toml [features]."
+    );
+
     // Compile the ObjC++ Core ML / IOSurface bridge.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "mlx-backend"))]
     {
         cc::Build::new()
             .file("src/bridge/coreml_arena.mm")

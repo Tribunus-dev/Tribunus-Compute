@@ -117,9 +117,9 @@ path = "benches/benchmark_placement.rs"
 
 [dependencies]
 hf-hub = "0.4"
-mlx-rs = { workspace = true }
-mlx-sys = { workspace = true }
-qwen3-tts-mlx = { path = "../../models/qwen3-tts-mlx" }
+mlx-sys = { workspace = true, optional = true }
+mlx-rs = { workspace = true, optional = true }
+qwen3-tts-mlx = { path = "../../models/qwen3-tts-mlx", optional = true }
 safetensors = "0.5"
 sha2 = { version = "0.10", features = ["asm"] }
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -127,7 +127,7 @@ rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-tokenizers = { version = "0.21", default-features = false }
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 parking_lot = "0.12"
 notify = "6"
 tribunus-evidence-schema = { path = "../../compute-evidence-native/crates/evidence-schema" }
@@ -139,16 +139,17 @@ axum = { version = "0.8", optional = true }
 tower-http = { version = "0.6", optional = true, features = ["cors"] }
 async-trait = "0.1"
 thiserror = "2"
-coreml-proto = "0.1.0"
+coreml-proto = { version = "0.1.0", optional = true }
 prost = "0.14.4"
 prost-types = "0.14.4"
 tempfile = { version = "3" }
 tokio-postgres = { version = "0.7", optional = true }
 redis = { version = "0.27", features = ["tokio-comp"], optional = true }
 duckdb = { version = "1.1", features = ["bundled"], optional = true }
-funasr-mlx = { path = "../../models/funasr-mlx" }
-flux-klein-mlx = { path = "../../models/flux-klein-mlx" }
+funasr-mlx = { path = "../../models/funasr-mlx", optional = true }
+flux-klein-mlx = { path = "../../models/flux-klein-mlx", optional = true }
 png = "0.17"
+candle-core = { version = "0.8", optional = true, default-features = false }
 
 [features]
 napi = []
@@ -157,7 +158,10 @@ default = ["mlx-backend"]
 stub-backend = []
 ane = []
 accelerate = []
-mlx-backend = ["mlx-rs/metal", "mlx-rs/accelerate", "mlx-rs/safetensors"]
+mlx-backend = ["dep:mlx-rs", "dep:mlx-sys", "dep:coreml-proto", "mlx-rs/metal", "mlx-rs/accelerate", "mlx-rs/safetensors", "dep:qwen3-tts-mlx", "dep:funasr-mlx", "dep:flux-klein-mlx"]
+candle-cpu = ["dep:candle-core"]
+candle-mkl = ["candle-cpu", "candle-core/mkl"]
+cpu = ["candle-cpu"]
 storage-adapters = ["dep:tokio-postgres", "dep:redis", "dep:duckdb"]
 server = ["dep:axum", "dep:tower-http"]
 exo = []
