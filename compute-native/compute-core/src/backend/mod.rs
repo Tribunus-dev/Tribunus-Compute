@@ -18,6 +18,10 @@ pub mod authority;
 pub mod graph;
 #[cfg(feature = "mlx-backend")]
 pub mod flex_dispatch;
+/// CPU attention scheduler — L2-cache-aware work partition + work-stealing
+/// (ported from vLLM's cpu_attn_impl.hpp).
+#[cfg(feature = "candle-cpu")]
+pub mod cpu_attn;
 #[cfg(feature = "mlx-backend")]
 pub mod heterogeneous_executor;
 pub mod routing;
