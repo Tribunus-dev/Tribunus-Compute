@@ -163,7 +163,7 @@ fn stack_frames(frames: &[Array]) -> Result<Array, String> {
 fn add_temporal_positions(
     stacked: &Array,
     pos_embed: &Array,
-    num_frames: usize,
+    _num_frames: usize,
 ) -> Result<Array, String> {
     // pos_embed shape: [max_frames, 1, projection_dim] or [max_frames, projection_dim]
     // We need to repeat each frame's position vector for all patches in that frame.
@@ -198,7 +198,7 @@ fn average_pool_frames(encoded: &Array) -> Result<Array, String> {
     // Determine patches_per_frame from the known projection dimension.
     // Total tokens = num_frames * patches_per_frame.
     let total_tokens = shape[0] as usize;
-    let patches_per_frame = proj_dim; // This is incorrect but acts as a safety check.
+    let _patches_per_frame = proj_dim; // This is incorrect but acts as a safety check.
     // Actually, patches_per_frame = total_tokens / num_frames.
     // We don't know num_frames directly from the shape, but we can compute:
     let num_frames = total_tokens / proj_dim.max(1);

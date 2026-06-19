@@ -1443,7 +1443,7 @@ fn json_schema_emit_rule(
                 })
                 .unwrap_or_default();
 
-            let mut rule_lines: Vec<String> = Vec::new();
+            let _rule_lines: Vec<String> = Vec::new();
             let mut sub_rules: Vec<(String, serde_json::Value)> = Vec::new();
             let mut added_prop_names: Vec<String> = Vec::new();
 
@@ -1541,7 +1541,7 @@ fn json_schema_emit_rule(
                     })
                     .collect();
                 out.push_str(&format!("{} ::= {}\n", name, alts.join(" | ")));
-            } else if let Some(ref_val) = schema.get("$ref").and_then(|v| v.as_str()) {
+            } else if let Some(_ref_val) = schema.get("$ref").and_then(|v| v.as_str()) {
                 // Handle $ref references (simplified: just treat as string)
                 out.push_str(&format!("{} ::= string\n", name));
             } else {

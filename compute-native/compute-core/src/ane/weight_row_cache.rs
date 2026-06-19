@@ -26,7 +26,7 @@ use crate::projection_executor::{
     MaterializationClass, StorageDtype, RuntimeMode,
 };
 use crate::projection_identity::ProjectionFamily;
-use crate::backend::{MlxBackend, QuantizedWeightHandle, TensorHandle};
+use crate::backend::MlxBackend;
 
 // ---------------------------------------------------------------------------
 // SlotAllocator
@@ -284,7 +284,7 @@ impl WeightRowCache {
             ));
         }
 
-        let lm_dim0 = shape[0] as usize; // hidden_size
+        let _lm_dim0 = shape[0] as usize; // hidden_size
         let lm_dim1 = shape[1] as usize; // vocab_size
 
         if tid >= lm_dim1 {

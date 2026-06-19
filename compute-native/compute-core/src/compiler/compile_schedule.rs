@@ -34,7 +34,7 @@ pub fn compile_model_to_scheduled_module(
     let hidden_size = arch.hidden_size as u64;
     let intermediate_size = arch.intermediate_size as u64;
     let seq_len = arch.max_position_embeddings.min(8192) as u64;
-    let vocab_size = arch.vocab_size as u64;
+    let _vocab_size = arch.vocab_size as u64;
 
     // ── Compute per-layer memory ──
     //
@@ -249,7 +249,7 @@ pub fn compile_model_to_scheduled_module(
     };
 
     // ── Transfers: IOSurface ↔ backend buffers ──
-    for (i, layer) in plan.layers.iter().enumerate() {
+    for (i, _layer) in plan.layers.iter().enumerate() {
         let _layer_id = i as u64;
         let in_tensor_id = TensorId(_layer_id * 100 + 1);
         let out_tensor_id = TensorId(_layer_id * 100 + 2);

@@ -296,7 +296,7 @@ impl TextToImageGenerator {
     /// flux-klein-mlx convention).
     fn encode_text(&self, input_ids: &[u32]) -> Result<(Array, Array), String> {
         let cfg = flux_klein_mlx::Qwen3Config::default();
-        let hs = cfg.hidden_size; // 2560
+        let _hs = cfg.hidden_size; // 2560
 
         // Token embeddings
         let tok_w = tensor_by_name(&self.model, "text_encoder.token_embed.weight")?;
@@ -405,7 +405,7 @@ impl TextToImageGenerator {
         txt: &Array,
     ) -> Result<Array, String> {
         let params = flux_klein_mlx::FluxKleinParams::default();
-        let hs = params.hidden_size; // 3072
+        let _hs = params.hidden_size; // 3072
 
         // ── Input projections ───────────────────────────────────────────
         let img_in_w = tensor_by_name(&self.model, "img_in.weight")?;
@@ -492,8 +492,8 @@ impl TextToImageGenerator {
 
         // ── Single stream blocks ────────────────────────────────────────
         // Concatenate img + txt along sequence dim.
-        let txt_seq = txt_h.shape()[1] as i32;
-        let img_seq = img.shape()[1] as i32;
+        let _txt_seq = txt_h.shape()[1] as i32;
+        let _img_seq = img.shape()[1] as i32;
         let mut merged = ops::concatenate_axis(&[&img, &txt_h], -2)
             .map_err(|e| format!("merge: {:?}", e))?;
 
@@ -719,7 +719,7 @@ impl TextToImageGenerator {
             (0, ch, cfg.in_channels as i32), // up.3: ch → 3
         ];
 
-        for &(level, in_ch, out_ch) in up_configs {
+        for &(level, _in_ch, out_ch) in up_configs {
             let prefix = format!("decoder.up.{}", level);
 
             // Resnet block

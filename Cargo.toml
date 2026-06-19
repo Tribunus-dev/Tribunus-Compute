@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "compute-native",
+    "compute-native/tensix-ffi",
+    "compute-native/tensix-backend",
     "mlx-rs-core",
     "mlx-rs-lm",
     "models/gemma4-mlx",

@@ -7,8 +7,6 @@
 
 use crate::config::VisionArchitecture;
 use crate::quantized::QuantizedLinearBinding;
-use mlx_rs::error::Result as MlxResult;
-use mlx_rs::nn;
 use mlx_rs::Array;
 
 /// A single ViT encoder layer.
@@ -86,7 +84,7 @@ impl VisionEncoder {
             .unwrap_or_else(|_| std::sync::Arc::new(Array::from_slice(&[0.0f32], &[1])));
         let patch_embed_out = config.hidden_size;
 
-        let patch_embed = QuantizedLinearBinding::new(
+        let _patch_embed = QuantizedLinearBinding::new(
             std::sync::Arc::into_raw(pe_w.clone()) as u64,
             std::sync::Arc::into_raw(pe_s.clone()) as u64,
             std::sync::Arc::into_raw(pe_b.clone()) as u64,
@@ -566,7 +564,7 @@ impl VisionEncoder {
 }
 
 /// RMS normalization used by Gemma models.
-fn rms_norm(x: &Array, binding: &QuantizedLinearBinding, eps: f32) -> Result<Array, String> {
+fn rms_norm(x: &Array, _binding: &QuantizedLinearBinding, eps: f32) -> Result<Array, String> {
     // Load weight from the binding (it's stored as a weight handle).
     // For simplicity, we reconstruct the weight from the binding.
     // Since QuantizedLinearBinding stores u64 handles, we need access

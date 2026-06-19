@@ -157,7 +157,7 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
                 tempfile::tempdir().map_err(|e| format!("create HF download dir: {e}"))?;
             let download_path: PathBuf = download_dir.path().to_path_buf();
 
-            compute_image::download_hf_model(hub_id, revision, &download_path)
+            compute_image::download_hf_model(hub_id, revision, &download_path, None)
                 .map_err(|e| format!("HF download failed: {e}"))?;
 
             let compile_source = download_path

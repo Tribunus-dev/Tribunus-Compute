@@ -257,7 +257,7 @@ impl HardwareTarget {
             (r, c) if r >= 393_216 && c >= 24 => Self::M3Ultra, // 384GB+ & 24+ cores
             (r, c) if r >= 131_072 && c >= 20 => Self::M2Ultra, // 128GB+
             (r, c) if r >= 65_536 && c >= 12 => Self::M2,       // 64GB+
-            (r, c) if r >= 32_768 => Self::M1Pro,               // 32GB+
+            (r, _c) if r >= 32_768 => Self::M1Pro,               // 32GB+
             _ => Self::M1,                                      // 16GB
         }
     }

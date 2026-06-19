@@ -418,7 +418,7 @@ impl DistributedKvCache {
             0
         };
 
-        let page = DistributedKvPage {
+        let _page = DistributedKvPage {
             token_hash: hash,
             page_data: data,
             source_node: self.local_node.clone(),
@@ -1017,7 +1017,7 @@ impl ExoNode {
             // Send SIGTERM first, then SIGKILL if it doesn't exit quickly.
             #[cfg(unix)]
             {
-                use std::os::unix::process::ExitStatusExt;
+                
                 let _ = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
                 std::thread::sleep(Duration::from_millis(500));
 

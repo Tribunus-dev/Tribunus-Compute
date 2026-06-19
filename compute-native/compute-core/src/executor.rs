@@ -9,10 +9,9 @@ use crate::ane::hot_row_predictor::HotRowPredictor;
 use crate::ane::moe_scheduler::{AneMoEScheduler, ExpertWeights};
 use crate::ane::weight_row_cache::WeightRowCache;
 use crate::backend::routing::BackendId;
-use crate::backend::{MlxBackend, QuantizedWeightHandle, TensorHandle};
+use crate::backend::MlxBackend;
 use crate::config::operation_route::OperationRoute;
 use crate::config::{EpiloguePlan, LayerPlan, ProloguePlan};
-use crate::grammar::{GrammarFSM, GrammarTokenizer};
 use crate::kv_cache::KvCache;
 use crate::log_debug;
 use crate::primitives;
@@ -445,7 +444,7 @@ pub fn run_layer(
         }
     };
 
-    let hidden = residual.add(&attn_out)?;
+    let _hidden = residual.add(&attn_out)?;
     let hidden = crate::heterogeneous::dispatch_add(residual, &attn_out, route, island)?;
 
     // --- FFN norm ---
@@ -477,7 +476,7 @@ pub fn run_layer(
         ProjectionFamily::UpProj,
         5,
     )?;
-    let gated = mlx_rs::nn::silu(&gate)?.multiply(&up)?;
+    let _gated = mlx_rs::nn::silu(&gate)?.multiply(&up)?;
     let gated =
         crate::heterogeneous::dispatch_multiply(&mlx_rs::nn::silu(&gate)?, &up, route, island)?;
     let ffn_out = qmatmul_attributed(
@@ -838,7 +837,7 @@ fn qmatmul(x: &Array, w: &Array, s: &Array, b: &Array) -> MlxResult<Array> {
 
     // OPT-0006-T2 diagnostic: first-call stride/contiguity probe.
     // Answers: do external (mmap-backed) arrays trigger hidden copies?
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::Ordering;
     if T2_PROBE.swap(false, Ordering::Relaxed) {
         // Force authority path for both probe calls (external and copied arrays)
         // so the timing comparison is apples-to-apples.

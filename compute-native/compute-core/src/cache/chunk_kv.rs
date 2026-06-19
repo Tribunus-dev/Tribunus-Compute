@@ -12,7 +12,6 @@
 //! new tokens are buffered until a chunk boundary is detected, then the chunk
 //! is compressed and stored as a unit.
 
-use std::collections::VecDeque;
 
 /// The chunk type signals the semantic role a chunk plays in the conversation
 /// and influences importance scoring (system chunks survive longer, intermediate
@@ -230,7 +229,7 @@ impl ChunkKvCache {
             self.pending.start_token = 0; // caller should set via token_offset
         }
 
-        let start_len = self.pending.tokens.len();
+        let _start_len = self.pending.tokens.len();
         self.pending.tokens.extend_from_slice(tokens);
 
         // Detect boundaries in the accumulated buffer, using the offset of

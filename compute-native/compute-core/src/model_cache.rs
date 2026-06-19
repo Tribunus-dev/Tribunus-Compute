@@ -476,7 +476,7 @@ impl ModelCache {
 
     /// Check system memory pressure and evict if >80% of RAM is used.
     pub fn check_pressure(&mut self) -> Result<(), String> {
-        let free_mb = crate::gpu_memory::get_current_wired_limit_mb()
+        let _free_mb = crate::gpu_memory::get_current_wired_limit_mb()
             .map(|m| m as u64)
             .unwrap_or(0);
         let used_mb = self.used_memory_bytes / 1_048_576;
@@ -543,7 +543,7 @@ impl ModelCache {
         }
 
         let mut watcher = SegmentWatcher::new(name, &image_dir)?;
-        let model_name = name.to_string();
+        let _model_name = name.to_string();
 
         // Channel: watcher thread sends changed segment filenames here.
         let (tx, rx) = mpsc::channel::<String>();

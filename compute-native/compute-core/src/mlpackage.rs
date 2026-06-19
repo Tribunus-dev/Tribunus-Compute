@@ -17,7 +17,6 @@
 use coreml_proto::proto::{self, mil_spec, model};
 use mil_spec::value_type;
 use prost::Message;
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};

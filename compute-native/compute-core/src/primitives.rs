@@ -192,7 +192,7 @@ impl QuantizedEmbedding {
             RuntimeMode, StorageDtype,
         };
         use crate::projection_identity::ProjectionFamily;
-        use crate::backend::{MlxBackend, QuantizedWeightHandle, TensorHandle};
+        use crate::backend::MlxBackend;
 
         let reg = ARRAY_REGISTRY.read();
         let w = reg

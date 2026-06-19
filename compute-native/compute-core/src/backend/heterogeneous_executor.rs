@@ -164,7 +164,7 @@ impl HeterogeneousExecutor {
         let mut _op_receipts: Vec<BackendExecutionReceipt> =
             Vec::with_capacity(plan.operations.len());
 
-        for (i, op_desc) in ops.iter().enumerate() {
+        for (_i, op_desc) in ops.iter().enumerate() {
             let backend_id = flex.dispatch(op_desc, plan.group_id.0 as u32);
 
             // Cache the route so the executor's routing table stays

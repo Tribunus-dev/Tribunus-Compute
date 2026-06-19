@@ -19,7 +19,6 @@
 //! Core ML reads and writes them without any CPU-side copies.
 
 use crate::arena::Arena;
-use crate::arena_info::ArenaInfo;
 use crate::coreml_bridge::{CoreMlComputeUnits, CoreMlModel};
 use crate::speculative::SampleStrategy;
 use crate::speculative::DraftModel;
@@ -461,7 +460,7 @@ impl AneMultiCoreDraft {
     ) -> Result<Vec<Vec<(u32, f32)>>, String> {
         let n = self.drafts.len();
         let mut results: Vec<Vec<(u32, f32)>> = Vec::with_capacity(n);
-        for (i, (draft, strat)) in self.drafts.iter_mut().zip(strategies.iter()).enumerate() {
+        for (_i, (draft, strat)) in self.drafts.iter_mut().zip(strategies.iter()).enumerate() {
             let (tokens, probs) = draft.speculate(prefix, n_tokens)?;
             results.push(crate::speculative::resample(&tokens, &probs, strat));
         }

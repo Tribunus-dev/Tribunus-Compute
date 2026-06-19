@@ -1,0 +1,16 @@
+[package]
+name = "tensix-ffi"
+edition = "2021"
+version = "0.1.0"
+
+[lib]
+crate-type = ["lib", "staticlib"]
+
+[dependencies]
+
+[build-dependencies]
+cc = "1.0"
+
+[features]
+default = []
+mock = []  # enables mock device mode (no real hardware)

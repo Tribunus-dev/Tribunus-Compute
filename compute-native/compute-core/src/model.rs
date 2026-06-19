@@ -12,7 +12,7 @@ use crate::projection_executor::{
 use crate::projection_identity::ProjectionFamily;
 use mlx_rs::error::Result as MlxResult;
 use mlx_rs::Array;
-use crate::backend::{MlxBackend, QuantizedWeightHandle, TensorHandle};
+use crate::backend::MlxBackend;
 
 /// Convert a safetensors TensorView to an mlx_rs Array.
 pub(crate) fn tensor_view_to_array(tv: &safetensors::tensor::TensorView) -> Array {

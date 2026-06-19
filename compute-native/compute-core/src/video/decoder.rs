@@ -5,7 +5,6 @@
 //! byte buffer `[H, W, 3]` (row-major RGB).
 
 use std::process::{Command, Stdio};
-use std::io::Read;
 
 /// Maximum number of frames to extract (keeps context within budget).
 pub const MAX_VIDEO_FRAMES: u32 = 32;

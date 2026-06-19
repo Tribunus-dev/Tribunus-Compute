@@ -1040,7 +1040,7 @@ fn sparse_joint_distribution_at_pos(
 /// Compute softmax-normalized probabilities from logits at a single position.
 fn softmax_at_pos(
     data: &[f32],
-    seq_len: usize,
+    _seq_len: usize,
     vocab_size: usize,
     pos: usize,
     inv_temp: f64,

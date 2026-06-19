@@ -10,9 +10,7 @@
 //! 3. **Dead code elimination** — remove operations whose output is never
 //!    used by any downstream consumer.
 
-use crate::config::{
-    EpiloguePlan, LayerPlan, ModelExecutionPlan, ProloguePlan,
-};
+use crate::config::ModelExecutionPlan;
 use std::collections::{HashMap, HashSet};
 
 // ── Op-level graph representation ─────────────────────────────────────────

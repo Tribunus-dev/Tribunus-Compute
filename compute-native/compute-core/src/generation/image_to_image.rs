@@ -695,7 +695,7 @@ fn sample_normal_like(template: &Array) -> Array {
 }
 
 /// Linear interpolation: `a * (1 - t) + b * t`.
-fn apply_lerp(a: &Array, b: &Array, _coeff_a: f32, _coeff_b: f32) -> Result<Array, String> {
+fn apply_lerp(_a: &Array, b: &Array, _coeff_a: f32, _coeff_b: f32) -> Result<Array, String> {
     // Placeholder: in a real implementation this would compute:
     //   a * coeff_a + b * coeff_b
     // using element-wise MLX ops.

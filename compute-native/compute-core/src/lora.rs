@@ -20,7 +20,7 @@ use mlx_rs::transforms::value_and_grad_with_argnums;
 use mlx_rs::{Array, Dtype};
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::profiled_executor::LoadedProfiledModel;
 use std::sync::Arc;

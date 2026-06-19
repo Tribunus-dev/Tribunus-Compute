@@ -11,7 +11,7 @@ use crate::projection_executor::{
     ProjectionExecutor, QuantizedProjectionDescriptor,
     MaterializationClass, StorageDtype, RuntimeMode,
 };
-use crate::backend::{MlxBackend, QuantizedWeightHandle, TensorHandle};
+use crate::backend::MlxBackend;
 use crate::session::SamplerConfig;
 use mlx_rs::Array;
 use std::collections::HashMap;

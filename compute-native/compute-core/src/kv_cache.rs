@@ -1053,7 +1053,7 @@ impl PageMigrationService {
         let now = std::time::Instant::now();
         let hot_threshold = self.hot_threshold;
         let cold_threshold = self.cold_threshold;
-        let mut pages = std::mem::take(&mut self.pages);
+        let pages = std::mem::take(&mut self.pages);
         for mut page in pages {
             let age = now.duration_since(page.last_access);
 
@@ -1212,7 +1212,7 @@ impl PageMigrationService {
 
         // Evict in reverse order so indices stay valid
         for &idx in to_evict.iter().rev() {
-            let filename = evict_page_to_disk(&self.pages[idx])?;
+            let _filename = evict_page_to_disk(&self.pages[idx])?;
             // Mark as L4Disk — l3_data is consumed by evict_page_to_disk
             self.pages[idx].l3_data = None;
             self.pages[idx].current_tier = KVCacheTier::L4Disk;

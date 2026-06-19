@@ -6,7 +6,6 @@
 //! Per-generation state lives in ProfiledInferenceSession (owns KV caches,
 //! cancellation flag, token buffer, and timeline).
 
-use crate::log_debug;
 use crate::compute_image::{CompiledImageReader, CopyClassification, TensorEntry};
 use crate::config::ModelExecutionPlan;
 use crate::engine_error::{EngineError, EngineErrorCode};

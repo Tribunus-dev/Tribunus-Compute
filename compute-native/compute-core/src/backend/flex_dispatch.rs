@@ -22,7 +22,6 @@
 //! - **Softmax / LayerNorm** → Accelerate (NEON) to keep the GPU free for
 //!   matmuls.
 
-use std::collections::HashMap;
 
 use crate::backend::heterogeneous_executor::HeterogeneousExecutor;
 use crate::backend::routing::*;
@@ -223,7 +222,7 @@ impl SystemState {
     fn sample_power_state() -> (f64, bool) {
         #[cfg(target_os = "macos")]
         {
-            const kCFStringEncodingUTF8: u32 = 0x08000100;
+            const K_CFSTRING_ENCODING_UTF8: u32 = 0x08000100;
 
             // Use IOKit via CoreFoundation.
             // `IOPSCopyPowerSourcesInfo` returns a blob we can query.
@@ -244,7 +243,7 @@ impl SystemState {
                 let ac_key = CFStringCreateWithCString(
                     std::ptr::null(),
                     b"AC Power\0" as *const u8 as *const libc::c_char,
-                    kCFStringEncodingUTF8,
+                    K_CFSTRING_ENCODING_UTF8,
                 );
                 let is_ac = CFEqual(
                     source_type as *const libc::c_void,

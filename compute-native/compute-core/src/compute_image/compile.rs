@@ -1856,7 +1856,7 @@ pub(crate) fn compile_sequential(
 
     // Run shape probe to validate and record intermediate shapes
     // Shape probe disabled: probe module removed (see comment in mod.rs)
-    let probe_result: Option<()> = None;
+    let _probe_result: Option<()> = None;
 
     let source = build_source_identity(
         &loaded.manifest,

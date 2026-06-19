@@ -346,7 +346,7 @@ impl DiffusionSampler {
     /// Generate with explicit parameters.
     fn generate_with_params(
         &self,
-        model: &DiffusionModel,
+        _model: &DiffusionModel,
         prompt_tokens: &[u32],
         max_new_tokens: u32,
         steps: u32,

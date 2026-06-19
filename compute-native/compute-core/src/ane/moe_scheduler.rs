@@ -222,7 +222,7 @@ impl AneMoEScheduler {
         }
 
         // 3. Schedule experts across cores.
-        let schedule = self.schedule_experts(num_experts as u32, top_k);
+        let _schedule = self.schedule_experts(num_experts as u32, top_k);
 
         // 4. For each expert that was selected by at least one token, compute
         //    the SwiGLU FFN and add weighted contributions to the output.

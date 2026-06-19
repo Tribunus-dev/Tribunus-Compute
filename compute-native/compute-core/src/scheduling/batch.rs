@@ -104,7 +104,7 @@ impl BatchedPrefill {
     /// one per prompt in order.
     pub fn execute(
         &self,
-        model: &crate::profiled_executor::LoadedProfiledModel,
+        _model: &crate::profiled_executor::LoadedProfiledModel,
     ) -> Result<Vec<u32>, String> {
         let batch_size = self.prompts.len();
         if batch_size == 0 {
