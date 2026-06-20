@@ -8,6 +8,7 @@ use super::manifest::{
     TensorDiff, TensorEntry, TensorProvenance, IgnoredTensorClassification,
     mlx_active_memory_bytes, mlx_peak_memory_bytes,
 };
+use crate::model_adapter::{self, CanonicalRole, CanonicalModel, SourceModel};
 use super::plan::{compile_unchecked_speculative, plan};
 use super::compile_hw::run_hardware_assessment;
 use super::hw_assessment::AssessmentReceipt;
@@ -21,6 +22,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::fs;
 use std::time::Instant;
+use std::ffi::OsStr;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Authority-aware compilation entry points
@@ -545,6 +547,43 @@ pub(crate) fn load_source(
             "source checkpoint failed validation: {} errors across {} expected tensors",
             validation.verdict.errors, validation.verdict.total_expected,
         )));
+    }
+
+    // ── Model-family adapter validation ──
+    // Verify the loaded source matches a known adapter for extra safety.
+    // This is informational: the existing pipeline continues regardless.
+    {
+        let model_type_val = arch.model_type.as_str();
+        let config_val: serde_json::Value = match std::fs::read_to_string(source_dir.join("config.json")) {
+            Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+            Err(_) => serde_json::Value::Null,
+        };
+        let tnames: Vec<String> = source_tensors.keys().cloned().collect();
+        let registry = crate::model_adapter::AdapterRegistry::new();
+        match registry.select(&config_val, &tnames) {
+            Ok(adapter) => {
+                let source_model = crate::model_adapter::SourceModel {
+                    config: config_val,
+                    config_path: config_path.clone(),
+                    model_type: model_type_val.to_string(),
+                    tensor_names: tnames.clone(),
+                    tensors: source_tensors.iter().map(|(k, v)| {
+                        (k.clone(), (v.dtype.clone(), v.shape.clone(), v.data.clone()))
+                    }).collect(),
+                };
+                match adapter.normalize(&source_model) {
+                    Ok(_canonical) => {
+                        eprintln!("[adapter] {} validation passed", adapter.family_name());
+                    }
+                    Err(report) => {
+                        eprintln!("[adapter] {} validation: {}", adapter.family_name(), report);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[adapter] no matching adapter: {}", e);
+            }
+        }
     }
 
     Ok(LoadedSource {
@@ -1394,8 +1433,131 @@ pub(crate) fn apply_quantize_to_loaded(
     Ok(())
 }
 
-/// Apply NF4 quantization to a weight tensor and update the loaded source.
+/// Apply 8-bit affine quantization to a weight tensor and update the loaded source.
 pub(crate) fn apply_af8_quantize(
+    loaded: &mut LoadedSource,
+    weight_name: &str,
+    f32_vals: &[f32],
+    out_dim: u32,
+    in_dim: u32,
+    group_size: u32,
+    groups_per_row: u32,
+    total_groups: u32,
+) -> crate::Result<()> {
+    let in_dim_u = in_dim as usize;
+    let gs = group_size as usize;
+    let gpr = groups_per_row as usize;
+    let total_g = total_groups as usize;
+
+    // 8-bit quantized weights stored as U8.
+    let packed_weight_len = (out_dim as usize) * in_dim_u;
+    let mut packed_weight = vec![0u8; packed_weight_len];
+    let mut scales = Vec::with_capacity(total_g);
+    let mut biases = Vec::with_capacity(total_g);
+
+    for row in 0..out_dim as usize {
+        let row_offset = row * in_dim_u;
+        for g in 0..gpr {
+            let group_start = row_offset + g * gs;
+            let group_end = (group_start + gs).min(row_offset + in_dim_u);
+            let group_vals = &f32_vals[group_start..group_end];
+
+            let (q_bytes, scale, bias) = quantize_af8_group(group_vals);
+            scales.push(scale);
+            biases.push(bias);
+
+            for (wi, &byte) in q_bytes.iter().enumerate() {
+                packed_weight[group_start + wi] = byte;
+            }
+        }
+    }
+
+    let scales_bytes: Vec<u8> = scales
+        .iter()
+        .flat_map(|&s| s.to_le_bytes().to_vec())
+        .collect();
+    let biases_bytes: Vec<u8> = biases
+        .iter()
+        .flat_map(|&b| b.to_le_bytes().to_vec())
+        .collect();
+
+    let stem = weight_name.strip_suffix(".weight").unwrap_or(weight_name);
+    let scales_name = format!("{}.scales", stem);
+    let biases_name = format!("{}.biases", stem);
+
+    let pack = 32 / 8; // 4 U8 per U32
+    let packed_in = in_dim / pack;
+    let packed_shape = crate::config::PackedLinearShapes {
+        weight: vec![out_dim, packed_in],
+        scales: vec![out_dim, groups_per_row],
+        biases: vec![out_dim, groups_per_row],
+        bits: 8,
+        group_size,
+        groups: groups_per_row * out_dim,
+    };
+
+    // Replace weight source tensor.
+    if let Some(st) = loaded.source_tensors.get_mut(weight_name) {
+        st.data = packed_weight;
+        st.dtype = "U8".to_string();
+        st.shape = vec![out_dim, packed_in];
+    }
+
+    loaded.source_tensors.insert(
+        scales_name.clone(),
+        SourceTensor {
+            name: scales_name.clone(),
+            dtype: "F32".to_string(),
+            shape: vec![out_dim, groups_per_row],
+            data: scales_bytes,
+            source_filename: String::new(),
+            source_sha256: String::new(),
+            source_offset: 0,
+        },
+    );
+
+    loaded.source_tensors.insert(
+        biases_name.clone(),
+        SourceTensor {
+            name: biases_name.clone(),
+            dtype: "F32".to_string(),
+            shape: vec![out_dim, groups_per_row],
+            data: biases_bytes,
+            source_filename: String::new(),
+            source_sha256: String::new(),
+            source_offset: 0,
+        },
+    );
+
+    for binding in &mut loaded.spec.global_tensors {
+        if binding.name == weight_name && binding.packed_shape.is_none() {
+            binding.packed_shape = Some(packed_shape.clone());
+        }
+    }
+    for layer in &mut loaded.spec.layers {
+        for binding in &mut layer.tensors {
+            if binding.name == weight_name && binding.packed_shape.is_none() {
+                binding.packed_shape = Some(packed_shape.clone());
+            }
+        }
+    }
+
+    eprintln!(
+        "[quantize] 8-bit affine quantized {}: [{},{}] -> packed [{},{}] + scales [{},{}]",
+        weight_name,
+        out_dim,
+        in_dim,
+        out_dim,
+        packed_in,
+        out_dim,
+        groups_per_row
+    );
+
+    Ok(())
+}
+
+/// Apply NF4 quantization to a weight tensor and update the loaded source.
+pub(crate) fn apply_nf4_quantize(
     loaded: &mut LoadedSource,
     weight_name: &str,
     f32_vals: &[f32],
@@ -1529,129 +1691,6 @@ pub(crate) fn apply_af8_quantize(
 
     eprintln!(
         "[quantize] NF4 quantized {}: [{},{}] -> packed [{},{}] + scales [{},{}]",
-        weight_name,
-        out_dim,
-        in_dim,
-        out_dim,
-        packed_in,
-        out_dim,
-        groups_per_row
-    );
-
-    Ok(())
-}
-
-/// Apply 8-bit affine quantization to a weight tensor and update the loaded source.
-pub(crate) fn apply_nf4_quantize(
-    loaded: &mut LoadedSource,
-    weight_name: &str,
-    f32_vals: &[f32],
-    out_dim: u32,
-    in_dim: u32,
-    group_size: u32,
-    groups_per_row: u32,
-    total_groups: u32,
-) -> crate::Result<()> {
-    let in_dim_u = in_dim as usize;
-    let gs = group_size as usize;
-    let gpr = groups_per_row as usize;
-    let total_g = total_groups as usize;
-
-    // 8-bit quantized weights stored as U8.
-    let packed_weight_len = (out_dim as usize) * in_dim_u;
-    let mut packed_weight = vec![0u8; packed_weight_len];
-    let mut scales = Vec::with_capacity(total_g);
-    let mut biases = Vec::with_capacity(total_g);
-
-    for row in 0..out_dim as usize {
-        let row_offset = row * in_dim_u;
-        for g in 0..gpr {
-            let group_start = row_offset + g * gs;
-            let group_end = (group_start + gs).min(row_offset + in_dim_u);
-            let group_vals = &f32_vals[group_start..group_end];
-
-            let (q_bytes, scale, bias) = quantize_af8_group(group_vals);
-            scales.push(scale);
-            biases.push(bias);
-
-            for (wi, &byte) in q_bytes.iter().enumerate() {
-                packed_weight[group_start + wi] = byte;
-            }
-        }
-    }
-
-    let scales_bytes: Vec<u8> = scales
-        .iter()
-        .flat_map(|&s| s.to_le_bytes().to_vec())
-        .collect();
-    let biases_bytes: Vec<u8> = biases
-        .iter()
-        .flat_map(|&b| b.to_le_bytes().to_vec())
-        .collect();
-
-    let stem = weight_name.strip_suffix(".weight").unwrap_or(weight_name);
-    let scales_name = format!("{}.scales", stem);
-    let biases_name = format!("{}.biases", stem);
-
-    let pack = 32 / 8; // 4 U8 per U32
-    let packed_in = in_dim / pack;
-    let packed_shape = crate::config::PackedLinearShapes {
-        weight: vec![out_dim, packed_in],
-        scales: vec![out_dim, groups_per_row],
-        biases: vec![out_dim, groups_per_row],
-        bits: 8,
-        group_size,
-        groups: groups_per_row * out_dim,
-    };
-
-    // Replace weight source tensor.
-    if let Some(st) = loaded.source_tensors.get_mut(weight_name) {
-        st.data = packed_weight;
-        st.dtype = "U8".to_string();
-        st.shape = vec![out_dim, packed_in];
-    }
-
-    loaded.source_tensors.insert(
-        scales_name.clone(),
-        SourceTensor {
-            name: scales_name.clone(),
-            dtype: "F32".to_string(),
-            shape: vec![out_dim, groups_per_row],
-            data: scales_bytes,
-            source_filename: String::new(),
-            source_sha256: String::new(),
-            source_offset: 0,
-        },
-    );
-
-    loaded.source_tensors.insert(
-        biases_name.clone(),
-        SourceTensor {
-            name: biases_name.clone(),
-            dtype: "F32".to_string(),
-            shape: vec![out_dim, groups_per_row],
-            data: biases_bytes,
-            source_filename: String::new(),
-            source_sha256: String::new(),
-            source_offset: 0,
-        },
-    );
-
-    for binding in &mut loaded.spec.global_tensors {
-        if binding.name == weight_name && binding.packed_shape.is_none() {
-            binding.packed_shape = Some(packed_shape.clone());
-        }
-    }
-    for layer in &mut loaded.spec.layers {
-        for binding in &mut layer.tensors {
-            if binding.name == weight_name && binding.packed_shape.is_none() {
-                binding.packed_shape = Some(packed_shape.clone());
-            }
-        }
-    }
-
-    eprintln!(
-        "[quantize] 8-bit affine quantized {}: [{},{}] -> packed [{},{}] + scales [{},{}]",
         weight_name,
         out_dim,
         in_dim,

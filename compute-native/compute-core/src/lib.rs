@@ -119,6 +119,7 @@ pub mod lora;
 pub mod mapped_image;
 #[cfg(feature = "mlx-backend")]
 pub mod memory;
+pub mod model_adapter;
 pub mod metrics;
 #[cfg(all(target_os = "macos", feature = "mlx-backend"))]
 pub mod metal_capture;
