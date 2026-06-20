@@ -550,39 +550,49 @@ pub(crate) fn load_source(
     }
 
     // ── Model-family adapter validation ──
-    // Verify the loaded source matches a known adapter for extra safety.
-    // This is informational: the existing pipeline continues regardless.
+    // Verify the loaded source matches a known adapter.
+    // Authoritative: unsupported model types or missing tensors produce clear errors.
     {
-        let model_type_val = arch.model_type.as_str();
-        let config_val: serde_json::Value = match std::fs::read_to_string(source_dir.join("config.json")) {
-            Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-            Err(_) => serde_json::Value::Null,
-        };
-        let tnames: Vec<String> = source_tensors.keys().cloned().collect();
-        let registry = crate::model_adapter::AdapterRegistry::new();
-        match registry.select(&config_val, &tnames) {
-            Ok(adapter) => {
-                let source_model = crate::model_adapter::SourceModel {
-                    config: config_val,
-                    config_path: config_path.clone(),
-                    model_type: model_type_val.to_string(),
-                    tensor_names: tnames.clone(),
-                    tensors: source_tensors.iter().map(|(k, v)| {
-                        (k.clone(), (v.dtype.clone(), v.shape.clone(), v.data.clone()))
-                    }).collect(),
-                };
-                match adapter.normalize(&source_model) {
-                    Ok(_canonical) => {
-                        eprintln!("[adapter] {} validation passed", adapter.family_name());
-                    }
-                    Err(report) => {
-                        eprintln!("[adapter] {} validation: {}", adapter.family_name(), report);
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("[adapter] no matching adapter: {}", e);
-            }
+        if skip_validation {
+            // skip adapter check in dev/skip mode
+        } else {
+            let model_type = arch.model_type.as_str();
+            let config_val: serde_json::Value = match std::fs::read_to_string(source_dir.join("config.json")) {
+                Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+                Err(_) => serde_json::Value::Null,
+            };
+            let tnames: Vec<String> = source_tensors.keys().cloned().collect();
+            let registry = crate::model_adapter::AdapterRegistry::new();
+            let adapter = registry.select(&config_val, &tnames).map_err(|e| {
+                crate::Error::from_reason(format!(
+                    "unsupported model type '{}': no model adapter matched.\n\
+                     Supported families: qwen2, llama, mistral, gemma, phi\n\
+                     Detail: {}\n\
+                     Tip: if the model is supported but adapter selection failed,\n\
+                     run with `--skip-validation` to bypass adapter checks.",
+                    model_type, e
+                ))
+            })?;
+            let source_model = crate::model_adapter::SourceModel {
+                config: config_val,
+                config_path: source_dir.join("config.json"),
+                model_type: model_type.to_string(),
+                tensor_names: tnames.clone(),
+                tensors: source_tensors.iter().map(|(k, v)| {
+                    (k.clone(), (v.dtype.clone(), v.shape.clone(), v.data.clone()))
+                }).collect(),
+            };
+            adapter.normalize(&source_model).map_err(|report| {
+                crate::Error::from_reason(format!(
+                    "model normalisation failed for '{}':\n{}\n\
+                     This usually means one of:\n\
+                     1. The model checkpoint has a different architecture than expected\n\
+                     2. The safetensors files are missing some required tensors\n\
+                     3. The model family adapter needs to be updated for new variants",
+                    model_type, report
+                ))
+            })?;
+            eprintln!("[adapter] {} validation passed", adapter.family_name());
         }
     }
 
