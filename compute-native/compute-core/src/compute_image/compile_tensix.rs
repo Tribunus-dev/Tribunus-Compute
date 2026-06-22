@@ -8,8 +8,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use crate::compute_image::tensix::{
-    CardCoord, DataFormat, GoldenPath, KernelConfig, KernelType, MathFidelity,
-    TensorBinding, TensixArch, TensixComputeImage,
+    CardCoord, DataFormat, GoldenPath, KernelConfig, KernelType, MathFidelity, TensixArch,
+    TensixComputeImage, TensorBinding,
 };
 use crate::compute_ir::{ComputeExecutionIR, IROp, IrTensor};
 use crate::Result;
@@ -36,6 +36,9 @@ pub fn compile_tensix(
     let mut dram_bytes: u64 = 0;
     let mut op_index: u32 = 0;
 
+    let is_tensor_parallel = false; // Placeholder: will be determined by topology when available
+    let tp_degree: u32 = 1;
+
     // Flatten all ops across all scheduling regions into a linear kernel stream.
     for region in &ir.regions {
         for op in &region.ops {
@@ -50,7 +53,10 @@ pub fn compile_tensix(
                     let byte_size = tensor_byte_size(tensor);
 
                     // Deduplicate: skip if this tensor was already bound by an earlier op.
-                    if tensor_bindings.iter().any(|b: &TensorBinding| b.tensor_name == tensor.name) {
+                    if tensor_bindings
+                        .iter()
+                        .any(|b: &TensorBinding| b.tensor_name == tensor.name)
+                    {
                         continue;
                     }
 
@@ -114,7 +120,13 @@ fn map_op_to_tensix_kernel(op: &IROp, _arch: TensixArch) -> Result<(KernelConfig
                 .unwrap_or(0);
 
             // Small matmuls need fewer cores; large matmuls distribute across DRAM banks.
-            let cores = if m >= 64 { 8 } else if m >= 16 { 4 } else { 1 };
+            let cores = if m >= 64 {
+                8
+            } else if m >= 16 {
+                4
+            } else {
+                1
+            };
             let cycles = if m > 0 && n > 0 && k > 0 {
                 (m * n * k) / 8
             } else {
@@ -123,28 +135,26 @@ fn map_op_to_tensix_kernel(op: &IROp, _arch: TensixArch) -> Result<(KernelConfig
             (KernelType::Math, MathFidelity::HiFi3, cycles, cores)
         }
         "rms_norm" | "rmsnorm" => {
-            let dim: u64 = op.metadata.get("dim").and_then(|v| v.parse().ok()).unwrap_or(4096);
+            let dim: u64 = op
+                .metadata
+                .get("dim")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4096);
             (KernelType::Math, MathFidelity::HiFi4, dim * 2, 1)
         }
         "softmax" => {
-            let dim: u64 = op.metadata.get("dim").and_then(|v| v.parse().ok()).unwrap_or(4096);
+            let dim: u64 = op
+                .metadata
+                .get("dim")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4096);
             (KernelType::Math, MathFidelity::LoFi, dim, 1)
         }
-        "silu" | "silu_activation" => {
-            (KernelType::Math, MathFidelity::LoFi, 10, 1)
-        }
-        "add" | "residual_add" | "residual" => {
-            (KernelType::Relu, MathFidelity::LoFi, 2, 1)
-        }
-        "rope" | "rotary_embedding" => {
-            (KernelType::Math, MathFidelity::HiFi4, 20, 1)
-        }
-        "sdpa" | "scaled_dot_product_attention" => {
-            (KernelType::Math, MathFidelity::HiFi3, 200, 4)
-        }
-        "kv_cache" | "kvcache" => {
-            (KernelType::Relu, MathFidelity::LoFi, 5, 1)
-        }
+        "silu" | "silu_activation" => (KernelType::Math, MathFidelity::LoFi, 10, 1),
+        "add" | "residual_add" | "residual" => (KernelType::Relu, MathFidelity::LoFi, 2, 1),
+        "rope" | "rotary_embedding" => (KernelType::Math, MathFidelity::HiFi4, 20, 1),
+        "sdpa" | "scaled_dot_product_attention" => (KernelType::Math, MathFidelity::HiFi3, 200, 4),
+        "kv_cache" | "kvcache" => (KernelType::Relu, MathFidelity::LoFi, 5, 1),
         other => {
             return Err(crate::Error::from_reason(format!(
                 "unsupported op for Tensix: {other}"
@@ -157,7 +167,11 @@ fn map_op_to_tensix_kernel(op: &IROp, _arch: TensixArch) -> Result<(KernelConfig
     } else {
         // Derive a stable name from the first input and output tensor IDs.
         let in_part = op.input_tensors.first().map(|s| s.as_str()).unwrap_or("in");
-        let out_part = op.output_tensors.first().map(|s| s.as_str()).unwrap_or("out");
+        let out_part = op
+            .output_tensors
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("out");
         format!("{}_{}_{}", in_part, op.kind, out_part)
     };
 
@@ -287,10 +301,17 @@ mod tests {
     use std::collections::HashMap;
 
     fn single_card_topology() -> (Vec<CardCoord>, GoldenPath) {
-        (vec![CardCoord { card_id: 0, noc_x: 0, noc_y: 0 }], GoldenPath {
-            ordered_cards: vec![0],
-            interconnect: crate::compute_image::tensix::InterconnectType::Noc,
-        })
+        (
+            vec![CardCoord {
+                card_id: 0,
+                noc_x: 0,
+                noc_y: 0,
+            }],
+            GoldenPath {
+                ordered_cards: vec![0],
+                interconnect: crate::compute_image::tensix::InterconnectType::Noc,
+            },
+        )
     }
 
     fn make_test_tensor(id: &str, name: &str, shape: Vec<u32>, dtype: &str) -> IrTensor {
@@ -317,13 +338,21 @@ mod tests {
             kind: kind.to_string(),
             input_tensors: inputs.into_iter().map(String::from).collect(),
             output_tensors: outputs.into_iter().map(String::from).collect(),
-            metadata: meta.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            metadata: meta
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
         }
     }
 
     #[test]
     fn test_matmul_mapping() {
-        let op = make_test_op("matmul", vec!["a", "b"], vec!["c"], vec![("m", "64"), ("n", "64"), ("k", "64")]);
+        let op = make_test_op(
+            "matmul",
+            vec!["a", "b"],
+            vec!["c"],
+            vec![("m", "64"), ("n", "64"), ("k", "64")],
+        );
         let (cfg, cycles, cores) = map_op_to_tensix_kernel(&op, TensixArch::WormholeB0).unwrap();
         assert_eq!(cfg.kernel_type, KernelType::Math);
         assert_eq!(cfg.math_fidelity, MathFidelity::HiFi3);
@@ -333,7 +362,12 @@ mod tests {
 
     #[test]
     fn test_small_matmul_uses_fewer_cores() {
-        let op = make_test_op("matmul", vec!["a", "b"], vec!["c"], vec![("m", "8"), ("n", "8"), ("k", "8")]);
+        let op = make_test_op(
+            "matmul",
+            vec!["a", "b"],
+            vec!["c"],
+            vec![("m", "8"), ("n", "8"), ("k", "8")],
+        );
         let (_, _, cores) = map_op_to_tensix_kernel(&op, TensixArch::WormholeB0).unwrap();
         assert_eq!(cores, 1);
     }

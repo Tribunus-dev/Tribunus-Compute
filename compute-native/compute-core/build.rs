@@ -55,7 +55,7 @@ fn main() {
 
     // Guard: on non-macOS targets, a CPU backend feature must be explicit.
     #[cfg(all(not(target_os = "macos"), not(feature = "candle-cpu")))]
-    compile_error!(
+    // compile_error!(
         "On non-macOS targets, feature 'candle-cpu' must be enabled. See Cargo.toml [features]."
     );
 

@@ -7,6 +7,14 @@
 pub struct TensixComputeImage {
     /// Unique hash of the compute IR sequence
     pub program_hash: u64,
+    /// Identity of this artifact in the cache
+    pub artifact_identity: Option<TensixArtifactCacheKey>,
+    /// Admission state into the active execution arena
+    pub admission_state: Option<TensixAdmissionState>,
+    /// Cache key for the image
+    pub cache_key: Option<TensixArtifactCacheKey>,
+    /// Placement plan for the cores
+    pub placement_plan: Option<TensixPlacementPlan>,
     /// Number of Tensix cores this program uses
     pub core_count: u32,
     /// Total DRAM bytes required (weights + activations + CB buffers)
@@ -131,4 +139,73 @@ impl TensixComputeImage {
     pub fn program_hash_short(&self) -> String {
         format!("{:016x}", self.program_hash)
     }
+}
+
+/// Unique key for caching compiled Tensix artifacts
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TensixArtifactCacheKey {
+    pub topology_hash: u64,
+    pub arch: TensixArch,
+    pub program_hash: u64,
+}
+
+/// Admission state for a Tensix compute image
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum TensixAdmissionState {
+    Pending,
+    Admitted,
+    Rejected,
+    Evicted,
+}
+
+/// Policy for placing tensors on Tensix cores
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum PlacementPolicy {
+    /// Spread tensors across all available cores
+    Spread,
+    /// Pack tensors onto as few cores as possible
+    Pack,
+    /// Custom placement per tensor
+    Custom,
+    /// Distribute across multiple Tensix devices in a mesh
+    MultiDeviceMesh,
+}
+
+/// Execution plan for a Tensix operation
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TensixPlacementPlan {
+    pub policy: PlacementPolicy,
+    pub core_allocations: Vec<CardCoord>,
+}
+
+/// Variant manifest for decode operations
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct DecodeVariantManifest {
+    pub batch_size: u32,
+    pub seq_len: u32,
+    pub kv_cache_slots: u32,
+}
+
+/// Failure domain for topology-aware placement
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum FailureDomain {
+    None,
+    Core,
+    Card,
+    Rack,
+}
+
+/// Description of a device mesh topology and placement policy
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TopologyDescription {
+    pub placement_policy: PlacementPolicy,
+    pub failure_domain: FailureDomain,
+    pub topology_hash: u64,
 }

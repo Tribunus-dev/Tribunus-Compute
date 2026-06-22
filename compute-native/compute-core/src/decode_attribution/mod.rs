@@ -27,3 +27,4 @@ pub mod shape_profiles;
 pub mod statistics;
 pub mod suite_manifest;
 pub mod timer_calibration;
+pub mod tensix_decode_plan;

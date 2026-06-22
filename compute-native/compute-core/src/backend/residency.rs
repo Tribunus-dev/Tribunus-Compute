@@ -300,3 +300,104 @@ impl ResidencyLedger {
         )
     }
 }
+
+
+use std::collections::VecDeque;
+
+// ── Weight Cache ───────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct WeightCacheKey {
+    pub tensor_identity: String,
+    pub capability: String,
+    pub topology_hash: String,
+    pub layout_version: u32,
+    pub data_format: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct WeightCacheEntry {
+    pub residency: TensorResidency,
+    pub session_id: Option<String>,
+}
+
+pub struct WeightCache {
+    pub max_dram_bytes: u64,
+    pub current_dram_bytes: u64,
+    pub entries: HashMap<WeightCacheKey, WeightCacheEntry>,
+    pub lru_order: VecDeque<WeightCacheKey>,
+    
+    pub hits: u64,
+    pub misses: u64,
+    pub upload_avoidance_bytes: u64,
+}
+
+impl WeightCache {
+    pub fn new(max_dram_bytes: u64) -> Self {
+        Self {
+            max_dram_bytes,
+            current_dram_bytes: 0,
+            entries: HashMap::new(),
+            lru_order: VecDeque::new(),
+            hits: 0,
+            misses: 0,
+            upload_avoidance_bytes: 0,
+        }
+    }
+
+    pub fn get(&mut self, key: &WeightCacheKey) -> Option<&TensorResidency> {
+        if let Some(pos) = self.lru_order.iter().position(|k| k == key) {
+            let k = self.lru_order.remove(pos).unwrap();
+            self.lru_order.push_back(k);
+            
+            let entry = self.entries.get(key).unwrap();
+            self.hits += 1;
+            self.upload_avoidance_bytes += entry.residency.byte_size;
+            Some(&entry.residency)
+        } else {
+            self.misses += 1;
+            None
+        }
+    }
+
+    pub fn insert(&mut self, key: WeightCacheKey, residency: TensorResidency, session_id: Option<String>) {
+        let size = residency.byte_size;
+        
+        // Remove existing key if present
+        if let Some(old_entry) = self.entries.remove(&key) {
+            self.current_dram_bytes -= old_entry.residency.byte_size;
+            if let Some(pos) = self.lru_order.iter().position(|k| *k == key) {
+                self.lru_order.remove(pos);
+            }
+        }
+
+        while self.current_dram_bytes + size > self.max_dram_bytes && !self.lru_order.is_empty() {
+            // Find victim: unpinned first, else oldest pinned
+            let mut victim_idx = None;
+            for (i, k) in self.lru_order.iter().enumerate() {
+                if let Some(entry) = self.entries.get(k) {
+                    if entry.session_id.is_none() {
+                        victim_idx = Some(i);
+                        break;
+                    }
+                }
+            }
+
+            let idx = victim_idx.unwrap_or(0);
+            let victim_key = self.lru_order.remove(idx).unwrap();
+            if let Some(victim_entry) = self.entries.remove(&victim_key) {
+                self.current_dram_bytes -= victim_entry.residency.byte_size;
+            }
+        }
+
+        self.entries.insert(key.clone(), WeightCacheEntry { residency, session_id });
+        self.lru_order.push_back(key);
+        self.current_dram_bytes += size;
+    }
+
+    pub fn invalidate_reset(&mut self) {
+        self.entries.clear();
+        self.lru_order.clear();
+        self.current_dram_bytes = 0;
+    }
+}

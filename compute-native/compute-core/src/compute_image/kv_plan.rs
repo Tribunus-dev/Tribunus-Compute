@@ -70,7 +70,10 @@ impl PrefixCompatibilityKey {
 
     /// Combined key for index lookup.
     pub fn composite_key(&self) -> String {
-        format!("{}:{}:{}", self.model_digest, self.tokenizer_digest, self.compile_digest)
+        format!(
+            "{}:{}:{}",
+            self.model_digest, self.tokenizer_digest, self.compile_digest
+        )
     }
 }
 
@@ -126,5 +129,102 @@ impl KvCachePlan {
             residency_domain: "HostPageable".into(),
             ..Default::default()
         }
+    }
+}
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvState {
+    Unallocated,
+    Allocated,
+    Primed,
+    Decoding,
+    Synchronized,
+    Invalidated,
+    Released,
+}
+
+pub struct RuntimePage {
+    pub state: KvState,
+    pub counter: AtomicU64,
+}
+
+impl RuntimePage {
+    pub fn new() -> Self {
+        Self {
+            state: KvState::Unallocated,
+            counter: AtomicU64::new(0),
+        }
+    }
+
+    pub fn allocate(&mut self) {
+        assert_eq!(self.state, KvState::Unallocated);
+        self.state = KvState::Allocated;
+    }
+
+    pub fn prime(&mut self) {
+        assert_eq!(self.state, KvState::Allocated);
+        self.state = KvState::Primed;
+    }
+
+    pub fn validate_then_prepare(&mut self) -> bool {
+        if self.state == KvState::Primed || self.state == KvState::Synchronized {
+            self.state = KvState::Decoding;
+            self.counter.fetch_add(1, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn append(&mut self) {
+        assert_eq!(self.state, KvState::Decoding);
+        self.state = KvState::Synchronized;
+    }
+
+    pub fn read(&self) -> KvState {
+        self.state
+    }
+
+    pub fn rollback(&mut self) {
+        if self.state == KvState::Decoding || self.state == KvState::Synchronized {
+            self.state = KvState::Primed;
+            self.counter.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    pub fn release(&mut self) {
+        self.state = KvState::Released;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_kv_runtime_state_machine() {
+        let mut page = RuntimePage::new();
+        assert_eq!(page.read(), KvState::Unallocated);
+
+        page.allocate();
+        assert_eq!(page.read(), KvState::Allocated);
+
+        page.prime();
+        assert_eq!(page.read(), KvState::Primed);
+
+        assert!(page.validate_then_prepare());
+        assert_eq!(page.read(), KvState::Decoding);
+        assert_eq!(page.counter.load(Ordering::SeqCst), 1);
+
+        page.append();
+        assert_eq!(page.read(), KvState::Synchronized);
+
+        page.rollback();
+        assert_eq!(page.read(), KvState::Primed);
+        assert_eq!(page.counter.load(Ordering::SeqCst), 0);
+
+        page.release();
+        assert_eq!(page.read(), KvState::Released);
     }
 }
