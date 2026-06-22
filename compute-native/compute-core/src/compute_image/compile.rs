@@ -2050,7 +2050,6 @@ pub(crate) fn compile_sequential(
         &loaded.source_tensors,
         &loaded.arch,
         output_dir,
-        output_dir_path,
         &loaded.namespace,
     ).map_err(crate::Error::from_reason)?;
     // Apply compile-time graph optimization passes.
@@ -2440,6 +2439,44 @@ pub fn compile_differential(
     ).map_err(crate::Error::from_reason)?;
     builder.set_execution_plan(plan_with_fusion);
 
+    let payload_emission_ms = t_emit.elapsed().as_millis() as u64;
+
+    // Flush and collect new segments
+    let (new_segments, new_payloads, partial_manifest) = builder.flush_and_collect_segments();
+
+    // Determine offset for new segment filenames
+    let max_existing: usize = unchanged_segments
+        .iter()
+        .filter_map(|s| {
+            let stripped = s.filename.strip_prefix("segment_")?;
+            let num_str = stripped.strip_suffix(".bin")?;
+            num_str.parse::<usize>().ok()
+        })
+        .max()
+        .map(|n| n + 1)
+        .unwrap_or(0);
+
+    // Write new segment files with offset filenames
+    for (i, payload) in new_payloads.iter().enumerate() {
+        let new_filename = format!("segment_{:03}.bin", max_existing + i);
+        let path = output_dir_path.join(&new_filename);
+        std::fs::write(&path, payload).map_err(|e| {
+            crate::Error::from_reason(format!("write new segment {}: {e}", new_filename))
+        })?;
+    }
+
+    // Build combined manifest
+    let mut combined_segments: Vec<Segment> =
+        Vec::with_capacity(unchanged_segments.len() + new_segments.len());
+    combined_segments.extend(unchanged_segments);
+
+    for (i, (seg, payload)) in new_segments.iter().zip(new_payloads.iter()).enumerate() {
+        let new_filename = format!("segment_{:03}.bin", max_existing + i);
+        let sha256 = {
+            let mut h = Sha256::new();
+            h.update(payload);
+            format!("{:x}", h.finalize())
+        };
         combined_segments.push(Segment {
             id: seg.id.clone(),
             filename: new_filename,

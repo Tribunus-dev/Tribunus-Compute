@@ -253,12 +253,51 @@ impl SystemState {
             };
 
             // Read battery capacity fraction from the power sources list.
-            let battery = unsafe { IOPSCopyBatteryInfo(power_info) };
-            let fraction = if !battery.is_null() {
-                unsafe { CFRelease(battery as *mut libc::c_void) };
-                0.0 // Placeholder — real implementation enumerates the
-                    // CFArray of batteries for current capacity / max capacity.
+            // Use modern IOPS API to enumerate power sources and read
+            // current / max capacity for battery fraction.
+            const K_CFNUMBER_S64: u32 = 4; // kCFNumberSInt64Type
+            let current_key = unsafe { CFStringCreateWithCString(
+                std::ptr::null(), b"Current Capacity\0" as *const u8 as *const libc::c_char,
+                K_CFSTRING_ENCODING_UTF8,
+            ) };
+            let max_key = unsafe { CFStringCreateWithCString(
+                std::ptr::null(), b"Max Capacity\0" as *const u8 as *const libc::c_char,
+                K_CFSTRING_ENCODING_UTF8,
+            ) };
+            let ps_list = unsafe { IOPSCopyPowerSourcesList(power_info) };
+            let ps_count = if !ps_list.is_null() {
+                unsafe { CFArrayGetCount(ps_list) }
             } else {
+                0
+            };
+            let fraction = if ps_count > 0 && !current_key.is_null() && !max_key.is_null() {
+                let mut total_frac = 0.0f64;
+                let mut valid = 0i64;
+                for i in 0..ps_count {
+                    let ps = unsafe { CFArrayGetValueAtIndex(ps_list, i) };
+                    if ps.is_null() { continue; }
+                    let desc = unsafe { IOPSGetPowerSourceDescription(power_info, ps) };
+                    if desc.is_null() { continue; }
+                    let current_val = unsafe { CFDictionaryGetValue(desc, current_key) };
+                    let max_val = unsafe { CFDictionaryGetValue(desc, max_key) };
+                    if current_val.is_null() || max_val.is_null() { continue; }
+                    let mut cur: i64 = 0;
+                    let mut max: i64 = 0;
+                    let ok_cur = unsafe { CFNumberGetValue(current_val, K_CFNUMBER_S64, &mut cur as *mut _ as *mut libc::c_void) };
+                    let ok_max = unsafe { CFNumberGetValue(max_val, K_CFNUMBER_S64, &mut max as *mut _ as *mut libc::c_void) };
+                    if ok_cur != 0 && ok_max != 0 && max > 0 {
+                        total_frac += cur as f64 / max as f64;
+                        valid += 1;
+                    }
+                }
+                if !ps_list.is_null() { unsafe { CFRelease(ps_list as *mut libc::c_void) } }
+                if !current_key.is_null() { unsafe { CFRelease(current_key as *mut libc::c_void) } }
+                if !max_key.is_null() { unsafe { CFRelease(max_key as *mut libc::c_void) } }
+                if valid > 0 { total_frac / valid as f64 } else { 1.0 }
+            } else {
+                if !ps_list.is_null() { unsafe { CFRelease(ps_list as *mut libc::c_void) } }
+                if !current_key.is_null() { unsafe { CFRelease(current_key as *mut libc::c_void) } }
+                if !max_key.is_null() { unsafe { CFRelease(max_key as *mut libc::c_void) } }
                 1.0
             };
 
@@ -539,7 +578,8 @@ impl Default for FlexDispatch {
 extern "C" {
     fn IOPSCopyPowerSourcesInfo() -> *mut libc::c_void;
     fn IOPSGetProvidingPowerSourceType(ps_info: *mut libc::c_void) -> *mut libc::c_void;
-    fn IOPSCopyBatteryInfo(ps_info: *mut libc::c_void) -> *mut libc::c_void;
+    fn IOPSCopyPowerSourcesList(ps_info: *mut libc::c_void) -> *mut libc::c_void;
+    fn IOPSGetPowerSourceDescription(ps_info: *mut libc::c_void, ps_id: *mut libc::c_void) -> *mut libc::c_void;
     fn CFRelease(cf: *mut libc::c_void);
     fn CFEqual(cf1: *const libc::c_void, cf2: *const libc::c_void) -> u8;
     fn CFStringCreateWithCString(
@@ -547,6 +587,10 @@ extern "C" {
         c_str: *const libc::c_char,
         encoding: u32,
     ) -> *mut libc::c_void;
+    fn CFDictionaryGetValue(dict: *mut libc::c_void, key: *const libc::c_void) -> *mut libc::c_void;
+    fn CFNumberGetValue(num: *mut libc::c_void, the_type: u32, value: *mut libc::c_void) -> u8;
+    fn CFArrayGetCount(arr: *mut libc::c_void) -> isize;
+    fn CFArrayGetValueAtIndex(arr: *mut libc::c_void, idx: isize) -> *mut libc::c_void;
 }
 
 #[cfg(test)]
