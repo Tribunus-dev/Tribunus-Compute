@@ -221,6 +221,7 @@ pub struct ProfiledInferenceSession {
     /// Compressed TurboQuant KV caches, one per layer.
     /// Populated in parallel with the FP16 KvCache during inference.
     pub compressed_caches: Vec<Option<TurboQuantKvCache>>,
+    pub compressed_caches: Vec<Option<Arc<Mutex<TurboQuantKvCache>>>>,
     /// Sampling configuration, including optional grammar-guided generation.
     /// The grammar FSM is advanced after each decoded token.
     pub sampler: SamplerConfig,
@@ -297,13 +298,20 @@ impl ProfiledInferenceSession {
         ));
 
         let compressed_caches: Vec<Option<TurboQuantKvCache>> = {
-            let cap = kv_caches.first().map(|c| c.capacity).unwrap_or(2048);
-            let group_size = 32usize;
-            kv_caches.iter().map(|_kvc| {
-                let mode = KvQuantMode::PolarHadamard(4);
-                Some(TurboQuantKvCache::new(mode, group_size, cap as usize))
-            }).collect()
-        };
+        let cap = kv_caches.first().map(|c| c.capacity).unwrap_or(2048);
+        let group_size = 32usize;
+        let mode = KvQuantMode::PolarHadamard(4);
+        let compressed_caches: Vec<Option<Arc<Mutex<TurboQuantKvCache>>>> = kv_caches.iter().map(|_kvc| {
+            let comp = Arc::new(Mutex::new(TurboQuantKvCache::new(mode, group_size, cap as usize)));
+            Some(comp)
+        }).collect();
+
+        // Pair each KvCache with its compressed sink.
+        for (kvc, comp) in kv_caches.iter_mut().zip(compressed_caches.iter()) {
+            if let Some(ref shared) = comp {
+                kvc.set_compressed_sink(shared.clone());
+            }
+        }
 
         Self {
             session_id,

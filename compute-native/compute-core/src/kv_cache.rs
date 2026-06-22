@@ -20,6 +20,9 @@ use mlx_rs::{ops, Array};
 use crate::cache::evolkv::{CalibrationSet, EvolKV, LayerBudget};
 
 use crate::memory::allocator::BlockHandle;
+use std::sync::Arc;
+use parking_lot::Mutex;
+use std::rc::Rc;
 use crate::quantization::turboquant_kv::{
     AsymmetricQuantMode, KvQuantMode, QjlCorrection, TurboQuantKvCache,
 };
@@ -379,9 +382,18 @@ pub struct KvCache {
     pub evictions_count: u64,
     /// Bytes copied during operations.
     pub copy_bytes: u64,
+    /// Optional compressed cache sink for TurboQuant quantization.
+    /// When set, every `append()` also quantizes the incoming key/value
+    /// arrays into this TurboQuant cache.
+    pub compressed_sink: Option<Arc<Mutex<TurboQuantKvCache>>>,
 }
 
 impl KvCache {
+    /// Set the compressed cache sink for TurboQuant quantization.
+    pub fn set_compressed_sink(&mut self, sink: Arc<Mutex<TurboQuantKvCache>>) {
+        self.compressed_sink = Some(sink);
+    }
+
     /// Create a new empty per-layer KV cache.
     ///
     /// `capacity` is the maximum number of positions stored (sliding window
@@ -406,6 +418,7 @@ impl KvCache {
             rollback_v: None,
             evictions_count: 0,
             copy_bytes: 0,
+            compressed_sink: None,
         }
     }
 
@@ -426,6 +439,23 @@ impl KvCache {
     /// caller needs to roll back, `rollback()` restores the pre-append state.
     pub fn append(&mut self, keys: Array, values: Array) -> MlxResult<()> {
         let incoming_len = keys.shape()[0] as u32;
+
+        // If compressed sink is set, quantize incoming data before storing.
+        if let Some(sink) = &self.compressed_sink {
+            let n_kv = self.n_kv_heads as usize;
+            let hd = self.head_dim as usize;
+            for t in 0..incoming_len as usize {
+                let k_t = keys.index(t as i32);
+                let v_t = values.index(t as i32);
+                let k_slice: &[f32] = k_t.as_slice::<f32>();
+                let v_slice: &[f32] = v_t.as_slice::<f32>();
+                if !k_slice.is_empty() && !v_slice.is_empty() {
+                    let slot = self.total_appended as usize + t;
+                    let mut comp = sink.lock();
+                    let _ = comp.quantize(slot, k_slice, v_slice);
+                }
+            }
+        }
 
         if self.k_cache.is_none()
             && self.v_cache.is_none()
