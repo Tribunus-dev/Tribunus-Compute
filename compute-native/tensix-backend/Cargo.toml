@@ -1,0 +1,12 @@
+[package]
+name = "tensix-backend"
+edition = "2021"
+version = "0.1.0"
+
+[dependencies]
+tensix-ffi = { path = "../tensix-ffi" }
+tribunus-compute-core = { path = "../compute-core" }
+
+[features]
+default = []
+mock = []
