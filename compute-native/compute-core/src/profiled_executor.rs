@@ -498,16 +498,16 @@ impl ProfiledInferenceSession {
         token_ids: &[i32],
         is_prefill: bool,
     ) -> GraphExecutionDisposition {
-        let kv_checkpoint: Vec<u32> = self.kv_caches.iter().map(|c| c.committed_len).collect();
+
+        // Capture broad fallback checkpoint BEFORE any mutation.
+        let checkpoint_hidden = hidden.clone();
+        let checkpoint_kv_lengths: Vec<u32> = self.kv_caches.iter().map(|c| c.committed_len).collect();
+        let checkpoint_position = self.absolute_position;
 
         let engine = PhaseEngine::new();
 
-        // Move KV caches — exclusive mutation ownership.
-        let session_caches = std::mem::take(&mut self.kv_caches);
-        let dag_caches: Vec<crate::kv_cache::LiveKvCache> = session_caches
-            .into_iter()
-            .map(|c| crate::kv_cache::LiveKvCache::Fp16(c))
-            .collect();
+        // RAII guard: takes session caches, restores on Drop (panic-safe).
+        let mut guard = KvCacheRestoreGuard::new(&mut self.kv_caches);
 
         let mut ctx = ExecutionContext {
             request_id: 0,
@@ -515,7 +515,7 @@ impl ProfiledInferenceSession {
             token_ids: token_ids.to_vec(),
             is_prefill,
             hidden_state: Some(hidden.clone()),
-            kv_caches: dag_caches,
+            kv_caches: std::mem::take(guard.caches_mut()),
             layer_weights: Arc::new(model.layers.clone()),
             backend: Some(Box::new(RuntimeBackends {
                 mlx_executor: Arc::new(std::sync::Mutex::new(
@@ -543,36 +543,43 @@ impl ProfiledInferenceSession {
             .count();
         self.phase_receipts.extend(result.receipts);
 
-        // Always restore KV caches — unwrap from LiveKvCache, move in bulk.
-        let restored: Vec<KvCache> = ctx.kv_caches.into_iter().map(|lc| match lc {
-            crate::kv_cache::LiveKvCache::Fp16(kv) => kv,
-            _ => panic!("DAG returned unexpected compressed KV cache"),
-        }).collect();
-        self.kv_caches = restored;
-
-        // Propagate hidden state back to caller.
-        if let Some(h) = ctx.hidden_state {
-            *hidden = h;
-        }
+        // Return mutated caches to guard (for restoration in Drop or disarming).
+        *guard.caches_mut() = ctx.kv_caches;
 
         // Determine disposition.
         if result.all_completed {
             let label = if is_prefill { "prefill" } else { "decode" };
             eprintln!("[phase-dag] {}: all {} phases completed via PhaseEngine", label, receipt_count);
+            // Propagate hidden only when Complete — never before disposition.
+            if let Some(h) = ctx.hidden_state {
+                *hidden = h;
+            }
+            let _ = guard.into_inner(); // disarm Drop — successful publication
             return GraphExecutionDisposition::Complete;
         }
 
-        let has_kv_mutations = self.kv_caches.iter().zip(&kv_checkpoint)
+        // Check for partial KV mutations against the checkpoint.
+        let has_kv_mutations = self.kv_caches.iter().zip(&checkpoint_kv_lengths)
             .any(|(c, &ckpt)| c.committed_len != ckpt);
+        let has_position_change = self.absolute_position != checkpoint_position;
 
-        if has_kv_mutations {
+        // Hidden state may have been modified even without KV change.
+        // Restore from checkpoint when falling back.
+        if has_kv_mutations || has_position_change {
             let label = if is_prefill { "prefill" } else { "decode" };
-            eprintln!("[phase-dag] {}: completed {} of {} phases WITH KV mutations", label, completed_count, receipt_count);
+            eprintln!("[phase-dag] {}: completed {} of {} phases WITH mutations (KV: {}, pos: {})",
+                label, completed_count, receipt_count, has_kv_mutations, has_position_change);
+            // Restore hidden from checkpoint before returning partial disposition.
+            *hidden = checkpoint_hidden;
+            let _ = guard.into_inner(); // disarm Drop — caller must not use old loop
             return GraphExecutionDisposition::PartialPublishedResumeRequired;
         }
 
         let label = if is_prefill { "prefill" } else { "decode" };
         eprintln!("[phase-dag] {}: {} phases completed, no KV mutation (safe fallback)", label, completed_count);
+        // Restore hidden from checkpoint so legacy loop starts clean.
+        *hidden = checkpoint_hidden;
+        let _ = guard.into_inner(); // disarm Drop — caller is responsible
         GraphExecutionDisposition::ZeroMutationsFallbackSafe
     }
 
@@ -616,7 +623,8 @@ impl ProfiledInferenceSession {
 
         let plan = &model.reader.manifest.execution_plan;
         let full_prompt = self.pending_prompt_tokens.as_ref().unwrap();
-        let remaining = full_prompt.len() as u32 - self.prefilled_tokens;
+        let full_prompt_len = full_prompt.len() as u32;
+        let remaining = full_prompt_len - self.prefilled_tokens;
         let chunk_size = remaining.min(PREFILL_CHUNK_SIZE);
 
         // Build the chunk of token IDs
@@ -807,7 +815,7 @@ impl ProfiledInferenceSession {
         self.prefilled_tokens += chunk_size;
         self.absolute_position += chunk_size;
 
-        let is_last_chunk = self.prefilled_tokens >= full_prompt.len() as u32;
+        let is_last_chunk = self.prefilled_tokens >= full_prompt_len;
         if is_last_chunk {
             // Run epilogue on completion
             let sampler = &self.sampler;
@@ -2588,6 +2596,63 @@ mod tests {
         assert_eq!(full_sin.shape(), &[8, 256]);
         assert_eq!(rope_cos.shape()[0], arch.max_position_embeddings as i32);
         assert_eq!(full_cos.shape()[0], arch.max_position_embeddings as i32);
+    }
+}
+
+/// Drop guard that restores session KV caches on unwind or early return.
+///
+/// Created by `std::mem::take`-ing the session's KV caches, converting them
+/// to `Vec<LiveKvCache>` for the PhaseEngine context. On Drop (including
+/// panic unwind), restores the original caches. Call `disarm()` after
+/// deliberate publication to suppress the Drop restoration.
+struct KvCacheRestoreGuard {
+    slot: *mut Vec<KvCache>,
+    caches: Option<Vec<crate::kv_cache::LiveKvCache>>,
+}
+
+impl KvCacheRestoreGuard {
+    /// Take ownership of the session KV caches, convert to LiveKvCache.
+    fn new(slot: &mut Vec<KvCache>) -> Self {
+        let raw = std::mem::take(slot);
+        let caches: Vec<crate::kv_cache::LiveKvCache> = raw
+            .into_iter()
+            .map(|c| crate::kv_cache::LiveKvCache::Fp16(c))
+            .collect();
+        Self {
+            slot: slot as *mut Vec<KvCache>,
+            caches: Some(caches),
+        }
+    }
+
+    /// Get a mutable reference to the owned caches for building ExecutionContext.
+    fn caches_mut(&mut self) -> &mut Vec<crate::kv_cache::LiveKvCache> {
+        self.caches.as_mut().expect("KvCacheRestoreGuard already disarmed")
+    }
+
+    /// Consume the guard and return ownership of the (potentially mutated) caches.
+    /// After this call, Drop restoration is suppressed — the caller assumes ownership.
+    fn into_inner(mut self) -> Vec<crate::kv_cache::LiveKvCache> {
+        self.caches.take().expect("KvCacheRestoreGuard already disarmed")
+    }
+}
+
+impl Drop for KvCacheRestoreGuard {
+    fn drop(&mut self) {
+        // On Drop (panic / unwind / early return), restore original caches.
+        if let Some(caches) = self.caches.take() {
+            let restored: Vec<KvCache> = caches
+                .into_iter()
+                .map(|lc| match lc {
+                    crate::kv_cache::LiveKvCache::Fp16(kv) => kv,
+                    _ => {
+                        eprintln!("[kv-guard] unexpected compressed cache variant on Drop — losing data");
+                        // Cannot recover — return zeroed cache to avoid leaving session empty.
+                        KvCache::new(0, 0, 0, false)
+                    }
+                })
+                .collect();
+            unsafe { *self.slot = restored; }
+        }
     }
 }
 
