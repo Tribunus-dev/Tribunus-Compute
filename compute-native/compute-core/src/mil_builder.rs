@@ -1034,4 +1034,43 @@ mod tests {
         assert!(text.contains("matmul("));
         assert!(text.contains("-> (matmul_1)"));
     }
+
+    // ── const_f32 auto-fill tests (MIL builder repair) ─────────────────
+
+    #[test]
+    fn const_f32_empty_data_auto_fills_zeros() {
+        let builder = MilBuilder::new("main")
+            .input("x", mil_spec::DataType::Float32, &[1, 4])
+            .const_f32("w", &[], &[4, 1])   // empty data, shape = [4,1] → 4 zeros
+            .matmul("x", "w_0")
+            .output("matmul_1")
+            .build()
+            .expect("mil build");
+        let text = builder.to_mil_text();
+        // Should contain 4 zero floats in the const
+        assert!(text.contains("0.0, 0.0, 0.0, 0.0"));
+    }
+
+    #[test]
+    fn const_f32_with_values_preserves_them() {
+        let builder = MilBuilder::new("main")
+            .const_f32("w", &[1.0, 2.0, 3.0, 4.0], &[4, 1])
+            .output("w_0")
+            .build()
+            .expect("mil build");
+        let text = builder.to_mil_text();
+        assert!(text.contains("1.0"));
+        assert!(text.contains("4.0"));
+    }
+
+    #[test]
+    fn const_f32_empty_shape_empty_data_ok() {
+        let builder = MilBuilder::new("main")
+            .const_f32("empty", &[], &[])
+            .output("empty_0")
+            .build()
+            .expect("mil build");
+        assert!(builder.to_mil_text().contains("const()["));
+    }
+
 }

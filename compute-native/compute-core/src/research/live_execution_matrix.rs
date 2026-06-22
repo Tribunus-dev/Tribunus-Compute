@@ -401,12 +401,12 @@ mod tests {
 
     #[test]
     fn test_subsystem_state_ordering() {
-        assert!((SubsystemState::NotAvailable as u8) < (SubsystemState::Available as u8);
-        assert!((SubsystemState::Available as u8) < (SubsystemState::Compiled as u8);
-        assert!((SubsystemState::Compiled as u8) < (SubsystemState::Loaded as u8);
-        assert!((SubsystemState::Loaded as u8) < (SubsystemState::Selected as u8);
-        assert!((SubsystemState::Selected as u8) < (SubsystemState::Dispatched as u8);
-        assert!((SubsystemState::Dispatched as u8) < (SubsystemState::Completed as u8);
+        assert!((SubsystemState::NotAvailable as u8) < (SubsystemState::Available as u8));
+        assert!((SubsystemState::Available as u8) < (SubsystemState::Compiled as u8));
+        assert!((SubsystemState::Compiled as u8) < (SubsystemState::Loaded as u8));
+        assert!((SubsystemState::Loaded as u8) < (SubsystemState::Selected as u8));
+        assert!((SubsystemState::Selected as u8) < (SubsystemState::Dispatched as u8));
+        assert!((SubsystemState::Dispatched as u8) < (SubsystemState::Completed as u8));
     }
 
     #[test]
@@ -498,7 +498,7 @@ mod tests {
 
     #[test]
     fn test_kv_cache_mode_ordering() {
-        assert!(KvCacheModeState::None as u8) < (KvCacheModeState::Fp16 as u8);
-        assert!(KvCacheModeState::Fp16 as u8) < (KvCacheModeState::Compressed as u8);
+        assert!((KvCacheModeState::None as u8) < (KvCacheModeState::Fp16 as u8));
+        assert!((KvCacheModeState::Fp16 as u8) < (KvCacheModeState::Compressed as u8));
     }
 }
