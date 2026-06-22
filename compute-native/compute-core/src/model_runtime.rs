@@ -649,6 +649,7 @@ mod tests {
             quantization: None,
             tensor_alignment_bytes: 16,
             layout_version: 1,
+            artifact_bindings: Default::default(),
         };
 
         let cat = TensorCatalogEntry {

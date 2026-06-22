@@ -188,7 +188,7 @@ pub(crate) fn load_tensor_from_mapped_segment(
 // RoPE table construction
 // ---------------------------------------------------------------------------
 
-fn build_rope_tables(
+pub(crate) fn build_rope_tables(
     arch: &TextArchitecture,
 ) -> crate::Result<(Arc<Array>, Arc<Array>, Arc<Array>, Arc<Array>)> {
     let (rope_cos, rope_sin) = crate::primitives::rope_freqs(

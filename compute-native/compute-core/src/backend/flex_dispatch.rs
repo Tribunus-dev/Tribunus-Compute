@@ -772,7 +772,7 @@ mod tests {
         // resets. We verify the internal state by checking the step counter.
         for i in 0..4 {
             let op = make_matmul_op(i);
-            flex.dispatch(&op, i);
+            flex.dispatch(&op, i as u32);
             assert!(
                 flex.steps_since_sample <= 5,
                 "steps_since_sample should be <= 5 after {i} dispatches"

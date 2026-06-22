@@ -92,7 +92,11 @@ pub use verify::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::{Serialize, Deserialize};
     use crate::model::TensorLookup;
+    use crate::compute_image::manifest::SourceIdentity;
+    use mlx_rs::Array;
+    use std::path::Path;
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
     use std::fs;
     use std::path::PathBuf;
@@ -1063,6 +1067,10 @@ mod tests {
             image_version: "0.1.0".into(),
             compiler_version: "test".into(),
             runtime_abi: "test".into(),
+            hardware_target: None,
+            readiness: None,
+            compile_date: Default::default(),
+            compile_host: Default::default(),
             source: source,
             architecture: crate::config::TextArchitecture {
                 hidden_size: 64,
@@ -1089,8 +1097,11 @@ mod tests {
                 },
                 rope_global: None,
                 model_type: "test".into(),
+                moe_config: Default::default(),
+                diffusion_config: Default::default(),
             },
             vision_config: None,
+            audio_config: None,
             segments: vec![],
             tensor_table: vec![],
             alias_table: vec![],
@@ -1104,6 +1115,10 @@ mod tests {
             required_storage_abi: STORAGE_ABI_COPIED_V0.into(),
             required_capabilities: vec![],
             prepacked_layout: "none".into(),
+            metallib_hash: None,
+            metallib_size: None,
+            metal_kernel_artifacts: vec![],
+            phase_dag: None,
             execution_plan: crate::config::ModelExecutionPlan::default(),
         };
 
@@ -1146,11 +1161,16 @@ mod tests {
             quantization: None,
             tensor_alignment_bytes: 16,
             layout_version: 1,
+            artifact_bindings: Default::default(),
         };
         let manifest = Manifest {
             image_version: "0.1.0".into(),
             compiler_version: "test".into(),
             runtime_abi: "test".into(),
+            hardware_target: None,
+            readiness: None,
+            compile_date: Default::default(),
+            compile_host: Default::default(),
             source: SourceIdentity {
                 config_hash: "abc".into(),
                 shard_hashes: vec![],
@@ -1186,6 +1206,8 @@ mod tests {
                 },
                 rope_global: None,
                 model_type: "test".into(),
+                moe_config: Default::default(),
+                diffusion_config: Default::default(),
             },
             segments: vec![segment],
             tensor_table: vec![tensor],
@@ -1199,8 +1221,13 @@ mod tests {
             image_hash: "dummy".into(),
             required_storage_abi: STORAGE_ABI_MAPPED_NO_COPY_V1.into(),
             vision_config: None,
+            audio_config: None,
             required_capabilities: vec![],
             prepacked_layout: "none".into(),
+            metallib_hash: None,
+            metallib_size: None,
+            metal_kernel_artifacts: vec![],
+            phase_dag: None,
             execution_plan: crate::config::ModelExecutionPlan::default(),
         };
 
@@ -1477,6 +1504,7 @@ mod tests {
             quantization: None,
             tensor_alignment_bytes: 16,
             layout_version: 1,
+            artifact_bindings: Default::default(),
         };
 
         // Segment is only 250 bytes, tensor ends at 300 -> OOB

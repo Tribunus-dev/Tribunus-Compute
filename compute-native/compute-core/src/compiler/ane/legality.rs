@@ -266,6 +266,7 @@ mod tests {
             fusions: vec![],
             state_effects: vec![],
             temp_memory_bytes: 0,
+            fusion_regions: vec![],
             is_fence: false,
         }
     }

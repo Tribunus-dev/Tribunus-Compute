@@ -596,7 +596,7 @@ mod tests {
 
     #[test]
     fn test_apply_to_cache() {
-        let mode = crate::quantization::turboquant_kv::KvQuantMode::Symmetric4Bit;
+        let mode = crate::quantization::turboquant_kv::KvQuantMode::Polar(4);
         let mut cache = CompressedKvCache::new(mode, 32, 10);
         assert!(cache.per_layer_budget.is_none());
 

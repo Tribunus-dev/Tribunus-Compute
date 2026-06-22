@@ -514,6 +514,7 @@ mod tests {
                     layer_scalar_ids: Vec::new(),
                     quantization_ids: Vec::new(),
                     route: Default::default(),
+                    fused_operations: Default::default(),
                 },
                 // Layer 1: full attention
                 LayerPlan {
@@ -548,6 +549,7 @@ mod tests {
                     layer_scalar_ids: Vec::new(),
                     quantization_ids: Vec::new(),
                     route: Default::default(),
+                    fused_operations: Default::default(),
                 },
             ],
             fused_ane_islands: vec![],
@@ -560,6 +562,11 @@ mod tests {
                 final_logit_softcapping: Some(30.0),
                 vocab_size: 256000,
             },
+            speculative_config: None,
+            generation_regime: Default::default(),
+            diffusion_config: Default::default(),
+            diffusion_execution_plan: Default::default(),
+            kv_cache_mode: Default::default(),
         }
     }
 
@@ -770,6 +777,11 @@ mod tests {
             prologue: ProloguePlan::default(),
             layers: vec![],
             epilogue: EpiloguePlan::default(),
+            speculative_config: None,
+            generation_regime: Default::default(),
+            diffusion_config: Default::default(),
+            diffusion_execution_plan: Default::default(),
+            kv_cache_mode: Default::default(),
         };
         let catalog = OperationCatalog::generate_from_plan(&plan);
         // Empty plan with no layers produces 0 records (no layers to catalog)

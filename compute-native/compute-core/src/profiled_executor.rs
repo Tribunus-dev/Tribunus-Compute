@@ -2599,6 +2599,8 @@ mod tests {
                 partial_rotary_factor: None,
             }),
             model_type: "gemma".to_string(),
+            moe_config: Default::default(),
+            diffusion_config: Default::default(),
         }
     }
 

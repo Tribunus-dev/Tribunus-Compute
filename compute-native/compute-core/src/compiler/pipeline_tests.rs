@@ -117,6 +117,7 @@ mod tests {
                     outputs: op.outputs.clone(),
                     dependencies: vec![],
                     fusions: vec![],
+                    fusion_regions: vec![],
                     state_effects: vec![],
                     temp_memory_bytes: 0,
                     is_fence: false,

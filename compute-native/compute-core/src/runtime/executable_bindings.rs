@@ -254,13 +254,11 @@ mod tests {
         let obj2_offset = 16u64; // gap
         let obj2_data = b"second object payload";
 
-        write_segment_file(&dir, segment_id, 0, {
-            let total = (obj2_offset as usize) + obj2_data.len();
-            let mut buf = vec![0u8; total];
-            buf[obj1_offset as usize..][..obj1_data.len()].copy_from_slice(obj1_data);
-            buf[obj2_offset as usize..][..obj2_data.len()].copy_from_slice(obj2_data);
-            &buf
-        });
+        let total = (obj2_offset as usize) + obj2_data.len();
+        let mut buf = vec![0u8; total];
+        buf[obj1_offset as usize..][..obj1_data.len()].copy_from_slice(obj1_data);
+        buf[obj2_offset as usize..][..obj2_data.len()].copy_from_slice(obj2_data);
+        write_segment_file(&dir, segment_id, 0, &buf);
 
         let store = ContentAddressedContentStore {
             store_version: ContentStoreVersion { major: 1, minor: 0 },

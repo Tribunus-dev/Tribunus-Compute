@@ -229,13 +229,21 @@ impl MilBuilder {
     /// Add a const operation with f32 immediate values.
     /// Returns `Self` with the constant's SSA name tracked.
     pub fn const_f32(mut self, name_hint: &str, values: &[f32], shape: &[i64]) -> Self {
+        // Auto-fill with zeros when values are empty but shape declares elements.
+        // Prevents "Tensor storage and type have different number of elements" from coremlcompiler.
+        let effective_values: Vec<f32> = if values.is_empty() && !shape.is_empty() {
+            let total: usize = shape.iter().map(|&d| d.max(0) as usize).product();
+            if total > 0 { vec![0.0f32; total] } else { values.to_vec() }
+        } else {
+            values.to_vec()
+        };
         let name = self.fresh_name(name_hint);
         let tensor_type = tensor_type(mil_spec::DataType::Float32, shape);
         let vt = value_type_tensor(tensor_type);
 
         let tv = mil_spec::TensorValue {
             value: Some(tensor_value::Value::Floats(tensor_value::RepeatedFloats {
-                values: values.to_vec(),
+                values: effective_values,
             })),
         };
         let v = mil_spec::Value {

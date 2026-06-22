@@ -776,12 +776,11 @@ mod tests {
         // value is a string "42" instead of number 42
         let raw = r#"{"name": "calculate", "arguments": {"value": "42"}}"#;
         match parse_and_repair(raw, &tool) {
-            ToolCallResult::Repaired(call, fixes) | ToolCallResult::Valid(call, fixes) => {
-                if fixes.is_empty() {
-                    // string "42" might be accepted as string
-                } else {
-                    assert!(fixes.iter().any(|f| f.contains("type mismatch")));
-                }
+            ToolCallResult::Valid(_call) => {
+                // string "42" might be accepted as string
+            }
+            ToolCallResult::Repaired(_call, fixes) => {
+                assert!(fixes.iter().any(|f| f.contains("type mismatch")));
             }
             _ => panic!("expected Repaired or Valid"),
         }

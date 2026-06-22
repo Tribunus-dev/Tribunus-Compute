@@ -518,10 +518,10 @@ mod tests {
         let logits = vec![0.0f32, 1.0, 2.0, 3.0, 4.0];
         let mut sum = 0.0;
         for t in 0..logits.len() as u32 {
-            sum += Self::token_probability(t, &logits);
+            sum += AneDraftModel::token_probability(t, &logits);
         }
         assert!(
-            (sum - 1.0).abs() < 1e-5,
+            (sum - 1.0_f32).abs() < 1e-5,
             "probabilities sum to {sum}, expected 1.0"
         );
     }

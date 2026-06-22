@@ -2130,9 +2130,6 @@ mod tests {
             denoising_steps: None,
             confidence_threshold: None,
             canvas_tokens: None,
-            denoising_steps: None,
-            confidence_threshold: None,
-            canvas_tokens: None,
             prompt_token_ids: vec![1, 2, 3],
             max_output_tokens: 8,
             deadline_ms: 30_000,
@@ -2323,6 +2320,7 @@ mod tests {
             sender,
             deadline,
             deadline_at,
+            None,
         )
     }
 
@@ -2369,6 +2367,7 @@ mod tests {
             sender,
             deadline,
             deadline_at,
+            None,
         ));
 
         let req2 = Arc::clone(&req);
@@ -2939,6 +2938,7 @@ mod integration_tests {
             sender,
             deadline,
             deadline_at,
+            None,
         ));
 
         stream.close();

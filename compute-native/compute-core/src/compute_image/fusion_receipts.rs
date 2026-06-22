@@ -140,7 +140,7 @@ mod tests {
             FusedMetalFallbackReason::XcrunNotAvailable,
         );
         assert_eq!(ev.artifact_name, "qkv_proj");
-        assert_eq!(ev.fallback_reason, Some(FusedMetalFallbackReason::XcrunNotAvailable));
+        assert!(matches!(ev.fallback_reason, Some(FusedMetalFallbackReason::XcrunNotAvailable)));
     }
 
     #[test]

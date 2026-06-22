@@ -25,6 +25,7 @@ use crate::session::InferenceSessionState;
 ///
 /// Load once, reuse across many requests.  Thread-safe — clone the `Arc`
 /// for each concurrent caller.
+#[derive(Debug)]
 pub struct AudioToAudioGenerator {
     pub model: Arc<LoadedProfiledModel>,
 }

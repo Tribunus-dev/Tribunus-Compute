@@ -1053,6 +1053,10 @@ mod tests {
             tie_word_embeddings: false,
             rms_norm_eps: 1e-6,
             speculative_config: None,
+            generation_regime: Default::default(),
+            diffusion_config: Default::default(),
+            diffusion_execution_plan: Default::default(),
+            kv_cache_mode: Default::default(),
         }
     }
 
@@ -1115,6 +1119,10 @@ mod tests {
             tie_word_embeddings: false,
             rms_norm_eps: 1e-6,
             speculative_config: None,
+            generation_regime: Default::default(),
+            diffusion_config: Default::default(),
+            diffusion_execution_plan: Default::default(),
+            kv_cache_mode: Default::default(),
         };
         optimize(&mut plan);
         assert!(plan.layers.is_empty());

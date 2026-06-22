@@ -225,8 +225,10 @@ pub fn validate_phase_graph_v1(graph: &EmittedPhaseGraph) -> GraphValidationResu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compute_image::manifest::SourceIdentity;
     use crate::compute_image::phase_graph::{
-        CancellationClass, DeclaredFallback, ExecutionClass, LaneBinding,
+        CancellationClass, DeclaredFallback, EmittedEdgeV2, EmittedPhaseKind, EmittedPhaseV2,
+        ExecutionClass, LaneBinding,
     };
 
     fn make_valid_graph() -> EmittedPhaseGraphV2 {

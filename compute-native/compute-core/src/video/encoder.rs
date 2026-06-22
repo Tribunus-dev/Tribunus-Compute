@@ -357,13 +357,14 @@ mod tests {
 
     #[test]
     fn test_placeholder_tokens_ref() {
-        use crate::video::types::{MultiModalInput, VideoInput};
-        let input = MultiModalInput::Video(VideoInput {
+        use crate::profiled_executor::{MultiModalInput, VideoInput};
+        let video = VideoInput {
             source: "test.mp4".into(),
             placeholder_tokens: vec![42, 43],
             num_frames: Some(8),
-        });
-        let tokens = input.placeholder_tokens();
+        };
+        let input = MultiModalInput::Video(video);
+        let tokens = match &input { MultiModalInput::Video(v) => &v.placeholder_tokens, _ => unreachable!() };
         assert_eq!(tokens, &[42, 43]);
     }
 }

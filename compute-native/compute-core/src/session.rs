@@ -934,6 +934,8 @@ mod tests {
             repetition_penalty: None,
             seed: None,
             stop_token_ids: Vec::new(),
+            grammar: None,
+            grammar_tokenizer: None,
         };
         assert!(config.is_greedy());
     }
@@ -947,6 +949,8 @@ mod tests {
             repetition_penalty: Some(1.1),
             seed: Some(42),
             stop_token_ids: vec![3, 4],
+            grammar: None,
+            grammar_tokenizer: None,
         };
         assert!(!config.is_greedy());
         assert_eq!(config.stop_token_ids, vec![3, 4]);

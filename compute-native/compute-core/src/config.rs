@@ -1864,6 +1864,7 @@ mod tests {
             layer_scalar_ids: Vec::new(),
             quantization_ids: Vec::new(),
             route: Default::default(),
+            fused_operations: Default::default(),
         }
     }
 
@@ -1893,6 +1894,11 @@ mod tests {
             tie_word_embeddings: true,
             rms_norm_eps: 1e-6,
             fused_ane_islands: vec![],
+            speculative_config: None,
+            generation_regime: Default::default(),
+            diffusion_config: Default::default(),
+            diffusion_execution_plan: Default::default(),
+            kv_cache_mode: Default::default(),
         }
     }
 

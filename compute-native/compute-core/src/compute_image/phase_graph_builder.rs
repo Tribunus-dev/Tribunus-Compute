@@ -93,7 +93,7 @@ impl PhaseGraphBuilder {
                 kind: EmittedPhaseKind::WeightResidency,
                 layer_index: None,
                 lane_binding: LaneBinding {
-                    primary_lane: "loader".into(),
+                    primary_lane: "accelerate".into(),
                     fallback_lanes: vec![],
                 },
                 operations: vec![],
@@ -193,10 +193,41 @@ impl PhaseGraphBuilder {
             });
             prev_id = Some(attn_id.clone());
 
+            // Residual RMSNorm phase (between attention and MLP) — runs on Accelerate for small element-wise ops
+            let rmsnorm_id = PhaseId(format!("layer_{}_residual_rmsnorm", layer));
+            edges.push(EmittedEdgeV2 {
+                from_phase: attn_id.clone(),
+                to_phase: rmsnorm_id.clone(),
+                semantic_kind: EdgeSemanticKind::TensorData,
+                label: Some("hidden".into()),
+                metadata: HashMap::new(),
+            });
+            phases.push(EmittedPhaseV2 {
+                id: rmsnorm_id.clone(),
+                kind: EmittedPhaseKind::AccelerateBlock,
+                layer_index: Some(layer),
+                lane_binding: LaneBinding {
+                    primary_lane: "accelerate".into(),
+                    fallback_lanes: vec!["mlx".into()],
+                },
+                operations: vec![],
+                tensor_reads: vec![],
+                tensor_writes: vec![],
+                state_reads: vec![],
+                state_writes: vec![],
+                required_weights: None,
+                input_contracts: vec![],
+                output_contracts: vec![],
+                artifact_binding: None,
+                fallback: None,
+                cancellation_class: CancellationClass::Preemptible,
+                execution_class: ExecutionClass::Required,
+            });
+
             // MLP phase
             let mlp_id = PhaseId(format!("layer_{}_mlp", layer));
             edges.push(EmittedEdgeV2 {
-                from_phase: attn_id.clone(),
+                from_phase: rmsnorm_id.clone(),
                 to_phase: mlp_id.clone(),
                 semantic_kind: EdgeSemanticKind::TensorData,
                 label: Some("hidden".into()),
@@ -379,7 +410,7 @@ fn map_kind_to_v1(kind: EmittedPhaseKind) -> PhaseKind {
         EmittedPhaseKind::Synchronization => PhaseKind::SyncBarrier,
         EmittedPhaseKind::FusedMetalKernel => PhaseKind::MetalFusedKernel,
         EmittedPhaseKind::CoreMlSubgraph => PhaseKind::CoreMlGraph,
-        EmittedPhaseKind::AccelerateBlock => PhaseKind::AccelMatMul,
+        EmittedPhaseKind::AccelerateBlock => PhaseKind::ResidualRmsNorm,
         EmittedPhaseKind::LegacyMlxLayer => PhaseKind::MlxDecode,
     }
 }
@@ -392,22 +423,29 @@ mod tests {
     fn test_build_two_layer_graph() {
         let builder = PhaseGraphBuilder::new(2).with_dimensions(4096, 32, 128, 14336);
         let graph = builder.build_v2();
-        // Expected: arena_alloc + weight_residency + prologue + (layer_0_attn + layer_0_mlp)
-        //   + (layer_1_attn + layer_1_mlp) + epilogue + sampling = 9 phases
-        assert_eq!(graph.phases.len(), 9);
-        // Edges: 8 connections (arena->weight_residency, wr->prologue, prologue->attn0,
-        //   attn0->mlp0, mlp0->attn1, attn1->mlp1, mlp1->epilogue, epilogue->sampling)
-        assert_eq!(graph.edges.len(), 8);
+        // Expected: arena_alloc + weight_residency + prologue
+        //   + (layer_0_attn + layer_0_residual_rmsnorm + layer_0_mlp)
+        //   + (layer_1_attn + layer_1_residual_rmsnorm + layer_1_mlp)
+        //   + epilogue + sampling = 11 phases
+        assert_eq!(graph.phases.len(), 11);
+        // Edges: 10 connections (arena->wr, wr->prologue, prologue->attn0,
+        //   attn0->rmsnorm0, rmsnorm0->mlp0, mlp0->attn1, attn1->rmsnorm1,
+        //   rmsnorm1->mlp1, mlp1->epilogue, epilogue->sampling)
+        assert_eq!(graph.edges.len(), 10);
         // Verify weight_residency phase exists
         assert!(graph.phases.iter().any(|p| p.id.0 == "weight_residency"));
+        // Verify residual_rmsnorm phases exist
+        assert!(graph.phases.iter().any(|p| p.id.0 == "layer_0_residual_rmsnorm"));
+        assert!(graph.phases.iter().any(|p| p.id.0 == "layer_1_residual_rmsnorm"));
+
     }
 
     #[test]
     fn test_build_single_layer() {
         let builder = PhaseGraphBuilder::new(1);
         let graph = builder.build_v2();
-        // 1 + 1 + 1 + (1+1) + 1 + 1 = 6 phases
-        assert_eq!(graph.phases.len(), 6);
+        // arena + wr + prologue + (attn + rmsnorm + mlp) + epilogue + sampling = 8
+        assert_eq!(graph.phases.len(), 8);
     }
 
     #[test]
@@ -424,7 +462,7 @@ mod tests {
     fn test_v1_conversion() {
         let builder = PhaseGraphBuilder::new(2);
         let v1 = builder.build_v1();
-        assert_eq!(v1.phases.len(), 9);
-        assert_eq!(v1.edges.len(), 8);
+        assert_eq!(v1.phases.len(), 11);
+        assert_eq!(v1.edges.len(), 10);
     }
 }

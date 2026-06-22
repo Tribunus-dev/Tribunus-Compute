@@ -130,6 +130,7 @@ fn build_ane_matmul_region() -> (SemanticModule, ScheduledRegion) {
             qualified: false,
             backend: Some(BackendId(4)),
         }],
+        fusion_regions: vec![],
         state_effects: vec![],
         temp_memory_bytes: 0,
         is_fence: false,

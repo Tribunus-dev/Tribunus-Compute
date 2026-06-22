@@ -339,6 +339,7 @@ mod tests {
     fn test_arch() -> TextArchitecture {
         TextArchitecture {
             diffusion_config: None,
+            moe_config: Default::default(),
             hidden_size: 3840,
             intermediate_size: 15360,
             num_attention_heads: 32,
@@ -409,6 +410,7 @@ mod tests {
                 layer_scalar_ids: vec![],
                 quantization_ids: vec![],
                 route: crate::config::operation_route::OperationRoute::default(),
+                fused_operations: Default::default(),
             });
         }
 
@@ -423,6 +425,11 @@ mod tests {
             final_logit_softcapping: None,
             tie_word_embeddings: false,
             rms_norm_eps: arch.rms_norm_eps,
+            speculative_config: None,
+            generation_regime: Default::default(),
+            diffusion_config: Default::default(),
+            diffusion_execution_plan: Default::default(),
+            kv_cache_mode: Default::default(),
         }
     }
 

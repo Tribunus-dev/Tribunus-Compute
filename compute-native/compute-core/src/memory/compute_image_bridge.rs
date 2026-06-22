@@ -227,6 +227,7 @@ mod tests {
             quantization: None,
             tensor_alignment_bytes: 16,
             layout_version: 1,
+            artifact_bindings: Default::default(),
         };
 
         let arr = load_mlx_tensor(&segment, &entry).expect("load mlx tensor");
@@ -265,6 +266,7 @@ mod tests {
             quantization: None,
             tensor_alignment_bytes: 16,
             layout_version: 1,
+            artifact_bindings: Default::default(),
         };
 
         let result = load_mlx_tensor(&segment, &entry);
@@ -301,6 +303,7 @@ mod tests {
             quantization: None,
             tensor_alignment_bytes: 16,
             layout_version: 1,
+            artifact_bindings: Default::default(),
         };
 
         let tensor_table = vec![entry];

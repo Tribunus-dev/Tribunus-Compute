@@ -1506,7 +1506,7 @@ mod tests {
 
         // Determine if this hash lands on node0 or node1.
         let owner_idx = cache.ring.node_index(&hash);
-        let owner_id = &cache.nodes[owner_idx].id;
+        let owner_id = cache.nodes[owner_idx].id.clone();
         eprintln!("Hash {:02x}... owned by {}", hash.0[0], owner_id);
 
         let page_data = vec![0xAA; 128];
