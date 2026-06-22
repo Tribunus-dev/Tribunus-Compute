@@ -85,6 +85,42 @@ impl PhaseGraphBuilder {
         });
         prev_id = Some(arena_id);
 
+        // WeightResidency phase (only when layers exist)
+        if self.num_layers > 0 {
+            let wr_id = PhaseId("weight_residency".to_string());
+            phases.push(EmittedPhaseV2 {
+                id: wr_id.clone(),
+                kind: EmittedPhaseKind::WeightResidency,
+                layer_index: None,
+                lane_binding: LaneBinding {
+                    primary_lane: "loader".into(),
+                    fallback_lanes: vec![],
+                },
+                operations: vec![],
+                tensor_reads: vec![],
+                tensor_writes: vec![],
+                state_reads: vec![],
+                state_writes: vec![],
+                required_weights: None,
+                input_contracts: vec![],
+                output_contracts: vec![],
+                artifact_binding: None,
+                fallback: None,
+                cancellation_class: CancellationClass::Barrier,
+                execution_class: ExecutionClass::Required,
+            });
+            if let Some(p) = &prev_id {
+                edges.push(EmittedEdgeV2 {
+                    from_phase: p.clone(),
+                    to_phase: wr_id.clone(),
+                    semantic_kind: EdgeSemanticKind::ProducerCompletion,
+                    label: Some("arena_ready".into()),
+                    metadata: HashMap::new(),
+                });
+            }
+            prev_id = Some(wr_id);
+        }
+
         // Prologue
         if self.has_prologue {
             let prologue_id = PhaseId("prologue".to_string());
@@ -275,6 +311,22 @@ impl PhaseGraphBuilder {
 
         for pv2 in &v2.phases {
             let kind = map_kind_to_v1(pv2.kind);
+            // Build metadata with model dimensions for probe-dependent runners.
+            let mut meta = HashMap::new();
+            if let Some(li) = pv2.layer_index {
+                meta.insert("layer_index".to_string(), li.to_string());
+        }
+            if self.hidden_size > 0 {
+                meta.insert("hidden_size".to_string(), self.hidden_size.to_string());
+        }
+            if self.num_heads > 0 {
+                meta.insert("n_heads".to_string(), self.num_heads.to_string());
+        }
+            // Assume num_kv_heads == num_heads unless overridden.
+            meta.insert("n_kv_heads".to_string(), self.num_heads.to_string());
+            if self.head_dim > 0 {
+                meta.insert("head_dim".to_string(), self.head_dim.to_string());
+        }
             phases.push(EmittedPhase {
                 phase_id: pv2.id.0.clone(),
                 kind,
@@ -284,7 +336,7 @@ impl PhaseGraphBuilder {
                 tensor_reads: pv2.tensor_reads.iter().map(|t| t.0.clone()).collect(),
                 tensor_writes: pv2.tensor_writes.iter().map(|t| t.0.clone()).collect(),
                 estimated_ops: 100,
-                metadata: HashMap::new(),
+                metadata: meta,
             });
         }
 
@@ -315,14 +367,14 @@ impl PhaseGraphBuilder {
 
 fn map_kind_to_v1(kind: EmittedPhaseKind) -> PhaseKind {
     match kind {
-        EmittedPhaseKind::Prologue => PhaseKind::MlxDecode,
+        EmittedPhaseKind::Prologue => PhaseKind::LegacyMlxPrologue,
         EmittedPhaseKind::LayerAttention => PhaseKind::MlxDecode,
         EmittedPhaseKind::LayerMlp => PhaseKind::MlxDecode,
-        EmittedPhaseKind::Epilogue => PhaseKind::MlxDecode,
-        EmittedPhaseKind::Sampling => PhaseKind::MlxDecode,
+        EmittedPhaseKind::Epilogue => PhaseKind::LegacyMlxEpilogue,
+        EmittedPhaseKind::Sampling => PhaseKind::Sampling,
         EmittedPhaseKind::ArenaAlloc => PhaseKind::ArenaAlloc,
         EmittedPhaseKind::MemoryPlanApply => PhaseKind::ArenaAlloc,
-        EmittedPhaseKind::WeightResidency => PhaseKind::Transfer,
+        EmittedPhaseKind::WeightResidency => PhaseKind::WeightResidency,
         EmittedPhaseKind::ExplicitMaterialization => PhaseKind::Transfer,
         EmittedPhaseKind::Synchronization => PhaseKind::SyncBarrier,
         EmittedPhaseKind::FusedMetalKernel => PhaseKind::MetalFusedKernel,
@@ -340,27 +392,39 @@ mod tests {
     fn test_build_two_layer_graph() {
         let builder = PhaseGraphBuilder::new(2).with_dimensions(4096, 32, 128, 14336);
         let graph = builder.build_v2();
-        // Expected: arena_alloc + prologue + (layer_0_attn + layer_0_mlp) + (layer_1_attn +
-        // layer_1_mlp) + epilogue + sampling = 8 phases
-        assert_eq!(graph.phases.len(), 8);
-        // Edges: 7 connections (arena->prologue, prologue->attn0, attn0->mlp0, mlp0->attn1,
-        // attn1->mlp1, mlp1->epilogue, epilogue->sampling)
-        assert_eq!(graph.edges.len(), 7);
+        // Expected: arena_alloc + weight_residency + prologue + (layer_0_attn + layer_0_mlp)
+        //   + (layer_1_attn + layer_1_mlp) + epilogue + sampling = 9 phases
+        assert_eq!(graph.phases.len(), 9);
+        // Edges: 8 connections (arena->weight_residency, wr->prologue, prologue->attn0,
+        //   attn0->mlp0, mlp0->attn1, attn1->mlp1, mlp1->epilogue, epilogue->sampling)
+        assert_eq!(graph.edges.len(), 8);
+        // Verify weight_residency phase exists
+        assert!(graph.phases.iter().any(|p| p.id.0 == "weight_residency"));
     }
 
     #[test]
     fn test_build_single_layer() {
         let builder = PhaseGraphBuilder::new(1);
         let graph = builder.build_v2();
-        // 1 + 1 + (1+1) + 1 + 1 = 5 phases
-        assert_eq!(graph.phases.len(), 5);
+        // 1 + 1 + 1 + (1+1) + 1 + 1 = 6 phases
+        assert_eq!(graph.phases.len(), 6);
+    }
+
+    #[test]
+    fn test_zero_layer_no_weight_residency() {
+        let builder = PhaseGraphBuilder::new(0);
+        let graph = builder.build_v2();
+        // No weight_residency phase when num_layers == 0
+        assert!(!graph.phases.iter().any(|p| p.id.0 == "weight_residency"));
+        // arena_alloc + (no prologue) + (no epilogue) + sampling = 2
+        assert_eq!(graph.phases.len(), 2);
     }
 
     #[test]
     fn test_v1_conversion() {
         let builder = PhaseGraphBuilder::new(2);
         let v1 = builder.build_v1();
-        assert_eq!(v1.phases.len(), 8);
-        assert_eq!(v1.edges.len(), 7);
+        assert_eq!(v1.phases.len(), 9);
+        assert_eq!(v1.edges.len(), 8);
     }
 }

@@ -10,7 +10,13 @@ use crate::scheduling::receipts::PhaseReceipt;
 use crate::scheduling::phase_engine_state::{PhaseLifecycleState, PhaseLifecycleTracker};
 use crate::inference::execution_image_state::ComputeImageState;
 use crate::inference::inference_session_state::InferenceSessionState;
-use crate::inference::inference_step_state::{InferenceStepState, InferenceStepOutput};
+use crate::inference::inference_step_state::{InferenceStepState, InferenceStepOutput, InferenceMode};
+use crate::runtime::executable_session::RuntimeBackends;
+use crate::backend::accelerate_lane::AccelerateLane;
+use crate::backend::coreml_lane::CoreMlLane;
+use crate::mlx_executor::MlxExecutor;
+use mlx_rs::Array;
+use std::sync::{Arc, Mutex};
 
 /// Result of executing a full phase graph to completion.
 #[derive(Debug)]
@@ -184,6 +190,40 @@ impl PhaseEngine {
 
         let ready_queue = ReadyQueue::new(dag);
 
+        // Build one execution context from real session/image/step state.
+        let placeholder_arr = Arc::new(Array::from_slice::<f32>(&[0.0], &[1]));
+                let mut ctx = ExecutionContext {
+                    request_id: step.request_id.0,
+                    token_position: step.token_position,
+            is_prefill: step.mode == InferenceMode::Prefill,
+                    token_ids: step.input_tokens.token_ids.iter().map(|&t| t as i32).collect(),
+            hidden_state: step.current_activation.as_ref().and_then(|ca| {
+                #[cfg(feature = "mlx-backend")]
+                { ca.mlx_compatibility_view.clone() }
+                #[cfg(not(feature = "mlx-backend"))]
+                { None::<Array> }
+            }),
+            // TODO: live kv_caches once LiveKvCache derives Clone or we build them per-layer
+            kv_caches: Vec::new(),
+            layer_weights: Arc::new(image.layer_weights.to_vec()),
+            backend: Some(Box::new(RuntimeBackends {
+                mlx_executor: Arc::new(Mutex::new(MlxExecutor::spawn_gpu())),
+                // TODO: populate metal_kernels from image when ComputeImageState carries them
+                metal_kernels: Arc::new(Vec::new()),
+                accelerate_state: AccelerateLane::new(),
+                coreml_state: CoreMlLane::new(),
+                // TODO: populate weight tensors from image when available
+                emb_w: placeholder_arr.clone(),
+                emb_s: placeholder_arr.clone(),
+                emb_b: placeholder_arr.clone(),
+                fn_w: placeholder_arr.clone(),
+                rope_cos: placeholder_arr.clone(),
+                rope_sin: placeholder_arr.clone(),
+                full_cos: placeholder_arr.clone(),
+                full_sin: placeholder_arr.clone(),
+            })),
+        };
+
         loop {
             // 1. Check cancellation before any work selection.
             if session.is_cancelled() {
@@ -207,19 +247,18 @@ impl PhaseEngine {
                 let _ = lifecycle.transition(&phase_id, PhaseLifecycleState::Admitted);
                 let _ = lifecycle.transition(&phase_id, PhaseLifecycleState::Dispatched);
 
-                // 4. Run the phase through the registry.
+                // 4. Run the phase through the registry using the shared context.
                 let phase_start = std::time::Instant::now();
-                let mut ctx = ExecutionContext {
-                    request_id: step.request_id.0,
-                    token_position: step.token_position,
-                    is_prefill: step.mode == crate::inference::inference_step_state::InferenceMode::Prefill,
-                    hidden_state: None,
-                    kv_caches: std::sync::Arc::new(Vec::new()),
-                    layer_weights: std::sync::Arc::new(Vec::new()),
-                    backend: None,
-        };
                 let run_result = self.runners.dispatch(phase, &mut ctx);
                 let duration_us = phase_start.elapsed().as_micros() as u64;
+
+                // 5. Propagate updated hidden_state back to step state.
+                #[cfg(feature = "mlx-backend")]
+                if let Some(ref mut ca) = step.current_activation.as_mut() {
+                    if let Some(ref hidden) = ctx.hidden_state {
+                    ca.mlx_compatibility_view = Some(hidden.clone());
+                }
+                }
 
                 // 5. Record receipt.
                 let (status, fused_evidence) = match run_result {
@@ -244,7 +283,7 @@ impl PhaseEngine {
                     completed.insert(phase_id);
                 } else {
                     let _ = lifecycle.transition(&phase_id, PhaseLifecycleState::FailedBeforePublication);
-                    completed.insert(phase_id); // Mark as visited to avoid infinite loop
+                    completed.insert(phase_id);
                 }
             }
         }

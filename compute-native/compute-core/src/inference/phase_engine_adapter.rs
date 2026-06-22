@@ -23,14 +23,8 @@ impl PhaseEngineAdapter {
         session: &mut InferenceSessionState,
         step: &mut InferenceStepState,
     ) -> Result<InferenceStepOutput, String> {
-        // In the full implementation, this calls engine.execute_until_terminal().
-        // For now, return a stub output.
-        let output = InferenceStepOutput {
-            token: None,
-            logits: None,
-            receipts: step.receipt_ledger.take(),
-        };
-        Ok(output)
+        step.mode = InferenceMode::Prefill;
+        engine.execute_until_terminal(image, session, step).await
     }
 
     /// Execute decode through the PhaseEngine.
@@ -41,11 +35,7 @@ impl PhaseEngineAdapter {
         session: &mut InferenceSessionState,
         step: &mut InferenceStepState,
     ) -> Result<InferenceStepOutput, String> {
-        let output = InferenceStepOutput {
-            token: None,
-            logits: None,
-            receipts: step.receipt_ledger.take(),
-        };
-        Ok(output)
+        step.mode = InferenceMode::Decode;
+        engine.execute_until_terminal(image, session, step).await
     }
 }

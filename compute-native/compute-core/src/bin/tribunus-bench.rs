@@ -51,6 +51,7 @@ fn print_usage() {
     eprintln!("  tribunus-bench decode   --model <path> [--prompt-tokens 10] [--output-tokens 128] [--warmup 3]");
     eprintln!("  tribunus-bench serve    --model <path> [--concurrency 1] [--duration 30s] [--prompt-tokens 64] [--output-tokens 50]");
     eprintln!("  tribunus-bench compare  --baseline-path <dir> --candidate-path <dir>");
+    eprintln!("  tribunus-bench capability-report  --model <path>");
     eprintln!();
     eprintln!("Environment:");
     eprintln!("  TRIBUNUS_BENCH_MODEL      Model path (default: --model)");
@@ -84,6 +85,16 @@ fn main() {
         "decode" => cmd_decode(&rest, model_path),
         "serve" => cmd_serve(&rest, model_path),
         "compare" => cmd_compare(&rest),
+        "capability-report" => {
+            let result = run_capability_report(&rest);
+            match result {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("Capability report error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
         "--help" | "-h" | "help" => {
             print_usage();
         }
@@ -137,6 +148,16 @@ fn hostname_or_default() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("HOST"))
         .unwrap_or_else(|_| "unknown".into())
+}
+
+/// Derive a human-readable hardware label for capability reporting.
+fn hardware_label() -> String {
+    let arch = std::env::consts::ARCH;
+    let os = std::env::consts::OS;
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get().to_string())
+        .unwrap_or_else(|_| "?".to_string());
+    format!("{os}-{arch}-{cpus}vcpu")
 }
 
 fn env_features() -> Vec<String> {
@@ -768,4 +789,84 @@ fn collect_json_files(dir: &Path) -> Vec<PathBuf> {
     }
     files.sort();
     files
+}
+
+// ---------------------------------------------------------------------------
+// Phase: capability-report — emit a CapabilityReport JSON for the loaded model
+// ---------------------------------------------------------------------------
+
+fn run_capability_report(args: &[String]) -> Result<(), String> {
+    use std::path::Path;
+    use tribunus_compute_core::profiled_model::LoadedProfiledModel;
+    use tribunus_compute_core::research::live_execution_matrix::*;
+
+    let model_path = args
+        .iter()
+        .position(|a| a == "--model")
+        .and_then(|i| args.get(i + 1))
+        .ok_or_else(|| "--model <path> required".to_string())?;
+
+    let hardware = hardware_label();
+    let mut report = CapabilityReportBuilder::new(model_path, &hardware)
+        .with_timestamp(
+            &std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs().to_string())
+                .unwrap_or_else(|_| "unknown".to_string()),
+        )
+        .with_feature_flags(CapabilityReport::detect_feature_flags())
+        .with_phase_engine_mode("authority")
+        .build();
+
+    // Populate from actual loaded model state
+    match LoadedProfiledModel::new(Path::new(model_path)) {
+        Ok(model) => {
+            if let Some(dag) = &model.phase_dag {
+                report.total_phases = dag.phases.len() as u32;
+            }
+            // Check Metal artifacts
+            report.metal_state = if model.metal_kernels.is_empty() {
+                SubsystemState::Available
+            } else {
+                SubsystemState::Loaded
+            };
+            report.fused_artifacts_loaded = model.metal_kernels.len() as u32;
+            // Accelerate symbols are always available on this platform
+            report.accelerate_native_symbols_available =
+                CapabilityReport::detect_accelerate_symbols();
+            report.accelerate_state = SubsystemState::Available;
+            // Core ML: check if model has ANE models loaded
+            let coreml_models: Vec<_> =
+                model.ane_coreml_models.iter().filter(|m| m.is_some()).collect();
+            report.coreml_compiled_subgraphs = coreml_models.len() as u32;
+            report.coreml_model_load_status = if coreml_models.is_empty() {
+                SubsystemState::Available
+            } else {
+                SubsystemState::Loaded
+            };
+            // KV cache: default for now
+            report.kv_mode = KvCacheModeState::Fp16;
+        }
+        Err(e) => {
+            eprintln!(
+                "[capability-report] model load failed: {} — proceeding with static probe only",
+                e
+            );
+        }
+    }
+
+    match report.fail_closed_check() {
+        Ok(()) => {
+            println!("{}", report.to_json());
+            Ok(())
+        }
+        Err(failures) => {
+            eprintln!("Capability report FAILED:");
+            for f in &failures {
+                eprintln!("  - {}", f);
+            }
+            println!("{}", report.to_json());
+            Err(failures.join("; "))
+        }
+    }
 }

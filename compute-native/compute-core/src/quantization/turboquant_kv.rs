@@ -1027,8 +1027,27 @@ impl TurboQuantKvCache {
 
         Ok((keys, values))
     }
-}
 
+    /// Number of committed (non-empty) quantized slots.
+    pub fn committed_len(&self) -> u32 {
+        self.state.iter().filter(|s| !s.keys.is_empty()).count() as u32
+    }
+
+    /// Total number of allocated slots (including empty ones).
+    pub fn seq_len(&self) -> u32 {
+        self.state.len() as u32
+    }
+
+    /// Total allocated bytes across all quantized state.
+    pub fn allocated_bytes(&self) -> u64 {
+        self.state
+            .iter()
+            .map(|s| {
+                (s.keys.len() + s.values.len() + s.qjl_keys.len() + s.qjl_values.len()) as u64
+            })
+            .sum()
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1543,3 +1562,4 @@ mod tests {
         assert!(state.asym_mode.is_none());
     }
 }
+

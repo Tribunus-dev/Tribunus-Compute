@@ -30,6 +30,7 @@ use crate::runtime_contract::{
 use crate::runtime_orchestration::InMemoryCoordinationFabric;
 use crate::runtime_trace::{RuntimeTimeline, TimelineEvent, TimelineEventType};
 use crate::scheduling::execution_context::ExecutionContext;
+use crate::compute_image::phase_dag::PhaseCompletionStatus;
 use crate::scheduling::phase_engine::PhaseEngine;
 use crate::scheduling::receipts::PhaseReceipt;
 use crate::session::InferenceSessionState;
@@ -507,36 +508,6 @@ impl ProfiledInferenceSession {
             }
         }
 
-        // Phase DAG execution path — if the compiler emitted a DAG, run
-        // through the PhaseEngine instead of the manual layer loop.
-        if let Some(dag) = &model.phase_dag {
-            let engine = PhaseEngine::new();
-            let mut ctx = ExecutionContext::new_empty();
-            ctx.is_prefill = true;
-            ctx.token_position = self.absolute_position as usize;
-            ctx.backend = Some(Box::new(RuntimeBackends {
-                mlx_executor: Arc::new(std::sync::Mutex::new(
-                    crate::mlx_executor::MlxExecutor::spawn_gpu(),
-                )),
-                metal_kernels: model.metal_kernels.clone(),
-                accelerate_state: crate::backend::accelerate_lane::AccelerateLane::new(),
-                coreml_state: crate::backend::coreml_lane::CoreMlLane::new(),
-            }));
-            ctx.hidden_state = None;
-            ctx.kv_caches = Arc::new(Vec::new());
-            ctx.layer_weights = Arc::new(model.layers.clone());
-
-            let result = engine.execute_graph(dag, &mut ctx);
-            let receipt_count = result.receipts.len();
-            let all_done = result.all_completed;
-            self.phase_receipts.extend(result.receipts);
-
-            // Shadow mode: PhaseEngine receipts recorded, real inference
-            // falls through to the old MLX layer loop below.
-            eprintln!("[phase-dag] prefill receipts: {} phases, {} completed",
-                receipt_count,
-                if all_done { "all" } else { "partial" });
-        }
 
         let plan = &model.reader.manifest.execution_plan;
         let full_prompt = self.pending_prompt_tokens.as_ref().unwrap();
@@ -579,8 +550,56 @@ impl ProfiledInferenceSession {
             )
         })?;
 
-        let _slots = model.memory_island.preallocate_layer_slots(1, 3840);
-        for (l, layer_plan) in plan.layers.iter().enumerate() {
+        // Phase DAG execution path — authoritative PhaseEngine dispatch.
+        // If the compiler emitted a phase DAG, execute it through PhaseEngine.
+        // If ALL phases complete, skip the old imperative layer loop.
+        let mut phase_engine_completed = false;
+        if let Some(dag) = &model.phase_dag {
+            let engine = PhaseEngine::new();
+            let mut ctx = ExecutionContext {
+                request_id: 0,
+                token_position: self.absolute_position as usize,
+                token_ids: token_ids_i32.clone(),
+                is_prefill: true,
+                hidden_state: Some(hidden.clone()),
+                kv_caches: self.kv_caches.iter().map(|c| crate::kv_cache::LiveKvCache::Fp16((*c).clone())).collect(),
+                layer_weights: Arc::new(model.layers.clone()),
+                backend: Some(Box::new(RuntimeBackends {
+                    mlx_executor: Arc::new(std::sync::Mutex::new(
+                        crate::mlx_executor::MlxExecutor::spawn_gpu(),
+                    )),
+                    metal_kernels: model.metal_kernels.clone(),
+                    accelerate_state: crate::backend::accelerate_lane::AccelerateLane::new(),
+                    coreml_state: crate::backend::coreml_lane::CoreMlLane::new(),
+                    emb_w: model.emb_w.clone(),
+                    emb_s: model.emb_s.clone(),
+                    emb_b: model.emb_b.clone(),
+                    fn_w: model.fn_w.clone(),
+                    rope_cos: model.rope_cos.clone(),
+                    rope_sin: model.rope_sin.clone(),
+                    full_cos: model.full_cos.clone(),
+                    full_sin: model.full_sin.clone(),
+                })),
+            };
+            let result = engine.execute_graph(dag, &mut ctx);
+            let receipt_count = result.receipts.len();
+            let completed_count = result.receipts.iter().filter(|r| matches!(r.status, PhaseCompletionStatus::Complete)).count();
+            self.phase_receipts.extend(result.receipts);
+
+            if result.all_completed {
+                eprintln!("[phase-dag] prefill: all {} phases completed via PhaseEngine, bypassing MLX loop", receipt_count);
+                if let Some(h) = ctx.hidden_state.take() {
+                    hidden = h;
+                }
+                phase_engine_completed = true;
+            } else {
+                eprintln!("[phase-dag] prefill: {} phases completed (shadow mode, falling through)", completed_count);
+            }
+        }
+
+        if !phase_engine_completed {
+            let _slots = model.memory_island.preallocate_layer_slots(1, 3840);
+            for (l, layer_plan) in plan.layers.iter().enumerate() {
             log_debug!(
                 "[infer] event=layer_run layer={} kind={}",
                 l,
@@ -689,6 +708,8 @@ impl ProfiledInferenceSession {
                     l, &plan.layers[l].attention_kind, h_shape, h_elems, checksum);
             }
             self.kv_caches[l].commit_step();
+        }
+
         }
 
         // Clear the memory plan after the layer loop completes.
@@ -918,38 +939,6 @@ impl ProfiledInferenceSession {
             ));
         }
 
-        // Phase DAG execution path — if the compiler emitted a DAG, run
-        // through the PhaseEngine instead of the manual layer loop.
-        if let Some(dag) = &model.phase_dag {
-            let engine = PhaseEngine::new();
-            let mut ctx = ExecutionContext::new_empty();
-            ctx.is_prefill = false;
-            ctx.token_position = self.absolute_position as usize;
-
-            // Populate backend context for the PhaseEngine runners
-            ctx.backend = Some(Box::new(RuntimeBackends {
-                mlx_executor: Arc::new(std::sync::Mutex::new(
-                    crate::mlx_executor::MlxExecutor::spawn_gpu(),
-                )),
-                metal_kernels: model.metal_kernels.clone(),
-                accelerate_state: crate::backend::accelerate_lane::AccelerateLane::new(),
-                coreml_state: crate::backend::coreml_lane::CoreMlLane::new(),
-            }));
-            ctx.hidden_state = None;
-            ctx.kv_caches = Arc::new(Vec::new());
-            ctx.layer_weights = Arc::new(model.layers.clone());
-
-            let result = engine.execute_graph(dag, &mut ctx);
-            let receipt_count = result.receipts.len();
-            let all_done = result.all_completed;
-            self.phase_receipts.extend(result.receipts);
-
-            // Shadow mode: PhaseEngine receipts recorded, real inference
-            // falls through to the old MLX layer loop below.
-            eprintln!("[phase-dag] decode receipts: {} phases, {} completed",
-                receipt_count,
-                if all_done { "all" } else { "partial" });
-        }
 
         let plan = &model.reader.manifest.execution_plan;
         let kv_offset = self.absolute_position;
@@ -979,6 +968,57 @@ impl ProfiledInferenceSession {
             )
         })?;
 
+        // Phase DAG execution path — authoritative PhaseEngine dispatch.
+        // If the compiler emitted a phase DAG, execute it through PhaseEngine.
+        // If ALL phases complete, skip the old imperative layer loop.
+        let mut phase_engine_completed = false;
+        if let Some(dag) = &model.phase_dag {
+            use crate::runtime::executable_session::RuntimeBackends;
+            use crate::scheduling::execution_context::ExecutionContext;
+            use crate::compute_image::phase_dag::PhaseCompletionStatus;
+
+            let engine = PhaseEngine::new();
+            let mut ctx = ExecutionContext {
+                request_id: 0,
+                token_position: self.absolute_position as usize,
+                token_ids: token_ids_i32.to_vec(),
+                is_prefill: false,
+                hidden_state: Some(hidden.clone()),
+                kv_caches: self.kv_caches.iter().map(|c| crate::kv_cache::LiveKvCache::Fp16((*c).clone())).collect(),
+                layer_weights: Arc::new(model.layers.clone()),
+                backend: Some(Box::new(RuntimeBackends {
+                    mlx_executor: Arc::new(std::sync::Mutex::new(
+                        crate::mlx_executor::MlxExecutor::spawn_gpu(),
+                    )),
+                    metal_kernels: model.metal_kernels.clone(),
+                    accelerate_state: crate::backend::accelerate_lane::AccelerateLane::new(),
+                    coreml_state: crate::backend::coreml_lane::CoreMlLane::new(),
+                    emb_w: model.emb_w.clone(),
+                    emb_s: model.emb_s.clone(),
+                    emb_b: model.emb_b.clone(),
+                    fn_w: model.fn_w.clone(),
+                    rope_cos: model.rope_cos.clone(),
+                    rope_sin: model.rope_sin.clone(),
+                    full_cos: model.full_cos.clone(),
+                    full_sin: model.full_sin.clone(),
+                })),
+            };
+            let result = engine.execute_graph(dag, &mut ctx);
+            let receipt_count = result.receipts.len();
+            let completed_count = result.receipts.iter().filter(|r| matches!(r.status, PhaseCompletionStatus::Complete)).count();
+            self.phase_receipts.extend(result.receipts);
+
+            if result.all_completed {
+                eprintln!("[phase-dag] decode: all {} phases completed via PhaseEngine, bypassing MLX loop", receipt_count);
+                if let Some(h) = ctx.hidden_state.take() {
+                    hidden = h;
+                }
+                phase_engine_completed = true;
+            } else {
+                eprintln!("[phase-dag] decode: {} phases completed (shadow mode, falling through)", completed_count);
+            }
+        }
+
         eprintln!(
             "[phase] decode_step start token_step={}",
             self.absolute_position
@@ -1001,8 +1041,9 @@ impl ProfiledInferenceSession {
         // Collect per-layer hidden states for anomaly detection
         let mut layer_hiddens: Vec<mlx_rs::Array> = Vec::new();
 
-        for (l, layer_plan) in plan.layers.iter().enumerate() {
-            if self.cancellation_flag.load(Ordering::Relaxed) {
+        if !phase_engine_completed {
+            for (l, layer_plan) in plan.layers.iter().enumerate() {
+                if self.cancellation_flag.load(Ordering::Relaxed) {
                 return Err(EngineError::new(
                     EngineErrorCode::Cancelled,
                     "cancelled during prefill",
@@ -1168,7 +1209,12 @@ impl ProfiledInferenceSession {
                 )
             })?;
         }
-        eprintln!("[phase] decode_step end");
+        }
+
+        if !phase_engine_completed {
+            eprintln!("[phase] decode_step end");
+        }
+        if !phase_engine_completed {
         let expected = kv_offset + 1;
         for (l, _) in plan.layers.iter().enumerate() {
             if self.kv_caches[l].committed_len != expected {
@@ -1179,13 +1225,14 @@ impl ProfiledInferenceSession {
                         l, self.kv_caches[l].committed_len, expected
                     ),
                 ));
-            }
         }
+            }
 
         // Check for anomalies in the decoded step (NaN, Inf, forbidden tokens)
         let gen_tokens = self.generated_tokens.clone();
         if let Err(e) = self.check_anomalies(&layer_hiddens, &gen_tokens) {
             eprintln!("[autopsy] Anomaly check failed: {}", e);
+            }
         }
 
         let sampler = &self.sampler;
@@ -1856,7 +1903,7 @@ impl ProfiledInferenceSession {
         }
 
         let kv_offset = 0u32;
-        let _slots = model.memory_island.preallocate_layer_slots(1, 3840);
+
 
         for (l, layer_plan) in plan.layers.iter().enumerate() {
             let lw = match &mut self.working_set {

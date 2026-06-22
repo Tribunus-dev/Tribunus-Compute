@@ -325,7 +325,7 @@ impl CompressedKvCache {
 ///
 /// Sliding layers use a ring buffer that overwrites the oldest entries once
 /// the window exceeds capacity. Global layers grow via concatenation.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct KvCache {
     /// Number of KV heads for this layer.
     pub n_kv_heads: u32,
@@ -1642,5 +1642,62 @@ mod tests {
         bad[..4].copy_from_slice(&100u32.to_le_bytes());
         let result2 = CompressedKvSlot::from_page_data(&bad);
         assert!(result2.is_err());
+    }
+}
+
+/// Runtime-tagged KV cache representation.
+///
+/// Preserves a tagged representation until every attention route can legally consume
+/// every admitted cache format. Do NOT replace Vec<KvCache> directly.
+#[derive(Debug)]
+pub enum LiveKvCache {
+    /// Uncompressed FP16 cache backed by MLX arrays.
+    Fp16(KvCache),
+    /// Compressed cache via TurboQuant byte buffers.
+    Compressed(CompressedKvCache),
+    /// TurboQuant with asymmetric quantization.
+    TurboQuant(TurboQuantKvCache),
+}
+
+impl LiveKvCache {
+    /// Number of committed tokens in this cache.
+    pub fn committed_len(&self) -> u32 {
+        match self {
+            Self::Fp16(c) => c.committed_len,
+            Self::Compressed(c) => c.committed_len,
+            Self::TurboQuant(c) => c.committed_len(),
+        }
+    }
+
+    pub fn seq_len(&self) -> u32 {
+        match self {
+            Self::Fp16(c) => c.seq_len,
+            Self::Compressed(c) => c.seq_len,
+            Self::TurboQuant(c) => c.seq_len(),
+        }
+    }
+
+    pub fn allocated_bytes(&self) -> u64 {
+        match self {
+            Self::Fp16(c) => c.allocated_bytes(),
+            Self::Compressed(c) => c.allocated_bytes(),
+            Self::TurboQuant(c) => c.allocated_bytes(),
+        }
+    }
+
+    pub fn commit_step(&mut self) {
+        match self {
+            Self::Fp16(c) => c.commit_step(),
+            Self::Compressed(c) => c.commit_step(),
+            Self::TurboQuant(_) => {}
+        }
+    }
+
+    pub fn rollback(&mut self) {
+        match self {
+            Self::Fp16(c) => c.rollback(),
+            Self::Compressed(c) => c.rollback(),
+            Self::TurboQuant(_) => {}
+        }
     }
 }

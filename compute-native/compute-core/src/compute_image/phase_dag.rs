@@ -59,6 +59,14 @@ pub enum PhaseKind {
     SyncBarrier,
     Transfer,
     ResidualRmsNorm,
+    /// Migrate weight residency for required layers.
+    WeightResidency,
+    /// Legacy MLX prologue runner — embedding lookup.
+    LegacyMlxPrologue,
+    /// Legacy MLX epilogue runner — final norm + lm_head.
+    LegacyMlxEpilogue,
+    /// Token sampling runner — argmax from logits.
+    Sampling,
 }
 
 /// Completion status of a phase — used for observability and fallback

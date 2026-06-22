@@ -188,6 +188,7 @@ pub mod receipts;
 pub mod replay_projection;
 pub mod requalification;
 #[cfg(feature = "mlx-backend")]
+pub mod research;
 pub mod research_contracts;
 #[cfg(feature = "mlx-backend")]
 pub mod research_metrics;

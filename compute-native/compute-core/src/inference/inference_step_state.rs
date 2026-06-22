@@ -118,15 +118,13 @@ pub struct InferenceStepState {
     pub token_position: usize,
     pub input_tokens: TokenInput,
     pub current_activation: Option<CurrentActivation>,
-    pub sampling_state: SamplingStateStub,
+    pub logits: Option<Array>,
+    pub output_activation: Option<CurrentActivation>,
     pub phase_status: PhaseStatusTable,
     pub receipt_ledger: StepReceiptLedger,
     pub deadline: Option<Instant>,
     pub terminal_output: Option<InferenceStepOutput>,
 }
-
-/// Stub — full sampling state is wired later.
-pub struct SamplingStateStub;
 
 impl InferenceStepState {
     pub fn new_prefill(request_id: u64, execution_id: u64, tokens: Vec<u32>) -> Self {
@@ -137,7 +135,8 @@ impl InferenceStepState {
             token_position: 0,
             input_tokens: TokenInput { token_ids: tokens },
             current_activation: None,
-            sampling_state: SamplingStateStub,
+            logits: None,
+            output_activation: None,
             phase_status: PhaseStatusTable::new(),
             receipt_ledger: StepReceiptLedger::new(),
             deadline: None,
@@ -155,7 +154,8 @@ impl InferenceStepState {
                 token_ids: vec![token],
             },
             current_activation: None,
-            sampling_state: SamplingStateStub,
+            logits: None,
+            output_activation: None,
             phase_status: PhaseStatusTable::new(),
             receipt_ledger: StepReceiptLedger::new(),
             deadline: None,

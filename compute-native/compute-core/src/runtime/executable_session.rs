@@ -38,6 +38,22 @@ pub struct RuntimeBackends {
     pub accelerate_state: crate::backend::accelerate_lane::AccelerateLane,
     /// Core ML lane state (ANE subgraph execution).
     pub coreml_state: crate::backend::coreml_lane::CoreMlLane,
+    /// Embedding weights for prologue.
+    pub emb_w: std::sync::Arc<mlx_rs::Array>,
+    /// Embedding scales for quantized lookup.
+    pub emb_s: std::sync::Arc<mlx_rs::Array>,
+    /// Embedding biases for quantized lookup.
+    pub emb_b: std::sync::Arc<mlx_rs::Array>,
+    /// Final RMS norm weight.
+    pub fn_w: std::sync::Arc<mlx_rs::Array>,
+    /// Partial RoPE cosine table (local/sliding layers).
+    pub rope_cos: std::sync::Arc<mlx_rs::Array>,
+    /// Partial RoPE sine table (local/sliding layers).
+    pub rope_sin: std::sync::Arc<mlx_rs::Array>,
+    /// Full RoPE cosine table (global layers).
+    pub full_cos: std::sync::Arc<mlx_rs::Array>,
+    /// Full RoPE sine table (global layers).
+    pub full_sin: std::sync::Arc<mlx_rs::Array>,
 }
 
 // Safety: Raw pointers in CoreMlLane/AccelerateLane are accessed only on
