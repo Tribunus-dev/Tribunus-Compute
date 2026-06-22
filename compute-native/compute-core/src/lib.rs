@@ -130,6 +130,8 @@ pub mod mapped_image;
 pub mod memory;
 #[cfg(all(target_os = "macos", feature = "mlx-backend"))]
 pub mod metal_capture;
+#[cfg(feature = "metal-dispatch")]
+pub mod metal_launcher;
 pub mod metrics;
 #[cfg(feature = "mlx-backend")]
 pub mod mil_builder;

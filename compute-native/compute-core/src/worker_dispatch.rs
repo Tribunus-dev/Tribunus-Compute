@@ -20,18 +20,35 @@ use crate::compute_image::manifest::{MetalDispatchRecipe, MetalKernelArtifact};
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// A loaded and pipeline-state-ready Metal kernel ready for dispatch.
+#[derive(Clone)]
 pub struct LoadedMetalKernel {
     pub artifact: MetalKernelArtifact,
     pipeline_state: MetalPipelineState,
 }
 
-struct MetalPipelineState {
+#[derive(Clone)]
+pub struct MetalPipelineState {
     library_data: Vec<u8>,
     function_name: String,
     // Future: MTLComputePipelineState, MTLDevice reference, etc.
 }
 
 impl LoadedMetalKernel {
+    /// Accessor for the pipeline state metadata.
+    pub fn pipeline_state(&self) -> &MetalPipelineState {
+        &self.pipeline_state
+    }
+
+    /// Access the loaded .metallib bytes.
+    pub fn library_data(&self) -> &[u8] {
+        &self.pipeline_state.library_data
+    }
+
+    /// Return the entry point function name.
+    pub fn function_name(&self) -> &str {
+        &self.pipeline_state.function_name
+    }
+
     /// Load a Metal kernel artifact from a ComputeImage directory.
     /// Reads the .metallib, creates the Metal pipeline state if a device
     /// is available, and validates the artifact checksum.
@@ -109,5 +126,16 @@ impl MetalKernelRegistry {
     /// Number of loaded kernels.
     pub fn len(&self) -> usize {
         self.kernels.len()
+    }
+}
+
+
+impl MetalKernelRegistry {
+    /// Consume the registry and return the loaded kernels as a Vec.
+    pub fn into_vec(self) -> Vec<LoadedMetalKernel> {
+        self.kernels
+            .into_values()
+            .map(|arc| Arc::unwrap_or_clone(arc))
+            .collect()
     }
 }

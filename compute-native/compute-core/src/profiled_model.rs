@@ -22,6 +22,7 @@ use crate::heterogeneous::SharedMemoryIsland;
 use crate::mapped_image::MappedImage;
 use crate::vision::encoder::VisionEncoder;
 use crate::worker_dispatch::LoadedMetalKernel;
+use crate::worker_dispatch::MetalKernelRegistry;
 use crate::worker_memory;
 use mlx_rs::Array;
 use std::collections::HashMap;
@@ -758,6 +759,29 @@ impl LoadedProfiledModel {
             }
         } else {
             None
+        }
+
+        // ── Load compiled Metal kernel artifacts ──────────────────────────
+        // Load .metallib files from the compute image, create pipeline states.
+        let metal_kernels: Arc<Vec<LoadedMetalKernel>> = {
+            let artifacts = &reader.manifest.metal_kernel_artifacts;
+            if artifacts.is_empty() {
+                eprintln!("[profiled-model] No Metal kernel artifacts in manifest");
+                Arc::new(Vec::new())
+            } else {
+                match MetalKernelRegistry::load_all(image_dir, artifacts) {
+                    Ok(registry) => {
+                        let count = registry.len();
+                        let vec = registry.into_vec();
+                        eprintln!("[profiled-model] Loaded {} Metal kernel artifacts", count);
+                        Arc::new(vec)
+                    }
+                    Err(e) => {
+                        eprintln!("[profiled-model] WARNING: failed to load Metal kernels: {}", e);
+                        Arc::new(Vec::new())
+                    }
+                }
+            }
         };
 
         Ok(Self {
@@ -786,8 +810,7 @@ impl LoadedProfiledModel {
             vision_encoder,
             active_adapter: None,
             // Metal kernels: start empty; populated by the fused-kernel
-            // injection path before inference.
-            metal_kernels: Arc::new(Vec::new()),
+            metal_kernels,
         })
     }
 }
