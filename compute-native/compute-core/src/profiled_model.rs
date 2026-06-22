@@ -655,44 +655,45 @@ impl LoadedProfiledModel {
             max_pool / (1024 * 1024), computed_pool / (1024 * 1024), total_ram / (1024 * 1024));
         let memory_island = SharedMemoryIsland::with_limit(max_pool);
 
-        // ── Compile ANE programs for Orion-routed layers ────────────────────
-        let ane_cache = {
-            // SKIPPED: Orion ANE program compilation.
-            // Orion ANE programs from the ComputeImage contain invalid MIL
-            // which causes fatal C++ exceptions in the ANE runtime.
-            None
-        };
-
         // ── Load ANE CoreML models for ANE-routed attention layers ─────
         let n_layers = reader.manifest.execution_plan.layers.len();
         let mut ane_coreml_models: Vec<Option<Arc<CoreMlModel>>> = vec![None; n_layers];
-        // SKIPPED: ANE CoreML model loading.
-        // MIL programs in the ComputeImage have empty weight constants which
-        // cause fatal C++ exceptions in the ANE runtime at inference time.
-        // All attention layers use MLX until the MIL builder receives real
-        // dequantized weight values during ComputeImage compilation.
 
-        // ── Load ANE CoreML models for sliding window attention layers ──
-        // SKIPPED: sliding window attention ANE compilation.
-        // The current MIL builder creates `const_f32` ops with empty values
-        // and non-empty shapes, which `coremlcompiler` rejects with:
-        //   "Tensor storage and type have different number of elements"
-        // All 24 layers fail → ~48s wasted → model load timeout.
-        //
-        // Re-enable when the MIL builder receives real dequantized weights:
-        //   for (l, layer_plan) in reader.manifest.execution_plan.layers.iter().enumerate() {
-        //       if let Some(real_weights) = get_layer_weights(l) {
-        //           compile_mil_text_with_weights(real_weights, ...)
-        //       }
-        //   }
-        //
-        // For now, all attention layers use the MLX fallback path.
+        // Load each ANE island's compiled .mlmodelc from disk.
+        for island in &reader.manifest.execution_plan.fused_ane_islands {
+            let modelc_path = image_dir.join(&island.modelc_relpath);
+            let modelc_str = modelc_path.to_string_lossy().to_string();
+            match CoreMlModel::load(&modelc_str) {
+                Ok(model) => {
+                    let model = Arc::new(model);
+                    for &layer_idx in &island.layer_indices {
+                        let idx = layer_idx as usize;
+                        if idx < n_layers {
+                            ane_coreml_models[idx] = Some(model.clone());
+                        }
+                    }
+                    eprintln!(
+                        "[profiled-model] Loaded ANE CoreML model island '{}' ({} layers)",
+                        island.island_id,
+                        island.layer_indices.len(),
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[profiled-model] WARNING: failed to load ANE CoreML model island '{}': {}",
+                        island.island_id, e,
+                    );
+                }
+            }
+        }
+
+        let loaded_count = ane_coreml_models.iter().filter(|m| m.is_some()).count();
         eprintln!(
-            "[profiled-model] ANE sliding window compile skipped — all {} layers will use MLX",
-            reader.manifest.execution_plan.layers.len(),
+            "[profiled-model] ANE CoreML models loaded for {}/{} layers",
+            loaded_count, n_layers,
         );
 
-        // ── Compile scheduled module (memory plan, regions, boundaries) ──
+        // ── Compile scheduled module (memory plan, regions, boundaries)
         let scheduled_module = Some(
             crate::compiler::compile_schedule::compile_model_to_scheduled_module(
                 &reader.manifest.execution_plan,
@@ -778,7 +779,7 @@ impl LoadedProfiledModel {
             copied_weight_bytes,
             materialized_bytes,
             handle_baseline,
-            ane_cache,
+            ane_cache: None,
             ane_coreml_models,
             memory_island,
             scheduled_module,

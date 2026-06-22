@@ -179,6 +179,7 @@ pub fn compile_subgraph(
     name: &str,
     coreml_ops: &[String],
     input_shapes: &HashMap<String, Vec<i64>>,
+    weights: &HashMap<String, Vec<f32>>,
     output_dir: &Path,
 ) -> Result<String, String> {
     // Extract dimensions from input_shapes.
@@ -219,19 +220,45 @@ pub fn compile_subgraph(
                 .get("n")
                 .and_then(|s| s.first().copied())
                 .unwrap_or(64) as u32;
-            super::subgraph_mil::build_matmul_mil("x", "w", "out", 1, k, n)?
+            let weight_values = weights.get("weight_values").map_or(&[] as &[f32], |v| v.as_slice());
+            super::subgraph_mil::build_matmul_mil("x", "w", "out", 1, k, n, weight_values)?
         }
-        "mlp_block" => super::subgraph_mil::build_mlp_block_mil("x", hidden_dim, intermediate_dim)?,
-        "rmsnorm_qkv" => super::subgraph_mil::build_rmsnorm_qkv_mil(
-            "x", hidden_dim, n_heads, n_kv_heads, head_dim,
-        )?,
-        "output_proj" => super::subgraph_mil::build_output_proj_mil("x", hidden_dim, vocab_dim)?,
+        "mlp_block" => {
+            let gate_w = weights.get("gate_w").map_or(&[] as &[f32], |v| v.as_slice());
+            let up_w = weights.get("up_w").map_or(&[] as &[f32], |v| v.as_slice());
+            let down_w = weights.get("down_w").map_or(&[] as &[f32], |v| v.as_slice());
+            super::subgraph_mil::build_mlp_block_mil("x", hidden_dim, intermediate_dim, gate_w, up_w, down_w)?
+        }
+        "rmsnorm_qkv" => {
+            let rms_w = weights.get("rms_w").map_or(&[] as &[f32], |v| v.as_slice());
+            let q_w = weights.get("q_w").map_or(&[] as &[f32], |v| v.as_slice());
+            let k_w = weights.get("k_w").map_or(&[] as &[f32], |v| v.as_slice());
+            let v_w = weights.get("v_w").map_or(&[] as &[f32], |v| v.as_slice());
+            super::subgraph_mil::build_rmsnorm_qkv_mil(
+                "x", hidden_dim, n_heads, n_kv_heads, head_dim, rms_w, q_w, k_w, v_w,
+            )?
+        }
+        "output_proj" => {
+            let weight_values = weights.get("weight_values").map_or(&[] as &[f32], |v| v.as_slice());
+            super::subgraph_mil::build_output_proj_mil("x", hidden_dim, vocab_dim, weight_values)?
+        }
         "ffn_output" => {
-            super::subgraph_mil::build_ffn_output_mil("x", hidden_dim, intermediate_dim, vocab_dim)?
+            let gate_w = weights.get("gate_w").map_or(&[] as &[f32], |v| v.as_slice());
+            let up_w = weights.get("up_w").map_or(&[] as &[f32], |v| v.as_slice());
+            let down_w = weights.get("down_w").map_or(&[] as &[f32], |v| v.as_slice());
+            let lm_head_w = weights.get("lm_head_w").map_or(&[] as &[f32], |v| v.as_slice());
+            super::subgraph_mil::build_ffn_output_mil(
+                "x", hidden_dim, intermediate_dim, vocab_dim, gate_w, up_w, down_w, lm_head_w,
+            )?
         }
-        "qkv_bundle" => super::subgraph_mil::build_qkv_bundle_mil(
-            "x", hidden_dim, n_heads, n_kv_heads, head_dim,
-        )?,
+        "qkv_bundle" => {
+            let q_w = weights.get("q_w").map_or(&[] as &[f32], |v| v.as_slice());
+            let k_w = weights.get("k_w").map_or(&[] as &[f32], |v| v.as_slice());
+            let v_w = weights.get("v_w").map_or(&[] as &[f32], |v| v.as_slice());
+            super::subgraph_mil::build_qkv_bundle_mil(
+                "x", hidden_dim, n_heads, n_kv_heads, head_dim, q_w, k_w, v_w,
+            )?
+        }
         _ => {
             return Err(format!(
                 "unknown subgraph kind '{}' — no MIL builder registered",

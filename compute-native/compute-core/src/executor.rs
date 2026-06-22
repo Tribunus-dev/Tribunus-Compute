@@ -877,8 +877,7 @@ fn sliding_attention_layer(
     v.eval()?;
 
     // ANE dispatch: if this layer is routed to ANE, send Q/K/V to CoreML
-    if false && route.attention == crate::heterogeneous::ANE {
-        // ANE dispatch disabled — see profiled_model.rs
+    if route.attention == crate::heterogeneous::ANE {
     }
 
     cache.append(k, v)?;
@@ -1020,8 +1019,7 @@ fn full_attention_layer(
     k.eval()?;
     v.eval()?;
     // ANE dispatch: if this layer is routed to ANE, send Q/K/V to CoreML
-    if false && route.attention == crate::heterogeneous::ANE {
-        // ANE dispatch disabled — see profiled_model.rs
+    if route.attention == crate::heterogeneous::ANE {
     }
 
     cache.append(k, v)?;

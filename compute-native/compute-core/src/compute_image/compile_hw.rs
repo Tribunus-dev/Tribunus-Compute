@@ -743,6 +743,7 @@ pub fn run_hardware_assessment() -> AssessmentReceipt {
                     ("vocab".to_string(), vec![32768i64]),
                     ("head_dim".to_string(), vec![128i64]),
                 ]),
+                &std::collections::HashMap::new(),
                 &tmp_dir,
             ) {
                 Ok(modelc_path) => {

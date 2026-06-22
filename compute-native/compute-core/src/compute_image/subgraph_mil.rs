@@ -297,6 +297,7 @@ pub fn build_matmul_mil(
     m: u32,
     k: u32,
     n: u32,
+    weight_values: &[f32],
 ) -> Result<mil_spec::Program, String> {
     let builder = MilBuilder::new("main")
         .input(
@@ -304,7 +305,7 @@ pub fn build_matmul_mil(
             mil_spec::DataType::Float32,
             &[m as i64, k as i64],
         )
-        .const_f32(weight_name, &[], &[k as i64, n as i64])
+        .const_f32(weight_name, weight_values, &[k as i64, n as i64])
         .matmul(input_name, &format!("{}_0", weight_name));
     let builder = builder.output("matmul_1");
     builder
@@ -332,6 +333,9 @@ pub fn build_mlp_block_mil(
     input_name: &str,
     hidden_dim: u32,
     intermediate_dim: u32,
+    gate_w: &[f32],
+    up_w: &[f32],
+    down_w: &[f32],
 ) -> Result<mil_spec::Program, String> {
     let h = hidden_dim as i64;
     let f = intermediate_dim as i64;
@@ -341,7 +345,7 @@ pub fn build_mlp_block_mil(
 
     // Gate projection: matmul(x, w_gate) → [1, f]
     let builder = builder
-        .const_f32("w_gate", &[], &[h, f])
+        .const_f32("w_gate", gate_w, &[h, f])
         .matmul(input_name, "w_gate_0");
 
     // SiLU(gate): sigmoid + mul composite
@@ -349,7 +353,7 @@ pub fn build_mlp_block_mil(
 
     // Up projection: matmul(x, w_up) → [1, f]
     let builder = builder
-        .const_f32("w_up", &[], &[h, f])
+        .const_f32("w_up", up_w, &[h, f])
         .matmul(input_name, "w_up_2");
 
     // Element-wise mul(gate_silu, up_proj)
@@ -357,7 +361,7 @@ pub fn build_mlp_block_mil(
 
     // Down projection: matmul(mul_result, w_down) → [1, h]
     let builder = builder
-        .const_f32("w_down", &[], &[f, h])
+        .const_f32("w_down", down_w, &[f, h])
         .matmul("mul_4", "w_down_5");
     // Counter: 6
     // mul_4 is output from mul(gate_silu, matmul_3). MilBuilder fresh_name("mul")
@@ -385,6 +389,10 @@ pub fn build_rmsnorm_qkv_mil(
     n_heads: u32,
     n_kv_heads: u32,
     head_dim: u32,
+    rms_w: &[f32],
+    q_w: &[f32],
+    k_w: &[f32],
+    v_w: &[f32],
 ) -> Result<mil_spec::Program, String> {
     let h = hidden_dim as i64;
     let q_dim = (n_heads * head_dim) as i64;
@@ -413,7 +421,7 @@ pub fn build_rmsnorm_qkv_mil(
     let builder = builder.mul(input_name, &rsqrt_out);
 
     // const w_rms [1, h] → "w_rms_3"
-    let builder = builder.const_f32("w_rms", &[], &[1, h]);
+    let builder = builder.const_f32("w_rms", rms_w, &[1, h]);
 
     // mul(normed, w_rms_3) → fully normed [1, h]
     // normed is "mul_2" — mul(input, rsqrt) with fresh_name("mul") at counter=2
@@ -423,21 +431,21 @@ pub fn build_rmsnorm_qkv_mil(
     // ── QKV projections ──────────────────────────────────────────────
     // Q: [1, h] × [h, q_dim] → [1, q_dim]
     let builder = builder
-        .const_f32("w_q", &[], &[h, q_dim])
+        .const_f32("w_q", q_w, &[h, q_dim])
         .matmul("mul_4", "w_q_5");
     // w_q: fresh_name("w_q") at counter=5 → "w_q_5"
     // matmul: fresh_name("matmul") at counter=6 → "matmul_6"
 
     // K: [1, h] × [h, kv_dim] → [1, kv_dim]
     let builder = builder
-        .const_f32("w_k", &[], &[h, kv_dim])
+        .const_f32("w_k", k_w, &[h, kv_dim])
         .matmul("mul_4", "w_k_7");
     // w_k: fresh_name("w_k") at counter=7 → "w_k_7"
     // matmul: fresh_name("matmul") at counter=8 → "matmul_8"
 
     // V: [1, h] × [h, kv_dim] → [1, kv_dim]
     let builder = builder
-        .const_f32("w_v", &[], &[h, kv_dim])
+        .const_f32("w_v", v_w, &[h, kv_dim])
         .matmul("mul_4", "w_v_9");
     // w_v: fresh_name("w_v") at counter=9 → "w_v_9"
     // matmul: fresh_name("matmul") at counter=10 → "matmul_10"
@@ -462,13 +470,14 @@ pub fn build_output_proj_mil(
     input_name: &str,
     hidden_dim: u32,
     vocab_dim: u32,
+    weight_values: &[f32],
 ) -> Result<mil_spec::Program, String> {
     let h = hidden_dim as i64;
     let v = vocab_dim as i64;
 
     let builder = MilBuilder::new("main")
         .input(input_name, mil_spec::DataType::Float32, &[1, h])
-        .const_f32("w_lm_head", &[], &[h, v])
+        .const_f32("w_lm_head", weight_values, &[h, v])
         .matmul(input_name, "w_lm_head_0")
         .output("matmul_1");
 
@@ -493,6 +502,10 @@ pub fn build_ffn_output_mil(
     hidden_dim: u32,
     intermediate_dim: u32,
     vocab_dim: u32,
+    gate_w: &[f32],
+    up_w: &[f32],
+    down_w: &[f32],
+    lm_head_w: &[f32],
 ) -> Result<mil_spec::Program, String> {
     let h = hidden_dim as i64;
     let f = intermediate_dim as i64;
@@ -503,7 +516,7 @@ pub fn build_ffn_output_mil(
 
     // Gate projection
     let builder = builder
-        .const_f32("w_gate", &[], &[h, f])
+        .const_f32("w_gate", gate_w, &[h, f])
         .matmul(input_name, "w_gate_0");
 
     // SiLU(gate)
@@ -511,7 +524,7 @@ pub fn build_ffn_output_mil(
 
     // Up projection
     let builder = builder
-        .const_f32("w_up", &[], &[h, f])
+        .const_f32("w_up", up_w, &[h, f])
         .matmul(input_name, "w_up_2");
 
     // Gate × up
@@ -519,13 +532,13 @@ pub fn build_ffn_output_mil(
 
     // Down projection
     let builder = builder
-        .const_f32("w_down", &[], &[f, h])
+        .const_f32("w_down", down_w, &[f, h])
         .matmul("mul_4", "w_down_5");
     // matmul_6 = MLP output
 
     // ── LM head ──────────────────────────────────────────────────────
     let builder = builder
-        .const_f32("w_lm_head", &[], &[h, v])
+        .const_f32("w_lm_head", lm_head_w, &[h, v])
         .matmul("matmul_6", "w_lm_head_7");
     // matmul_8 = final logits
 
@@ -550,6 +563,9 @@ pub fn build_qkv_bundle_mil(
     n_heads: u32,
     n_kv_heads: u32,
     head_dim: u32,
+    q_w: &[f32],
+    k_w: &[f32],
+    v_w: &[f32],
 ) -> Result<mil_spec::Program, String> {
     let h = hidden_dim as i64;
     let q_dim = (n_heads * head_dim) as i64;
@@ -559,17 +575,17 @@ pub fn build_qkv_bundle_mil(
 
     // Q
     let builder = builder
-        .const_f32("w_q", &[], &[h, q_dim])
+        .const_f32("w_q", q_w, &[h, q_dim])
         .matmul(input_name, "w_q_0");
 
     // K
     let builder = builder
-        .const_f32("w_k", &[], &[h, kv_dim])
+        .const_f32("w_k", k_w, &[h, kv_dim])
         .matmul(input_name, "w_k_2");
 
     // V
     let builder = builder
-        .const_f32("w_v", &[], &[h, kv_dim])
+        .const_f32("w_v", v_w, &[h, kv_dim])
         .matmul(input_name, "w_v_4");
 
     let builder = builder
@@ -591,7 +607,7 @@ mod tests {
 
     #[test]
     fn build_matmul_acceptance() {
-        let prog = build_matmul_mil("x", "w", "out", 1, 64, 32).unwrap();
+        let prog = build_matmul_mil("x", "w", "out", 1, 64, 32, &[]).unwrap();
         assert_eq!(prog.version, 1);
         let func = prog.functions.get("main").unwrap();
         let block = func.block_specializations.get("CoreML9").unwrap();
@@ -607,7 +623,7 @@ mod tests {
 
     #[test]
     fn build_mlp_block_acceptance() {
-        let prog = build_mlp_block_mil("x", 64, 256).unwrap();
+        let prog = build_mlp_block_mil("x", 64, 256, &[], &[], &[]).unwrap();
         let func = prog.functions.get("main").unwrap();
         let block = func.block_specializations.get("CoreML9").unwrap();
         // const_gate, matmul(gate), sig, mul(silu), const_up, matmul(up),
@@ -626,7 +642,7 @@ mod tests {
 
     #[test]
     fn build_rmsnorm_qkv_acceptance() {
-        let prog = build_rmsnorm_qkv_mil("x", 64, 4, 2, 32).unwrap();
+        let prog = build_rmsnorm_qkv_mil("x", 64, 4, 2, 32, &[], &[], &[], &[]).unwrap();
         let func = prog.functions.get("main").unwrap();
         let block = func.block_specializations.get("CoreML9").unwrap();
         assert_eq!(block.outputs.len(), 3, "expected 3 outputs");
@@ -641,7 +657,7 @@ mod tests {
 
     #[test]
     fn build_output_proj_acceptance() {
-        let prog = build_output_proj_mil("x", 64, 32768).unwrap();
+        let prog = build_output_proj_mil("x", 64, 32768, &[]).unwrap();
         let func = prog.functions.get("main").unwrap();
         let block = func.block_specializations.get("CoreML9").unwrap();
         assert_eq!(block.outputs, vec!["matmul_1"]);
@@ -653,7 +669,7 @@ mod tests {
 
     #[test]
     fn build_ffn_output_acceptance() {
-        let prog = build_ffn_output_mil("x", 64, 256, 32768).unwrap();
+        let prog = build_ffn_output_mil("x", 64, 256, 32768, &[], &[], &[], &[]).unwrap();
         let func = prog.functions.get("main").unwrap();
         let block = func.block_specializations.get("CoreML9").unwrap();
         assert_eq!(block.outputs, vec!["matmul_8"]);
@@ -665,7 +681,7 @@ mod tests {
 
     #[test]
     fn build_qkv_bundle_acceptance() {
-        let prog = build_qkv_bundle_mil("x", 64, 4, 2, 32).unwrap();
+        let prog = build_qkv_bundle_mil("x", 64, 4, 2, 32, &[], &[], &[]).unwrap();
         let func = prog.functions.get("main").unwrap();
         let block = func.block_specializations.get("CoreML9").unwrap();
         assert_eq!(block.outputs.len(), 3, "expected 3 outputs");
