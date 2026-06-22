@@ -760,6 +760,7 @@ impl LoadedProfiledModel {
         } else {
             None
         }
+        ;
 
         // ── Load compiled Metal kernel artifacts ──────────────────────────
         // Load .metallib files from the compute image, create pipeline states.
