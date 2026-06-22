@@ -2615,6 +2615,59 @@ mod tests {
         assert_eq!(rope_cos.shape()[0], arch.max_position_embeddings as i32);
         assert_eq!(full_cos.shape()[0], arch.max_position_embeddings as i32);
     }
+    // ── KvCacheRestoreGuard tests ──────────────────────────────────────
+
+    #[test]
+    fn test_guard_takes_caches_and_restores_on_drop() {
+        let mut session_caches = vec![KvCache::new(1024, 8, 128, false)];
+        {
+            let _guard = KvCacheRestoreGuard::new(&mut session_caches);
+            assert_eq!(_guard.caches.as_ref().unwrap().len(), 1);
+        }
+        assert_eq!(session_caches.len(), 1);
+    }
+
+    #[test]
+    fn test_guard_into_inner_suppresses_drop_restoration() {
+        let mut session_caches = vec![KvCache::new(512, 4, 64, true)];
+        let recovered = {
+            let guard = KvCacheRestoreGuard::new(&mut session_caches);
+            guard.into_inner()
+        };
+        assert_eq!(recovered.len(), 1);
+    }
+
+    #[test]
+    fn test_guard_caches_mut_returns_live_ref() {
+        let mut session_caches = vec![KvCache::new(1024, 8, 128, false)];
+        let mut guard = KvCacheRestoreGuard::new(&mut session_caches);
+        {
+            let live = guard.caches_mut();
+            if let crate::kv_cache::LiveKvCache::Fp16(kv) = &mut live[0] {
+                kv.committed_len = 10;
+            }
+        }
+        let recovered = guard.into_inner();
+        if let crate::kv_cache::LiveKvCache::Fp16(kv) = &recovered[0] {
+            assert_eq!(kv.committed_len, 10);
+        } else {
+            panic!("expected Fp16 variant");
+        }
+    }
+
+    #[test]
+    fn test_guard_multiple_caches_take_and_restore() {
+        let caches: Vec<KvCache> = (0..4)
+            .map(|i| KvCache::new(1024, 8, 128, i % 2 == 0))
+            .collect();
+        let mut session_caches = caches;
+        {
+            let _guard = KvCacheRestoreGuard::new(&mut session_caches);
+            assert_eq!(_guard.caches.as_ref().unwrap().len(), 4);
+        }
+        assert_eq!(session_caches.len(), 4);
+    }
+
 }
 
 /// Drop guard that restores session KV caches on unwind or early return.
