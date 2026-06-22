@@ -652,6 +652,9 @@ pub struct AneFusedIsland {
     pub layer_indices: Vec<u32>,
     pub compute_units: String,
     pub function_name: String,
+    /// Semantic subgraph kind for this fused island.
+    #[serde(default)]
+    pub subgraph_kind: String,
 }
 
 /// A fused operation composed of multiple atomic operations.
@@ -793,12 +796,31 @@ impl ModelExecutionPlan {
                     layer_indices.last().unwrap()
                 );
                 let modelc_path = format!("{}.modelc", island_id);
+                // Determine subgraph kind from the first layer's ops
+                let first_idx = layer_indices[0] as usize;
+                let first_ops = self.layers[first_idx].operation_names();
+                let subgraph_kind = if first_ops.contains(&"gate_proj") && first_ops.contains(&"down_proj") {
+                    "mlp_block".to_string()
+                } else if first_ops.contains(&"q_proj")
+                    && first_ops.contains(&"k_proj")
+                    && first_ops.contains(&"v_proj")
+                    && !first_ops.contains(&"rms_norm")
+                {
+                    "qkv_bundle".to_string()
+                } else if first_ops.contains(&"rms_norm") && first_ops.contains(&"q_proj") {
+                    "rmsnorm_qkv".to_string()
+                } else if first_ops.contains(&"lm_head") {
+                    "output_proj".to_string()
+                } else {
+                    "mlp_block".to_string()
+                };
                 islands.push(AneFusedIsland {
                     island_id,
                     modelc_relpath: modelc_path,
                     layer_indices,
                     compute_units: "cpuAndNeuralEngine".to_string(),
                     function_name: "main".to_string(),
+                    subgraph_kind,
                 });
             }
         }

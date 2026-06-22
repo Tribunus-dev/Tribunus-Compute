@@ -24,6 +24,7 @@ use crate::compute_image::hw_assessment::ConcurrencyPlan;
 use crate::coreml_pipeline;
 use crate::mil_builder::MilBuilder;
 use crate::mlpackage::{self, ModelMeta};
+use crate::compute_image::compile::SourceTensor;
 
 // ── Known subgraph catalog ──────────────────────────────────────────────────
 
@@ -432,4 +433,146 @@ fn build_mil_program(
     builder
         .build()
         .map_err(|e| format!("MIL build error for subgraph '{}': {e}", name))
+}
+/// Compile all ANE fused islands with real weights from source tensors.
+///
+/// Iterates over [`crate::config::AneFusedIsland`] entries in the execution
+/// plan and compiles each as a Core ML subgraph with the weights extracted
+/// from `source_tensors`.  Each island's `.mlmodelc` is written to
+/// `output_dir / island.modelc_relpath`.
+pub fn compile_ane_islands(
+    execution_plan: &crate::config::ModelExecutionPlan,
+    source_tensors: &std::collections::HashMap<String, SourceTensor>,
+    arch: &crate::config::TextArchitecture,
+    output_dir: &std::path::Path,
+    namespace: &crate::config::NamespaceBinding,
+) -> Result<(), String> {
+    /// Reinterpret raw bytes from a [`SourceTensor`] as `Vec<f32>`.
+    fn get_weight_values(
+        source_tensors: &std::collections::HashMap<String, SourceTensor>,
+        key: &str,
+    ) -> Vec<f32> {
+        source_tensors.get(key).map(|st| {
+            let ptr = st.data.as_ptr() as *const f32;
+            let len = st.data.len() / 4;
+            unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+        }).unwrap_or_default()
+    }
+    /// Compile all ANE fused islands
+
+    for island in &execution_plan.fused_ane_islands {
+        let idx = island.layer_indices.first().copied().unwrap_or(0);
+        let ns = &namespace.root;
+
+        // ── Build weights HashMap ──────────────────────────────────────
+        let mut weights: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
+
+        match island.subgraph_kind.as_str() {
+            "mlp_block" => {
+                let gate_k = format!("{ns}.layers.{idx}.mlp.gate_proj.weight");
+                let up_k = format!("{ns}.layers.{idx}.mlp.up_proj.weight");
+                let down_k = format!("{ns}.layers.{idx}.mlp.down_proj.weight");
+                weights.insert("gate_w".to_string(), get_weight_values(source_tensors, &gate_k));
+                weights.insert("up_w".to_string(), get_weight_values(source_tensors, &up_k));
+                weights.insert("down_w".to_string(), get_weight_values(source_tensors, &down_k));
+            }
+            "qkv_bundle" | "rmsnorm_qkv" => {
+                let q_k = format!("{ns}.layers.{idx}.self_attn.q_proj.weight");
+                let k_k = format!("{ns}.layers.{idx}.self_attn.k_proj.weight");
+                let v_k = format!("{ns}.layers.{idx}.self_attn.v_proj.weight");
+                weights.insert("q_w".to_string(), get_weight_values(source_tensors, &q_k));
+                weights.insert("k_w".to_string(), get_weight_values(source_tensors, &k_k));
+                weights.insert("v_w".to_string(), get_weight_values(source_tensors, &v_k));
+            }
+            "output_proj" => {
+                let lm_k = format!("{ns}.lm_head.weight");
+                weights.insert("lm_head_w".to_string(), get_weight_values(source_tensors, &lm_k));
+            }
+            "ffn_output" => {
+                let gate_k = format!("{ns}.layers.{idx}.mlp.gate_proj.weight");
+                let up_k = format!("{ns}.layers.{idx}.mlp.up_proj.weight");
+                let down_k = format!("{ns}.layers.{idx}.mlp.down_proj.weight");
+                let lm_k = format!("{ns}.lm_head.weight");
+                weights.insert("gate_w".to_string(), get_weight_values(source_tensors, &gate_k));
+                weights.insert("up_w".to_string(), get_weight_values(source_tensors, &up_k));
+                weights.insert("down_w".to_string(), get_weight_values(source_tensors, &down_k));
+                weights.insert("lm_head_w".to_string(), get_weight_values(source_tensors, &lm_k));
+            }
+            "matmul" => {
+                // No named weight — uses input activations only.
+            }
+            other => {
+                return Err(format!(
+                    "unknown subgraph_kind '{}' for island '{}'",
+                    other, island.island_id
+                ));
+            }
+        }
+
+        // Add rms weight for rmsnorm_qkv
+        if island.subgraph_kind == "rmsnorm_qkv" {
+            let rms_k = format!("{ns}.layers.{idx}.input_layernorm.weight");
+            weights.insert("rms_w".to_string(), get_weight_values(source_tensors, &rms_k));
+        }
+
+        // ── Build input_shapes ────────────────────────────────────────
+        let mut shapes: std::collections::HashMap<String, Vec<i64>> = std::collections::HashMap::new();
+        shapes.insert("hidden".to_string(), vec![arch.hidden_size as i64]);
+        shapes.insert("intermediate".to_string(), vec![arch.intermediate_size as i64]);
+        shapes.insert("vocab".to_string(), vec![arch.vocab_size as i64]);
+        shapes.insert("head_dim".to_string(), vec![arch.head_dim as i64]);
+        shapes.insert("n_heads".to_string(), vec![arch.num_attention_heads as i64]);
+        shapes.insert("n_kv_heads".to_string(), vec![arch.num_key_value_heads as i64]);
+
+        // ── Build ops from subgraph_kind ───────────────────────────────
+        let ops: Vec<String> = match island.subgraph_kind.as_str() {
+            "mlp_block" => vec![
+                "gate_proj".to_string(),
+                "up_proj".to_string(),
+                "down_proj".to_string(),
+            ],
+            "qkv_bundle" => vec![
+                "q_proj".to_string(),
+                "k_proj".to_string(),
+                "v_proj".to_string(),
+            ],
+            "rmsnorm_qkv" => vec![
+                "q_proj".to_string(),
+                "k_proj".to_string(),
+                "v_proj".to_string(),
+            ],
+            "output_proj" => vec!["lm_head".to_string()],
+            "ffn_output" => vec![
+                "gate_proj".to_string(),
+                "up_proj".to_string(),
+                "down_proj".to_string(),
+                "lm_head".to_string(),
+            ],
+            "matmul" => vec!["matmul".to_string()],
+            other => {
+                return Err(format!(
+                    "unknown subgraph_kind '{}' for island '{}'",
+                    other, island.island_id
+                ));
+            }
+        };
+
+        // ── Compile subgraph with weights ──────────────────────────────
+        let modelc_path = compile_subgraph(
+            &island.island_id,
+            &ops,
+            &shapes,
+            &weights,
+            output_dir,
+        )?;
+        eprintln!(
+            "[compile_coreml] compiled {} → {}/{}",
+            island.island_id,
+            output_dir.display(),
+            island.modelc_relpath
+        );
+        let _ = modelc_path; // consumed by compile_subgraph
+    }
+
+    Ok(())
 }
