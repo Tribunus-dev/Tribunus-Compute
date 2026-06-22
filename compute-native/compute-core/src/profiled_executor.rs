@@ -554,13 +554,23 @@ impl ProfiledInferenceSession {
             if let Some(h) = ctx.hidden_state {
                 *hidden = h;
             }
-            let _ = guard.into_inner(); // disarm Drop — successful publication
+            // Publish caches back to session — unwrap LiveKvCache::Fp16.
+            self.kv_caches = guard.into_inner().into_iter().map(|lc| match lc {
+                crate::kv_cache::LiveKvCache::Fp16(kv) => kv,
+                _ => panic!("execute_dag_with_kv_guard: unexpected compressed cache in Complete"),
+            }).collect();
             return GraphExecutionDisposition::Complete;
         }
 
-        // Check for partial KV mutations against the checkpoint.
-        let has_kv_mutations = self.kv_caches.iter().zip(&checkpoint_kv_lengths)
-            .any(|(c, &ckpt)| c.committed_len != ckpt);
+        // Check mutations against the GUARD's caches (self.kv_caches is empty after take).
+        let has_kv_mutations = guard.caches.as_ref()
+            .map(|caches| {
+                caches.iter().zip(&checkpoint_kv_lengths).any(|(lc, &ckpt)| match lc {
+                    crate::kv_cache::LiveKvCache::Fp16(c) => c.committed_len != ckpt,
+                    _ => true, // compressed variant always counts as mutation
+                })
+            })
+            .unwrap_or(false);
         let has_position_change = self.absolute_position != checkpoint_position;
 
         // Hidden state may have been modified even without KV change.
@@ -571,7 +581,11 @@ impl ProfiledInferenceSession {
                 label, completed_count, receipt_count, has_kv_mutations, has_position_change);
             // Restore hidden from checkpoint before returning partial disposition.
             *hidden = checkpoint_hidden;
-            let _ = guard.into_inner(); // disarm Drop — caller must not use old loop
+            // Publish caches back so caller can inspect/rollback.
+            self.kv_caches = guard.into_inner().into_iter().map(|lc| match lc {
+                crate::kv_cache::LiveKvCache::Fp16(kv) => kv,
+                _ => panic!("execute_dag_with_kv_guard: unexpected compressed cache in Partial"),
+            }).collect();
             return GraphExecutionDisposition::PartialPublishedResumeRequired;
         }
 
@@ -579,7 +593,11 @@ impl ProfiledInferenceSession {
         eprintln!("[phase-dag] {}: {} phases completed, no KV mutation (safe fallback)", label, completed_count);
         // Restore hidden from checkpoint so legacy loop starts clean.
         *hidden = checkpoint_hidden;
-        let _ = guard.into_inner(); // disarm Drop — caller is responsible
+        // Publish caches back to session for legacy loop.
+        self.kv_caches = guard.into_inner().into_iter().map(|lc| match lc {
+            crate::kv_cache::LiveKvCache::Fp16(kv) => kv,
+            _ => panic!("execute_dag_with_kv_guard: unexpected compressed cache in ZeroMutations"),
+        }).collect();
         GraphExecutionDisposition::ZeroMutationsFallbackSafe
     }
 
