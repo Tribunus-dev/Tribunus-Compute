@@ -2435,10 +2435,9 @@ pub fn compile_differential(
         &plan_with_fusion,
         &loaded.source_tensors,
         &loaded.arch,
-        output_dir,
+        output_dir_path,
         &loaded.namespace,
     ).map_err(crate::Error::from_reason)?;
-    builder.set_execution_plan(plan_with_fusion);
     builder.set_execution_plan(plan_with_fusion);
 
         combined_segments.push(Segment {
