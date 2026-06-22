@@ -49,6 +49,7 @@ pub use crate::profiled_model::*;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use parking_lot::Mutex;
 
 /// Execution mode for the runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,7 +221,6 @@ pub struct ProfiledInferenceSession {
     pub asymmetric_quant: Option<AsymmetricQuantMode>,
     /// Compressed TurboQuant KV caches, one per layer.
     /// Populated in parallel with the FP16 KvCache during inference.
-    pub compressed_caches: Vec<Option<TurboQuantKvCache>>,
     pub compressed_caches: Vec<Option<Arc<Mutex<TurboQuantKvCache>>>>,
     /// Sampling configuration, including optional grammar-guided generation.
     /// The grammar FSM is advanced after each decoded token.
@@ -290,6 +290,7 @@ impl ProfiledInferenceSession {
     /// `kv_caches` must be pre-allocated for each layer and will be populated
     /// during the first prefill call.
     pub fn new(session_id: String, kv_caches: Vec<KvCache>) -> Self {
+    pub fn new(session_id: String, mut kv_caches: Vec<KvCache>) -> Self {
         let mut timeline = RuntimeTimeline::new();
         timeline.push_event(TimelineEvent::new(
             0,
@@ -297,10 +298,9 @@ impl ProfiledInferenceSession {
             format!("session {} created", session_id),
         ));
 
-        let compressed_caches: Vec<Option<TurboQuantKvCache>> = {
         let cap = kv_caches.first().map(|c| c.capacity).unwrap_or(2048);
-        let group_size = 32usize;
         let mode = KvQuantMode::PolarHadamard(4);
+        let group_size = 32usize;
         let compressed_caches: Vec<Option<Arc<Mutex<TurboQuantKvCache>>>> = kv_caches.iter().map(|_kvc| {
             let comp = Arc::new(Mutex::new(TurboQuantKvCache::new(mode, group_size, cap as usize)));
             Some(comp)
