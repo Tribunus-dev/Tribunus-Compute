@@ -289,7 +289,6 @@ impl ProfiledInferenceSession {
     ///
     /// `kv_caches` must be pre-allocated for each layer and will be populated
     /// during the first prefill call.
-    pub fn new(session_id: String, kv_caches: Vec<KvCache>) -> Self {
     pub fn new(session_id: String, mut kv_caches: Vec<KvCache>) -> Self {
         let mut timeline = RuntimeTimeline::new();
         timeline.push_event(TimelineEvent::new(
