@@ -1,36 +1,70 @@
-# OS
+# OS files
 .DS_Store
 Thumbs.db
+*.swp
+*.swo
+*~
 
-# Build artifacts
+# IDE
+.idea/
+.vscode/
+*.iml
+settings.json
+
+# Rust build artifacts
 target/
-packages/
-*.node
+debug/
+release/
+*.rlib
 *.so
 *.dylib
+*.dll
+*.exe
+*.pdb
+Cargo.lock
+**/*.rs.bk
+
+# Node
+node_modules/
+.bun/
 
 # Python
 __pycache__/
 *.pyc
+*.pyo
 .venv*/
 venv/
+*.egg-info/
 
-# Models (too large for git)
-compute-native/models/
-models/qwen-coreml/
-models/qwen-source/
-models/*.safetensors
-models/*.gguf
-models/*.bin
-models/*.pt
-models/*.pth
-
-# IDE / generated
-.idea/
-.vscode/
-*.swp
-*.swo
-*.xcodeproj/
+# Build output
+dist/
+build/
+out/
+*.o
+*.a
+*.tsbuildinfo
 
 # Environment
-.environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+
+# Models / large data (too large for git)
+compute-native/models/
+models/
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Temp files
+*.tmp
+*.bak
+*.orig
+
+# Tribunus-specific
+.tribunus/
