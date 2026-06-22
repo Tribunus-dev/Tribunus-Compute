@@ -556,13 +556,21 @@ impl ProfiledInferenceSession {
         let mut phase_engine_completed = false;
         if let Some(dag) = &model.phase_dag {
             let engine = PhaseEngine::new();
+
+            // Move KV caches into PhaseEngine context — exclusive mutation ownership.
+            let session_caches = std::mem::take(&mut self.kv_caches);
+            let dag_caches: Vec<crate::kv_cache::LiveKvCache> = session_caches
+                .into_iter()
+                .map(|c| crate::kv_cache::LiveKvCache::Fp16(c))
+                .collect();
+
             let mut ctx = ExecutionContext {
                 request_id: 0,
                 token_position: self.absolute_position as usize,
                 token_ids: token_ids_i32.clone(),
                 is_prefill: true,
                 hidden_state: Some(hidden.clone()),
-                kv_caches: self.kv_caches.iter().map(|c| crate::kv_cache::LiveKvCache::Fp16((*c).clone())).collect(),
+                kv_caches: dag_caches,
                 layer_weights: Arc::new(model.layers.clone()),
                 backend: Some(Box::new(RuntimeBackends {
                     mlx_executor: Arc::new(std::sync::Mutex::new(
@@ -585,6 +593,16 @@ impl ProfiledInferenceSession {
             let receipt_count = result.receipts.len();
             let completed_count = result.receipts.iter().filter(|r| matches!(r.status, PhaseCompletionStatus::Complete)).count();
             self.phase_receipts.extend(result.receipts);
+
+            // Restore KV caches back to session — unwrap from LiveKvCache, move in bulk.
+            let restored: Vec<crate::kv_cache::KvCache> = ctx.kv_caches
+                .into_iter()
+                .map(|lc| match lc {
+                    crate::kv_cache::LiveKvCache::Fp16(kv) => kv,
+                    _ => panic!("prefill: unexpected compressed KV cache after DAG execution"),
+                })
+                .collect();
+            self.kv_caches = restored;
 
             if result.all_completed {
                 eprintln!("[phase-dag] prefill: all {} phases completed via PhaseEngine, bypassing MLX loop", receipt_count);
@@ -978,13 +996,21 @@ impl ProfiledInferenceSession {
             use crate::compute_image::phase_dag::PhaseCompletionStatus;
 
             let engine = PhaseEngine::new();
+
+            // Move KV caches into PhaseEngine context — exclusive mutation ownership.
+            let session_caches = std::mem::take(&mut self.kv_caches);
+            let dag_caches: Vec<crate::kv_cache::LiveKvCache> = session_caches
+                .into_iter()
+                .map(|c| crate::kv_cache::LiveKvCache::Fp16(c))
+                .collect();
+
             let mut ctx = ExecutionContext {
                 request_id: 0,
                 token_position: self.absolute_position as usize,
                 token_ids: token_ids_i32.to_vec(),
                 is_prefill: false,
                 hidden_state: Some(hidden.clone()),
-                kv_caches: self.kv_caches.iter().map(|c| crate::kv_cache::LiveKvCache::Fp16((*c).clone())).collect(),
+                kv_caches: dag_caches,
                 layer_weights: Arc::new(model.layers.clone()),
                 backend: Some(Box::new(RuntimeBackends {
                     mlx_executor: Arc::new(std::sync::Mutex::new(
@@ -1007,6 +1033,16 @@ impl ProfiledInferenceSession {
             let receipt_count = result.receipts.len();
             let completed_count = result.receipts.iter().filter(|r| matches!(r.status, PhaseCompletionStatus::Complete)).count();
             self.phase_receipts.extend(result.receipts);
+
+            // Restore KV caches back to session — unwrap from LiveKvCache, move in bulk.
+            let restored: Vec<crate::kv_cache::KvCache> = ctx.kv_caches
+                .into_iter()
+                .map(|lc| match lc {
+                    crate::kv_cache::LiveKvCache::Fp16(kv) => kv,
+                    _ => panic!("decode: unexpected compressed KV cache after DAG execution"),
+                })
+                .collect();
+            self.kv_caches = restored;
 
             if result.all_completed {
                 eprintln!("[phase-dag] decode: all {} phases completed via PhaseEngine, bypassing MLX loop", receipt_count);
