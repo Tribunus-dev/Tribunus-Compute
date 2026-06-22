@@ -266,6 +266,19 @@ pub enum EmbedPoolStrategy {
     Last,
 }
 
+
+/// Disposition of a PhaseEngine graph execution, used for safe fallback logic.
+pub enum GraphExecutionDisposition {
+    /// All phases completed — skip legacy loop, use graph output.
+    Complete,
+    /// Zero phases mutated state — legacy fallback from layer 0 is safe.
+    ZeroMutationsFallbackSafe,
+    /// Partial completion with KV mutations — cannot safely run legacy loop.
+    PartialPublishedResumeRequired,
+    /// Error during execution — all paths guarded.
+    Fatal,
+}
+
 impl ProfiledInferenceSession {
     /// Create a new inference session.
     ///
@@ -471,6 +484,98 @@ impl ProfiledInferenceSession {
 
     /// Chunked prefill: process the next chunk of the prompt.
     ///
+
+    /// Execute the phase DAG with KV cache ownership management.
+    ///
+    /// Moves KV caches into the PhaseEngine context via `std::mem::take`,
+    /// runs the graph, always restores caches afterward, and returns a
+    /// disposition indicating whether the legacy loop may safely run.
+    fn execute_dag_with_kv_guard(
+        &mut self,
+        model: &LoadedProfiledModel,
+        dag: &EmittedPhaseGraph,
+        hidden: &mut Array,
+        token_ids: &[i32],
+        is_prefill: bool,
+    ) -> GraphExecutionDisposition {
+        let kv_checkpoint: Vec<u32> = self.kv_caches.iter().map(|c| c.committed_len).collect();
+
+        let engine = PhaseEngine::new();
+
+        // Move KV caches — exclusive mutation ownership.
+        let session_caches = std::mem::take(&mut self.kv_caches);
+        let dag_caches: Vec<crate::kv_cache::LiveKvCache> = session_caches
+            .into_iter()
+            .map(|c| crate::kv_cache::LiveKvCache::Fp16(c))
+            .collect();
+
+        let mut ctx = ExecutionContext {
+            request_id: 0,
+            token_position: self.absolute_position as usize,
+            token_ids: token_ids.to_vec(),
+            is_prefill,
+            hidden_state: Some(hidden.clone()),
+            kv_caches: dag_caches,
+            layer_weights: Arc::new(model.layers.clone()),
+            backend: Some(Box::new(RuntimeBackends {
+                mlx_executor: Arc::new(std::sync::Mutex::new(
+                    crate::mlx_executor::MlxExecutor::spawn_gpu(),
+                )),
+                metal_kernels: model.metal_kernels.clone(),
+                accelerate_state: crate::backend::accelerate_lane::AccelerateLane::new(),
+                coreml_state: crate::backend::coreml_lane::CoreMlLane::new(),
+                emb_w: model.emb_w.clone(),
+                emb_s: model.emb_s.clone(),
+                emb_b: model.emb_b.clone(),
+                fn_w: model.fn_w.clone(),
+                rope_cos: model.rope_cos.clone(),
+                rope_sin: model.rope_sin.clone(),
+                full_cos: model.full_cos.clone(),
+                full_sin: model.full_sin.clone(),
+            })),
+        };
+
+        let result = engine.execute_graph(dag, &mut ctx);
+        let receipt_count = result.receipts.len();
+        let completed_count = result.receipts
+            .iter()
+            .filter(|r| matches!(r.status, PhaseCompletionStatus::Complete))
+            .count();
+        self.phase_receipts.extend(result.receipts);
+
+        // Always restore KV caches — unwrap from LiveKvCache, move in bulk.
+        let restored: Vec<KvCache> = ctx.kv_caches.into_iter().map(|lc| match lc {
+            crate::kv_cache::LiveKvCache::Fp16(kv) => kv,
+            _ => panic!("DAG returned unexpected compressed KV cache"),
+        }).collect();
+        self.kv_caches = restored;
+
+        // Propagate hidden state back to caller.
+        if let Some(h) = ctx.hidden_state {
+            *hidden = h;
+        }
+
+        // Determine disposition.
+        if result.all_completed {
+            let label = if is_prefill { "prefill" } else { "decode" };
+            eprintln!("[phase-dag] {}: all {} phases completed via PhaseEngine", label, receipt_count);
+            return GraphExecutionDisposition::Complete;
+        }
+
+        let has_kv_mutations = self.kv_caches.iter().zip(&kv_checkpoint)
+            .any(|(c, &ckpt)| c.committed_len != ckpt);
+
+        if has_kv_mutations {
+            let label = if is_prefill { "prefill" } else { "decode" };
+            eprintln!("[phase-dag] {}: completed {} of {} phases WITH KV mutations", label, completed_count, receipt_count);
+            return GraphExecutionDisposition::PartialPublishedResumeRequired;
+        }
+
+        let label = if is_prefill { "prefill" } else { "decode" };
+        eprintln!("[phase-dag] {}: {} phases completed, no KV mutation (safe fallback)", label, completed_count);
+        GraphExecutionDisposition::ZeroMutationsFallbackSafe
+    }
+
     /// On the first call, stores the full prompt and processes the first
     /// chunk of up to [`PREFILL_CHUNK_SIZE`] tokens.  Subsequent calls
     /// continue from where the previous chunk left off.
@@ -552,66 +657,24 @@ impl ProfiledInferenceSession {
 
         // Phase DAG execution path — authoritative PhaseEngine dispatch.
         // If the compiler emitted a phase DAG, execute it through PhaseEngine.
-        // If ALL phases complete, skip the old imperative layer loop.
+        // KV caches managed by execute_dag_with_kv_guard (std::mem::take + restore).
         let mut phase_engine_completed = false;
         if let Some(dag) = &model.phase_dag {
-            let engine = PhaseEngine::new();
-
-            // Move KV caches into PhaseEngine context — exclusive mutation ownership.
-            let session_caches = std::mem::take(&mut self.kv_caches);
-            let dag_caches: Vec<crate::kv_cache::LiveKvCache> = session_caches
-                .into_iter()
-                .map(|c| crate::kv_cache::LiveKvCache::Fp16(c))
-                .collect();
-
-            let mut ctx = ExecutionContext {
-                request_id: 0,
-                token_position: self.absolute_position as usize,
-                token_ids: token_ids_i32.clone(),
-                is_prefill: true,
-                hidden_state: Some(hidden.clone()),
-                kv_caches: dag_caches,
-                layer_weights: Arc::new(model.layers.clone()),
-                backend: Some(Box::new(RuntimeBackends {
-                    mlx_executor: Arc::new(std::sync::Mutex::new(
-                        crate::mlx_executor::MlxExecutor::spawn_gpu(),
-                    )),
-                    metal_kernels: model.metal_kernels.clone(),
-                    accelerate_state: crate::backend::accelerate_lane::AccelerateLane::new(),
-                    coreml_state: crate::backend::coreml_lane::CoreMlLane::new(),
-                    emb_w: model.emb_w.clone(),
-                    emb_s: model.emb_s.clone(),
-                    emb_b: model.emb_b.clone(),
-                    fn_w: model.fn_w.clone(),
-                    rope_cos: model.rope_cos.clone(),
-                    rope_sin: model.rope_sin.clone(),
-                    full_cos: model.full_cos.clone(),
-                    full_sin: model.full_sin.clone(),
-                })),
-            };
-            let result = engine.execute_graph(dag, &mut ctx);
-            let receipt_count = result.receipts.len();
-            let completed_count = result.receipts.iter().filter(|r| matches!(r.status, PhaseCompletionStatus::Complete)).count();
-            self.phase_receipts.extend(result.receipts);
-
-            // Restore KV caches back to session — unwrap from LiveKvCache, move in bulk.
-            let restored: Vec<crate::kv_cache::KvCache> = ctx.kv_caches
-                .into_iter()
-                .map(|lc| match lc {
-                    crate::kv_cache::LiveKvCache::Fp16(kv) => kv,
-                    _ => panic!("prefill: unexpected compressed KV cache after DAG execution"),
-                })
-                .collect();
-            self.kv_caches = restored;
-
-            if result.all_completed {
-                eprintln!("[phase-dag] prefill: all {} phases completed via PhaseEngine, bypassing MLX loop", receipt_count);
-                if let Some(h) = ctx.hidden_state.take() {
-                    hidden = h;
+            match self.execute_dag_with_kv_guard(model, dag, &mut hidden, &token_ids_i32, true) {
+                GraphExecutionDisposition::Complete => { phase_engine_completed = true; }
+                GraphExecutionDisposition::ZeroMutationsFallbackSafe => {}
+                GraphExecutionDisposition::PartialPublishedResumeRequired => {
+                    return Err(EngineError::new(
+                        EngineErrorCode::NumericalFailure,
+                        "PhaseEngine: prefill completed partially with KV mutations — cannot run legacy loop",
+                    ));
                 }
-                phase_engine_completed = true;
-            } else {
-                eprintln!("[phase-dag] prefill: {} phases completed (shadow mode, falling through)", completed_count);
+                GraphExecutionDisposition::Fatal => {
+                    return Err(EngineError::new(
+                        EngineErrorCode::InferenceFailed,
+                        "PhaseEngine: prefill encountered fatal error",
+                    ));
+                }
             }
         }
 
@@ -988,70 +1051,24 @@ impl ProfiledInferenceSession {
 
         // Phase DAG execution path — authoritative PhaseEngine dispatch.
         // If the compiler emitted a phase DAG, execute it through PhaseEngine.
-        // If ALL phases complete, skip the old imperative layer loop.
+        // KV caches managed by execute_dag_with_kv_guard (std::mem::take + restore).
         let mut phase_engine_completed = false;
         if let Some(dag) = &model.phase_dag {
-            use crate::runtime::executable_session::RuntimeBackends;
-            use crate::scheduling::execution_context::ExecutionContext;
-            use crate::compute_image::phase_dag::PhaseCompletionStatus;
-
-            let engine = PhaseEngine::new();
-
-            // Move KV caches into PhaseEngine context — exclusive mutation ownership.
-            let session_caches = std::mem::take(&mut self.kv_caches);
-            let dag_caches: Vec<crate::kv_cache::LiveKvCache> = session_caches
-                .into_iter()
-                .map(|c| crate::kv_cache::LiveKvCache::Fp16(c))
-                .collect();
-
-            let mut ctx = ExecutionContext {
-                request_id: 0,
-                token_position: self.absolute_position as usize,
-                token_ids: token_ids_i32.to_vec(),
-                is_prefill: false,
-                hidden_state: Some(hidden.clone()),
-                kv_caches: dag_caches,
-                layer_weights: Arc::new(model.layers.clone()),
-                backend: Some(Box::new(RuntimeBackends {
-                    mlx_executor: Arc::new(std::sync::Mutex::new(
-                        crate::mlx_executor::MlxExecutor::spawn_gpu(),
-                    )),
-                    metal_kernels: model.metal_kernels.clone(),
-                    accelerate_state: crate::backend::accelerate_lane::AccelerateLane::new(),
-                    coreml_state: crate::backend::coreml_lane::CoreMlLane::new(),
-                    emb_w: model.emb_w.clone(),
-                    emb_s: model.emb_s.clone(),
-                    emb_b: model.emb_b.clone(),
-                    fn_w: model.fn_w.clone(),
-                    rope_cos: model.rope_cos.clone(),
-                    rope_sin: model.rope_sin.clone(),
-                    full_cos: model.full_cos.clone(),
-                    full_sin: model.full_sin.clone(),
-                })),
-            };
-            let result = engine.execute_graph(dag, &mut ctx);
-            let receipt_count = result.receipts.len();
-            let completed_count = result.receipts.iter().filter(|r| matches!(r.status, PhaseCompletionStatus::Complete)).count();
-            self.phase_receipts.extend(result.receipts);
-
-            // Restore KV caches back to session — unwrap from LiveKvCache, move in bulk.
-            let restored: Vec<crate::kv_cache::KvCache> = ctx.kv_caches
-                .into_iter()
-                .map(|lc| match lc {
-                    crate::kv_cache::LiveKvCache::Fp16(kv) => kv,
-                    _ => panic!("decode: unexpected compressed KV cache after DAG execution"),
-                })
-                .collect();
-            self.kv_caches = restored;
-
-            if result.all_completed {
-                eprintln!("[phase-dag] decode: all {} phases completed via PhaseEngine, bypassing MLX loop", receipt_count);
-                if let Some(h) = ctx.hidden_state.take() {
-                    hidden = h;
+            match self.execute_dag_with_kv_guard(model, dag, &mut hidden, &token_ids_i32, false) {
+                GraphExecutionDisposition::Complete => { phase_engine_completed = true; }
+                GraphExecutionDisposition::ZeroMutationsFallbackSafe => {}
+                GraphExecutionDisposition::PartialPublishedResumeRequired => {
+                    return Err(EngineError::new(
+                        EngineErrorCode::NumericalFailure,
+                        "PhaseEngine: decode completed partially with KV mutations — cannot run legacy loop",
+                    ));
                 }
-                phase_engine_completed = true;
-            } else {
-                eprintln!("[phase-dag] decode: {} phases completed (shadow mode, falling through)", completed_count);
+                GraphExecutionDisposition::Fatal => {
+                    return Err(EngineError::new(
+                        EngineErrorCode::InferenceFailed,
+                        "PhaseEngine: decode encountered fatal error",
+                    ));
+                }
             }
         }
 
