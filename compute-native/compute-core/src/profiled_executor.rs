@@ -23,6 +23,7 @@ use crate::mapped_image::MappedImage;
 use crate::placement_profile::ExecutionPlacementProfile;
 use crate::quantization::turboquant_kv::AsymmetricQuantMode;
 use crate::quantization::turboquant_kv::KvQuantMode;
+use crate::quantization::turboquant_kv::TurboQuantKvCache;
 use crate::runtime::executable_session::RuntimeBackends;
 use crate::runtime_contract::{
     AuthorityMode, BackendTarget, BudgetClass, RetryPolicy, RuntimeWorkItem,
@@ -217,6 +218,9 @@ pub struct ProfiledInferenceSession {
     /// When set, overrides `compression_ratio` with the asymmetric ratio
     /// and the KV cache uses `append_asymmetric()`.
     pub asymmetric_quant: Option<AsymmetricQuantMode>,
+    /// Compressed TurboQuant KV caches, one per layer.
+    /// Populated in parallel with the FP16 KvCache during inference.
+    pub compressed_caches: Vec<Option<TurboQuantKvCache>>,
     /// Sampling configuration, including optional grammar-guided generation.
     /// The grammar FSM is advanced after each decoded token.
     pub sampler: SamplerConfig,
@@ -292,6 +296,15 @@ impl ProfiledInferenceSession {
             format!("session {} created", session_id),
         ));
 
+        let compressed_caches: Vec<Option<TurboQuantKvCache>> = {
+            let cap = kv_caches.first().map(|c| c.capacity).unwrap_or(2048);
+            let group_size = 32usize;
+            kv_caches.iter().map(|_kvc| {
+                let mode = KvQuantMode::PolarHadamard(4);
+                Some(TurboQuantKvCache::new(mode, group_size, cap as usize))
+            }).collect()
+        };
+
         Self {
             session_id,
             kv_caches,
@@ -317,6 +330,7 @@ impl ProfiledInferenceSession {
                     v_bits: 4,
                 },
             ),
+            compressed_caches,
             autopsy: None,
             sampler: SamplerConfig::default(),
             video_encoder: None,
